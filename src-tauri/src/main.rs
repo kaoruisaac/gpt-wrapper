@@ -1,6 +1,10 @@
+mod project_settings;
+
+use project_settings::{ProjectSettings, ProjectSettingsState, TabSpec};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -17,17 +21,24 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use uuid::Uuid;
 use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, ExecuteScriptCompletedHandler,
     Microsoft::Web::WebView2::Win32::ICoreWebView2,
 };
 use windows::{
-    core::HSTRING,
-    Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE},
+    core::{HSTRING, PCWSTR},
+    Win32::UI::{
+        Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
+        WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, ShowWindow,
+            TrackPopupMenuEx, MF_CHECKED, MF_DISABLED, MF_STRING, SW_RESTORE, TPM_LEFTBUTTON,
+            TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
+        },
+    },
 };
 
 const ADAPTER_SCRIPT: &str = include_str!("chatgpt_adapter.js");
-const TAB_BAR_SCRIPT: &str = include_str!("tab_bar.js");
 const MAIN_WINDOW_LABEL: &str = "main";
 const SETTINGS_WINDOW_LABEL: &str = "settings";
 const HOST_WEBVIEW_LABEL: &str = "tab-host";
@@ -98,7 +109,7 @@ struct TabSnapshot {
 
 #[derive(Debug)]
 struct TabManager {
-    tabs: Vec<usize>,
+    tabs: Vec<TabInfo>,
     loaded_tabs: HashSet<usize>,
     active_tab_id: Option<usize>,
     next_tab_id: usize,
@@ -120,15 +131,7 @@ impl TabManager {
 
     fn snapshot(&self) -> TabSnapshot {
         TabSnapshot {
-            tabs: self
-                .tabs
-                .iter()
-                .copied()
-                .map(|id| TabInfo {
-                    id,
-                    title: "ChatGPT".to_string(),
-                })
-                .collect(),
+            tabs: self.tabs.iter().cloned().collect(),
             active_tab_id: self.active_tab_id,
         }
     }
@@ -331,14 +334,15 @@ fn is_tab_loaded(app_handle: &AppHandle, tab_id: usize) -> bool {
         .unwrap_or(false)
 }
 
-fn create_chatgpt_webview(app_handle: &AppHandle, tab_id: usize) -> Result<Webview, String> {
+fn create_chatgpt_webview(
+    app_handle: &AppHandle,
+    tab_id: usize,
+    chatgpt_url: url::Url,
+) -> Result<Webview, String> {
     let window = app_handle
         .get_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "main window is missing".to_string())?;
     let (width, content_height) = content_size(&window)?;
-    let chatgpt_url = "https://chatgpt.com"
-        .parse()
-        .map_err(|error| format!("invalid ChatGPT URL: {error}"))?;
 
     let builder = WebviewBuilder::new(
         tab_label(tab_id),
@@ -367,7 +371,7 @@ fn create_chatgpt_webview(app_handle: &AppHandle, tab_id: usize) -> Result<Webvi
                 }
                 tabs.standby_ptt_ready = true;
                 (false, false)
-            } else if tabs.tabs.contains(&tab_id) {
+            } else if tabs.tabs.iter().any(|tab| tab.id == tab_id) {
                 if !tabs.loaded_tabs.insert(tab_id) {
                     return;
                 }
@@ -426,20 +430,31 @@ fn create_chatgpt_webview(app_handle: &AppHandle, tab_id: usize) -> Result<Webvi
 }
 
 fn create_tab_internal(app_handle: &AppHandle) -> Result<TabSnapshot, String> {
+    let spec = app_handle
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .default_tab_spec();
+    create_tab_with_spec(app_handle, spec)
+}
+
+fn create_tab_with_spec(app_handle: &AppHandle, spec: TabSpec) -> Result<TabSnapshot, String> {
     let state = app_handle.state::<TabState>();
     let (tab_id, previous_active) = {
         let mut tabs = state.lock()?;
         let tab_id = tabs.next_tab_id;
         tabs.next_tab_id += 1;
         let previous_active = tabs.active_tab_id;
-        tabs.tabs.push(tab_id);
+        tabs.tabs.push(TabInfo {
+            id: tab_id,
+            title: spec.title,
+        });
         tabs.active_tab_id = Some(tab_id);
         (tab_id, previous_active)
     };
 
-    if let Err(error) = create_chatgpt_webview(app_handle, tab_id) {
+    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url) {
         let mut tabs = state.lock()?;
-        tabs.tabs.retain(|id| *id != tab_id);
+        tabs.tabs.retain(|tab| tab.id != tab_id);
         tabs.loaded_tabs.remove(&tab_id);
         tabs.active_tab_id = previous_active;
         return Err(error);
@@ -457,6 +472,10 @@ fn create_tab_internal(app_handle: &AppHandle) -> Result<TabSnapshot, String> {
 }
 
 fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
+    let url = app_handle
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .resolved_url();
     let state = app_handle.state::<TabState>();
     let tab_id = {
         let mut tabs = state.lock()?;
@@ -471,7 +490,7 @@ fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
         tab_id
     };
 
-    if let Err(error) = create_chatgpt_webview(app_handle, tab_id) {
+    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, url) {
         let mut tabs = state.lock()?;
         if tabs.standby_ptt_tab_id == Some(tab_id) {
             tabs.standby_ptt_tab_id = None;
@@ -517,6 +536,11 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
         .ok_or_else(|| "standby PTT tab is missing".to_string())?;
     let webview = get_tab_webview(app_handle, standby_id)
         .ok_or_else(|| format!("standby PTT webview {standby_id} is missing"))?;
+    let title = app_handle
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .default_tab_spec()
+        .title;
 
     let (previous_active, ready) = {
         let mut tabs = state.lock()?;
@@ -528,7 +552,10 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
         let ready = tabs.standby_ptt_ready;
         tabs.standby_ptt_tab_id = None;
         tabs.standby_ptt_ready = false;
-        tabs.tabs.push(standby_id);
+        tabs.tabs.push(TabInfo {
+            id: standby_id,
+            title,
+        });
         tabs.active_tab_id = Some(standby_id);
         if ready {
             tabs.loaded_tabs.insert(standby_id);
@@ -561,7 +588,7 @@ fn switch_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnaps
     let state = app_handle.state::<TabState>();
     let previous_active = {
         let tabs = state.lock()?;
-        if !tabs.tabs.contains(&tab_id) {
+        if !tabs.tabs.iter().any(|tab| tab.id == tab_id) {
             return Err(format!("tab {tab_id} does not exist"));
         }
         tabs.active_tab_id
@@ -606,15 +633,15 @@ fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapsh
         let index = tabs
             .tabs
             .iter()
-            .position(|id| *id == tab_id)
+            .position(|tab| tab.id == tab_id)
             .ok_or_else(|| format!("tab {tab_id} does not exist"))?;
 
         let was_active = tabs.active_tab_id == Some(tab_id);
         let replacement = if was_active {
             if index + 1 < tabs.tabs.len() {
-                Some(tabs.tabs[index + 1])
+                Some(tabs.tabs[index + 1].id)
             } else if index > 0 {
-                Some(tabs.tabs[index - 1])
+                Some(tabs.tabs[index - 1].id)
             } else {
                 None
             }
@@ -633,7 +660,7 @@ fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapsh
 
     {
         let mut tabs = state.lock()?;
-        tabs.tabs.retain(|id| *id != tab_id);
+        tabs.tabs.retain(|tab| tab.id != tab_id);
         tabs.loaded_tabs.remove(&tab_id);
         if was_active {
             tabs.active_tab_id = replacement;
@@ -684,6 +711,110 @@ async fn create_tab(app: AppHandle, webview: Webview) -> Result<TabSnapshot, Str
 }
 
 #[tauri::command]
+async fn create_project_tab(
+    app: AppHandle,
+    webview: Webview,
+    project_id: Uuid,
+) -> Result<TabSnapshot, String> {
+    ensure_host_webview(&webview)?;
+    let spec = app
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .project_tab_spec(project_id)?;
+    create_tab_with_spec(&app, spec)
+}
+
+#[derive(Debug, Deserialize)]
+struct MenuAnchor {
+    right: f64,
+    bottom: f64,
+}
+
+struct PopupMenu(windows::Win32::UI::WindowsAndMessaging::HMENU);
+
+impl Drop for PopupMenu {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { DestroyMenu(self.0) } {
+            eprintln!("[gpt-wrapper] failed to destroy bookmark menu: {error}");
+        }
+    }
+}
+
+fn track_project_bookmark_menu(
+    app: &AppHandle,
+    settings: ProjectSettings,
+    anchor: MenuAnchor,
+) -> Result<Option<Uuid>, String> {
+    // IPC can reach the UI thread after the mouse has already been released.
+    if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+        return Ok(None);
+    }
+    let window = app
+        .get_window(MAIN_WINDOW_LABEL)
+        .ok_or("main window is missing")?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let origin = window.inner_position().map_err(|error| error.to_string())?;
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    let menu = PopupMenu(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
+
+    if settings.projects.is_empty() {
+        let label: Vec<u16> = "尚無 Project Bookmark\0".encode_utf16().collect();
+        unsafe { AppendMenuW(menu.0, MF_STRING | MF_DISABLED, 1, PCWSTR(label.as_ptr())) }
+            .map_err(|error| error.to_string())?;
+    } else {
+        for (index, project) in settings.projects.iter().enumerate() {
+            let label: Vec<u16> =
+                format!("{}\0", project.name.replace('&', "&&").replace('\0', ""))
+                    .encode_utf16()
+                    .collect();
+            let mut flags = MF_STRING;
+            if settings.default_project_id == Some(project.id) {
+                flags |= MF_CHECKED;
+            }
+            unsafe { AppendMenuW(menu.0, flags, index + 1, PCWSTR(label.as_ptr())) }
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    // WebView2 may still own capture from pointerdown; the menu loop needs it.
+    let _ = unsafe { ReleaseCapture() };
+    if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+        return Ok(None);
+    }
+    let x = origin.x + (anchor.right * scale).round() as i32;
+    let y = origin.y + (anchor.bottom * scale).round() as i32;
+    let flags = TPM_LEFTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN;
+    let command = unsafe { TrackPopupMenuEx(menu.0, flags.0, x, y, hwnd, None) }.0 as usize;
+    Ok(command
+        .checked_sub(1)
+        .and_then(|index| settings.projects.get(index).map(|p| p.id)))
+}
+
+#[tauri::command]
+async fn show_project_bookmark_menu(
+    app: AppHandle,
+    webview: Webview,
+    anchor: MenuAnchor,
+) -> Result<Option<Uuid>, String> {
+    ensure_host_webview(&webview)?;
+    if !anchor.right.is_finite() || !anchor.bottom.is_finite() {
+        return Err("invalid bookmark menu anchor".into());
+    }
+    let settings = app.state::<ProjectSettingsState>().snapshot()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let app_for_ui = app.clone();
+        app.run_on_main_thread(move || {
+            let _ = sender.send(track_project_bookmark_menu(&app_for_ui, settings, anchor));
+        })
+        .map_err(|error| error.to_string())?;
+        receiver.recv().map_err(|error| error.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn switch_tab(app: AppHandle, webview: Webview, tab_id: usize) -> Result<TabSnapshot, String> {
     ensure_host_webview(&webview)?;
     switch_tab_internal(&app, tab_id)
@@ -701,6 +832,80 @@ fn ensure_settings_webview(webview: &Webview) -> Result<(), String> {
     } else {
         Err("settings commands are only available to the Settings window".to_string())
     }
+}
+
+fn update_project_settings(
+    app: &AppHandle,
+    change: impl FnOnce(&mut ProjectSettings) -> Result<(), String>,
+) -> Result<ProjectSettings, String> {
+    let (settings, url_changed) = app.state::<ProjectSettingsState>().update(change)?;
+    if url_changed {
+        let has_standby = app.state::<TabState>().lock()?.standby_ptt_tab_id.is_some();
+        if has_standby {
+            discard_standby_ptt_tab(app);
+            if app
+                .state::<TrayVisibilityState>()
+                .tray_hidden
+                .load(Ordering::SeqCst)
+            {
+                if let Err(error) = ensure_standby_ptt_tab(app) {
+                    eprintln!("[gpt-wrapper] failed to refresh standby PTT tab: {error}");
+                }
+            }
+        }
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_project_settings(app: AppHandle, webview: Webview) -> Result<ProjectSettings, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<ProjectSettingsState>().snapshot()
+}
+
+#[tauri::command]
+fn create_project(
+    app: AppHandle,
+    webview: Webview,
+    name: String,
+    url: String,
+    message_prefix: String,
+) -> Result<ProjectSettings, String> {
+    ensure_settings_webview(&webview)?;
+    update_project_settings(&app, |data| {
+        project_settings::create(data, name, url, message_prefix)
+    })
+}
+
+#[tauri::command]
+fn edit_project(
+    app: AppHandle,
+    webview: Webview,
+    id: Uuid,
+    name: String,
+    url: String,
+    message_prefix: String,
+) -> Result<ProjectSettings, String> {
+    ensure_settings_webview(&webview)?;
+    update_project_settings(&app, |data| {
+        project_settings::edit(data, id, name, url, message_prefix)
+    })
+}
+
+#[tauri::command]
+fn delete_project(app: AppHandle, webview: Webview, id: Uuid) -> Result<ProjectSettings, String> {
+    ensure_settings_webview(&webview)?;
+    update_project_settings(&app, |data| project_settings::delete(data, id))
+}
+
+#[tauri::command]
+fn set_default_project(
+    app: AppHandle,
+    webview: Webview,
+    id: Option<Uuid>,
+) -> Result<ProjectSettings, String> {
+    ensure_settings_webview(&webview)?;
+    update_project_settings(&app, |data| project_settings::set_default(data, id))
 }
 
 #[tauri::command]
@@ -1168,10 +1373,17 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_tabs,
             create_tab,
+            create_project_tab,
+            show_project_bookmark_menu,
             switch_tab,
             close_tab,
             get_autostart_enabled,
-            set_autostart_enabled
+            set_autostart_enabled,
+            get_project_settings,
+            create_project,
+            edit_project,
+            delete_project,
+            set_default_project
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1188,6 +1400,9 @@ fn main() {
             app.manage(PttState(Arc::clone(&ptt_tracker)));
             app.manage(TrayVisibilityState::new());
             app.manage(SettingsWindowState::new());
+            let project_settings_path: PathBuf =
+                app.path().app_config_dir()?.join("project-settings.json");
+            app.manage(ProjectSettingsState::load(project_settings_path));
 
             let window = WindowBuilder::new(app, MAIN_WINDOW_LABEL)
                 .title("GPT Wrapper")
@@ -1199,11 +1414,12 @@ fn main() {
                 .build()?;
 
             let (width, _) = content_size(&window).map_err(tauri::Error::AssetNotFound)?;
-            let host_builder =
-                WebviewBuilder::new(HOST_WEBVIEW_LABEL, WebviewUrl::App("index.html".into()))
-                    .initialization_script(TAB_BAR_SCRIPT)
-                    .background_color(LOADING_BACKGROUND)
-                    .focused(false);
+            let host_builder = WebviewBuilder::new(
+                HOST_WEBVIEW_LABEL,
+                WebviewUrl::App("tab-bar/index.html".into()),
+            )
+            .background_color(LOADING_BACKGROUND)
+            .focused(false);
 
             window.add_child(
                 host_builder,

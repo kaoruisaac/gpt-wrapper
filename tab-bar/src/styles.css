@@ -1,0 +1,155 @@
+:root {
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f4f4;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #f4f4f4;
+}
+
+#gpt-wrapper-tab-bar {
+  width: 100%;
+  height: 38px;
+  display: flex;
+  align-items: end;
+  gap: 6px;
+  padding: 5px 8px 0;
+  background: #f4f4f4;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.10);
+  user-select: none;
+}
+
+#gpt-wrapper-tab-bar.is-busy {
+  cursor: default;
+}
+
+.gpt-wrapper-tabs {
+  min-width: 0;
+  height: 33px;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: end;
+  gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.gpt-wrapper-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.gpt-wrapper-tab {
+  height: 31px;
+  flex: 0 1 220px;
+  min-width: 132px;
+  max-width: 240px;
+  padding: 0 8px 0 12px;
+  border: 0;
+  border-radius: 9px 9px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #e9e9e9;
+  color: #565869;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.gpt-wrapper-tab:hover {
+  background: #efefef;
+  color: #202123;
+}
+
+.gpt-wrapper-tab.is-active {
+  background: #ffffff;
+  color: #202123;
+  box-shadow:
+    0 -1px 0 rgba(0, 0, 0, 0.04),
+    1px 0 0 rgba(0, 0, 0, 0.06),
+    -1px 0 0 rgba(0, 0, 0, 0.06);
+}
+
+.gpt-wrapper-tab-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #10a37f;
+}
+
+.gpt-wrapper-tab-title {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.gpt-wrapper-tab-close {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  color: #6e6e80;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.gpt-wrapper-tab-close:hover,
+.gpt-wrapper-tab-close:focus-visible {
+  background: rgba(0, 0, 0, 0.08);
+  color: #202123;
+  outline: none;
+}
+
+.gpt-wrapper-new-tab {
+  width: 29px;
+  height: 29px;
+  flex: 0 0 29px;
+  margin-bottom: 2px;
+  border: 0;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: #565869;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.gpt-wrapper-new-tab:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.07);
+  color: #202123;
+}
+
+.gpt-wrapper-new-tab:active:not(:disabled) {
+  background: rgba(0, 0, 0, 0.11);
+}
+
+.gpt-wrapper-new-tab:disabled {
+  cursor: default;
+}
+
+.gpt-wrapper-new-tab svg {
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}

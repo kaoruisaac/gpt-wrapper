@@ -1203,6 +1203,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-global-shortcut",
+ "url",
+ "uuid",
  "webview2-com",
  "windows",
 ]

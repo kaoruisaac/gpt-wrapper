@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "cc.pedelec.gptwrapper",
   "build": {
-    "beforeDevCommand": "npm run settings:build",
-    "beforeBuildCommand": "npm run settings:build",
+    "beforeDevCommand": "npm run frontend:build",
+    "beforeBuildCommand": "npm run frontend:build",
     "frontendDist": "../dist"
   },
   "app": {

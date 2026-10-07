@@ -148,6 +148,163 @@ h1 {
   color: #067647;
 }
 
+.bookmark-intro {
+  margin: -12px 0 25px;
+  color: #6e6e80;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.default-project {
+  padding: 17px 0 22px;
+  border-top: 1px solid #ececec;
+  border-bottom: 1px solid #ececec;
+}
+
+.default-project select {
+  display: block;
+  width: min(100%, 320px);
+  margin-top: 9px;
+  padding: 8px 10px;
+  border: 1px solid #d0d0d0;
+  border-radius: 7px;
+  background: #fff;
+  color: #202123;
+  font: inherit;
+  font-size: 14px;
+}
+
+.projects-heading,
+.project-item-top,
+.project-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.projects-heading {
+  justify-content: space-between;
+  margin: 25px 0 14px;
+}
+
+.projects-heading h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.projects-heading button,
+.project-actions button {
+  padding: 7px 11px;
+  border: 1px solid #d5d5d5;
+  border-radius: 7px;
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.projects-heading button.primary-button,
+.project-actions button.primary-button {
+  border-color: #10a37f;
+  background: #10a37f;
+  color: white;
+}
+
+.projects-heading button.primary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.projects-heading button.primary-button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.project-actions button.delete-button {
+  color: #b42318;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.project-item,
+.project-editor {
+  margin: 0 0 10px;
+  padding: 16px;
+  border: 1px solid #e7e7e7;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.project-item-top {
+  margin-bottom: 13px;
+  font-size: 15px;
+}
+
+.default-badge {
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: #e2f5ee;
+  color: #067647;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.project-field {
+  display: grid;
+  grid-template-columns: 105px minmax(0, 1fr);
+  gap: 9px;
+  margin: 7px 0;
+  color: #6e6e80;
+  font-size: 13px;
+}
+
+.project-value {
+  overflow-wrap: anywhere;
+  color: #30303a;
+}
+
+.prefix-value {
+  white-space: pre-wrap;
+}
+
+.project-item .project-actions {
+  margin-top: 13px;
+}
+
+.project-editor label {
+  display: block;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.project-editor input,
+.project-editor textarea {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  padding: 8px 10px;
+  border: 1px solid #d0d0d0;
+  border-radius: 7px;
+  background: #fff;
+  color: #202123;
+  font: inherit;
+  font-weight: 400;
+}
+
+.project-editor textarea {
+  resize: vertical;
+}
+
+.empty-projects {
+  color: #6e6e80;
+  font-size: 13px;
+}
+
 @media (max-width: 560px) {
   .settings-shell {
     grid-template-columns: 140px minmax(0, 1fr);

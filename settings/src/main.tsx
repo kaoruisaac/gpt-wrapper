@@ -2,6 +2,7 @@ import { createSignal, onMount } from "solid-js";
 import { render } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
+import ProjectBookmarks from "./ProjectBookmarks";
 
 type SettingsTab = "general" | "bookmarks";
 type StatusKind = "" | "success" | "error";
@@ -115,15 +116,6 @@ function GeneralSettings() {
   );
 }
 
-function ProjectBookmarksPlaceholder() {
-  return (
-    <>
-      <h1>專案書籤</h1>
-      <p class="placeholder">專案書籤功能將於後續加入。</p>
-    </>
-  );
-}
-
 function SettingsApp() {
   const [activeTab, setActiveTab] = createSignal<SettingsTab>("general");
 
@@ -163,7 +155,7 @@ function SettingsApp() {
           classList={{ "is-active": activeTab() === "bookmarks" }}
           aria-hidden={activeTab() !== "bookmarks"}
         >
-          <ProjectBookmarksPlaceholder />
+          <ProjectBookmarks />
         </section>
       </main>
     </div>

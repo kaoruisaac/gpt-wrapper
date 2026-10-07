@@ -11,5 +11,10 @@
     "skipLibCheck": true,
     "types": ["vite/client"]
   },
-  "include": ["settings/src", "vite.settings.config.mts"]
+  "include": [
+    "settings/src",
+    "tab-bar/src",
+    "vite.settings.config.mts",
+    "vite.tab-bar.config.mts"
+  ]
 }

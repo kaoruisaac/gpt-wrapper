@@ -23,7 +23,7 @@ Build the app:
 npm run tauri build
 ```
 
-The Settings UI is built automatically by the Tauri dev/build flow; no separate frontend build step is required.
+The SolidJS tab bar and Settings UIs are built automatically by the Tauri dev/build flow; no separate frontend build step is required.
 
 ## Usage
 
@@ -34,6 +34,10 @@ The Settings UI is built automatically by the Tauri dev/build flow; no separate 
 5. When the app is visible, dictation starts in the current active tab.
 6. Speak while holding the shortcut, then release it to finish dictation.
 7. The app waits for transcription and submits the prompt in the same tab where dictation started.
+
+Open **Settings → 專案書籤** from the tray menu to save ChatGPT Project URLs. Choose a **Default project** to use its URL for new tabs, including the first tab after restart and the standby tab prepared while the app is hidden. Existing tabs stay on their current pages. Selecting **chatgpt.com** restores the built-in default. Each bookmark also stores an optional **Message Prefix** for display and later editing; it does not change dictation or sent messages.
+
+Press and release the tab bar **+** to open a tab with the current Default project. Hold **+** for about 400 ms to open the Project Bookmark menu, then drag to a project and release to open it in a new tab. Release outside the menu to cancel. Choosing a project here does not change the Default project.
 
 Closing the main window hides GPT Wrapper to the system tray and preloads a hidden standby ChatGPT tab. If PTT is pressed while the app is hidden, GPT Wrapper restores the window, promotes that standby into a new active tab, and starts dictation there. Reopening from the tray normally keeps the existing active tab and discards the unused standby. Choose **Quit** from the tray menu to exit completely.
 

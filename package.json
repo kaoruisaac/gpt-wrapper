@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "tab-bar:build": "vite build --config vite.tab-bar.config.mts",
     "settings:build": "vite build --config vite.settings.config.mts",
+    "frontend:build": "npm run tab-bar:build && npm run settings:build",
     "tauri": "tauri"
   },
   "keywords": [],
@@ -20,6 +22,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",
+    "solid-icons": "^1.2.0",
     "solid-js": "^1.9.16"
   }
 }
