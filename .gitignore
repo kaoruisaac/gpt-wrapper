@@ -1,0 +1,4 @@
+.agent_temp/
+dist/
+node_modules/
+AGENTS.md

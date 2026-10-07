@@ -1,0 +1,17 @@
+[package]
+name = "gpt-wrapper"
+version = "0.1.0"
+description = "Tauri wrapper for push-to-talk ChatGPT Web dictation"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-ico", "unstable"] }
+tauri-plugin-global-shortcut = "2"
+webview2-com = "0.39.1"
+windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-autostart = "2.7.0"
