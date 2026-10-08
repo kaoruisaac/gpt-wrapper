@@ -213,6 +213,28 @@ impl TabManager {
             active_tab_id: self.active_tab_id,
         }
     }
+
+    // Tab order is independent from tab identity and the active WebView.
+    fn reorder(&mut self, tab_ids: &[usize]) -> Result<(), String> {
+        if tab_ids.len() != self.tabs.len() {
+            return Err("tab order must contain every visible tab exactly once".to_string());
+        }
+
+        let positions: HashMap<usize, usize> = tab_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
+        if positions.len() != self.tabs.len()
+            || self.tabs.iter().any(|tab| !positions.contains_key(&tab.id))
+        {
+            return Err("tab order contains missing, duplicate, or unknown tab IDs".to_string());
+        }
+
+        self.tabs.sort_by_key(|tab| positions[&tab.id]);
+        Ok(())
+    }
 }
 
 struct TabState(Mutex<TabManager>);
@@ -1207,6 +1229,19 @@ fn switch_tab(app: AppHandle, webview: Webview, tab_id: usize) -> Result<TabSnap
 }
 
 #[tauri::command]
+fn reorder_tabs(
+    app: AppHandle,
+    webview: Webview,
+    tab_ids: Vec<usize>,
+) -> Result<TabSnapshot, String> {
+    ensure_host_webview(&webview)?;
+    let state = app.state::<TabState>();
+    let mut tabs = state.lock()?;
+    tabs.reorder(&tab_ids)?;
+    Ok(tabs.snapshot())
+}
+
+#[tauri::command]
 async fn close_tab(app: AppHandle, webview: Webview, tab_id: usize) -> Result<TabSnapshot, String> {
     ensure_host_webview(&webview)?;
     close_tab_internal(&app, tab_id)
@@ -1793,6 +1828,7 @@ fn main() {
             create_project_tab,
             show_project_bookmark_menu,
             switch_tab,
+            reorder_tabs,
             close_tab,
             get_autostart_enabled,
             set_autostart_enabled,
@@ -2008,5 +2044,39 @@ mod tab_status_tests {
         assert!(!tabs.update_status(3, TabStatus::Voice));
         assert_eq!(tabs.contexts[&3].status, TabStatus::Voice);
         assert!(!tabs.update_status(4, TabStatus::Send));
+    }
+
+    #[test]
+    fn reorder_tabs_changes_only_visible_order() {
+        let mut tabs = TabManager::new();
+        let spec = ProjectSettings::default().default_tab_spec();
+        for id in [1, 2, 3] {
+            tabs.contexts.insert(id, TabContext::new(spec.clone()));
+            tabs.tabs.push(TabInfo {
+                id,
+                title: format!("Tab {id}"),
+                status: TabStatus::Fallback,
+            });
+        }
+        tabs.active_tab_id = Some(2);
+        tabs.standby_ptt_tab_id = Some(4);
+        tabs.contexts.insert(4, TabContext::new(spec));
+
+        assert!(tabs.reorder(&[3, 1, 2]).is_ok());
+        assert_eq!(
+            tabs.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+        assert_eq!(tabs.active_tab_id, Some(2));
+        assert_eq!(tabs.standby_ptt_tab_id, Some(4));
+        assert_eq!(tabs.contexts.len(), 4);
+
+        for invalid in [vec![1, 2], vec![1, 1, 2], vec![1, 2, 5], vec![1, 2, 3, 4]] {
+            assert!(tabs.reorder(&invalid).is_err());
+            assert_eq!(
+                tabs.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                vec![3, 1, 2]
+            );
+        }
     }
 }
