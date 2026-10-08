@@ -133,6 +133,16 @@ h1 {
   line-height: 1.55;
 }
 
+.ble-section { margin-top: 22px; border-top: 1px solid #ececec; padding-top: 18px; }
+.ble-section h2 { margin: 0 0 10px; font-size: 17px; }
+.ble-section .setting-row { border-bottom: 0; }
+.ble-state, .ble-device { font-size: 13px; line-height: 1.5; }
+.ble-actions { display: flex; gap: 8px; margin: 12px 0; }
+.ble-actions button, .ble-candidate button { padding: 7px 11px; border: 1px solid #d5d5d5; border-radius: 7px; background: #fff; cursor: pointer; }
+.ble-candidates { border-top: 1px solid #ececec; }
+.ble-candidate { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid #ececec; font-size: 13px; }
+.ble-candidate small { display: block; color: #6e6e80; overflow-wrap: anywhere; }
+
 .status {
   min-height: 22px;
   margin-top: 12px;

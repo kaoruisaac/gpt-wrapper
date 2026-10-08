@@ -1,7 +1,16 @@
 (() => {
   if (window.__GPT_WRAPPER__) return;
 
-  const state = { before: "", timer: null };
+  const state = {
+    before: "", timer: null, pendingTranscription: false,
+    sendRequested: false, lastClickedText: null, generation: 0,
+    activeSegment: false, segments: [], segmentVersion: 0, sendClicked: false,
+  };
+  const cancelTimer = () => {
+    if (state.timer !== null) clearInterval(state.timer);
+    state.timer = null;
+    state.generation++;
+  };
   const q = (selector) => document.querySelector(selector);
   const visible = (el) => {
     if (!el) return false;
@@ -27,6 +36,15 @@
   const composerText = () => {
     const el = composer();
     return (el?.value ?? el?.innerText ?? el?.textContent ?? "").trim();
+  };
+
+  // An absent/unknown completion signal is not evidence of a final transcript.
+  const transcriptionBusy = () => {
+    const indicator = q('[data-testid="transcription-status"]');
+    if (!indicator) return null;
+    if (indicator.getAttribute("aria-busy") === "true") return true;
+    if (indicator.getAttribute("aria-busy") === "false") return false;
+    return null;
   };
 
   const sendButton = () => {
@@ -84,6 +102,10 @@
     });
     update();
     window.addEventListener("pagehide", () => {
+      if (state.timer !== null && state.sendRequested) {
+        console.warn("[gpt-wrapper] BLE send cancelled: page unloaded");
+      }
+      cancelTimer();
       observer.disconnect();
       if (pending !== null) clearTimeout(pending);
     }, { once: true });
@@ -150,12 +172,97 @@
     },
 
     prepareStart() {
-      clearInterval(state.timer);
+      if (state.sendClicked) {
+        state.sendRequested = false;
+        state.sendClicked = false;
+        state.lastClickedText = null;
+      }
+      // A queued BLE Submit belongs to the whole draft, including later segments.
+      if (!state.sendRequested) cancelTimer();
       state.before = composerText();
+      state.activeSegment = true;
+      state.segmentVersion++;
+      if (!state.sendRequested) state.lastClickedText = null;
+    },
+
+    finishBleSegment() {
+      state.activeSegment = false;
+      state.segments.push({ before: state.before, busySeen: transcriptionBusy(), settled: false });
+      state.pendingTranscription = true;
+      state.segmentVersion++;
+      console.info("[gpt-wrapper] BLE transcription awaiting an observable busy-to-idle transition");
+    },
+
+    finishKeyboardSegment() {
+      state.activeSegment = false;
+    },
+
+    cancelExplicitSend() {
+      cancelTimer();
+      state.pendingTranscription = false;
+      state.sendRequested = false;
+      state.sendClicked = false;
+      state.activeSegment = false;
+      state.segments = [];
+      console.warn("[gpt-wrapper] BLE send cancelled");
+    },
+
+    requestExplicitSend() {
+      if (state.sendRequested || state.timer !== null) {
+        console.info("[gpt-wrapper] duplicate BLE send request ignored");
+        return "already-pending";
+      }
+      state.sendRequested = true;
+      const started = Date.now();
+      const generation = ++state.generation;
+      let lastText = null;
+      let stableSince = 0;
+      let lastSegmentVersion = state.segmentVersion;
+      console.info("[gpt-wrapper] BLE send requested; delivery remains unconfirmed");
+
+      const check = () => {
+        if (generation !== state.generation) return;
+        const current = composerText();
+        const send = sendButton();
+        const enabled = !!send && visible(send) && send.isConnected &&
+          !send.disabled && send.getAttribute("aria-disabled") !== "true";
+        const busy = transcriptionBusy();
+        for (const segment of state.segments) {
+          if (busy === true) segment.busySeen = true;
+          if (segment.busySeen && busy === false && current !== segment.before) segment.settled = true;
+        }
+        const settled = !state.activeSegment && busy !== true &&
+          state.segments.every((segment) => segment.settled);
+        if (current !== lastText || !enabled || !settled ||
+            lastSegmentVersion !== state.segmentVersion) {
+          lastText = current;
+          stableSince = Date.now();
+          lastSegmentVersion = state.segmentVersion;
+        }
+        if (current && settled && enabled &&
+            current !== state.lastClickedText && Date.now() - stableSince >= 1000) {
+          cancelTimer();
+          state.pendingTranscription = false;
+          state.segments = [];
+          state.lastClickedText = current;
+          state.sendClicked = true;
+          send.click();
+          console.info("[gpt-wrapper] BLE Send button clicked; delivery unconfirmed");
+          return;
+        }
+        if (Date.now() - started >= 15000) {
+          cancelTimer();
+          state.sendRequested = false;
+          console.warn("[gpt-wrapper] BLE send timed out: latest transcription completion could not be verified, or draft/Send unavailable; draft remains unsent");
+        }
+      };
+      state.timer = setInterval(check, 100);
+      check();
+      return "requested";
     },
 
     waitAndSend() {
-      clearInterval(state.timer);
+      cancelTimer();
       const started = Date.now();
 
       state.timer = setInterval(() => {
@@ -169,12 +276,14 @@
 
         if (changed && enabled) {
           clearInterval(state.timer);
+          state.timer = null;
           send.click();
           return;
         }
 
         if (Date.now() - started > 15000) {
           clearInterval(state.timer);
+          state.timer = null;
           console.warn("[gpt-wrapper] Timed out waiting for transcription.");
         }
       }, 250);

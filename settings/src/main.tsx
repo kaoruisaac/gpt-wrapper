@@ -1,4 +1,4 @@
-import { createSignal, onMount } from "solid-js";
+import { createSignal, onCleanup, onMount, For, Show } from "solid-js";
 import { render } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
@@ -6,6 +6,8 @@ import ProjectBookmarks from "./ProjectBookmarks";
 
 type SettingsTab = "general" | "bookmarks";
 type StatusKind = "" | "success" | "error";
+type BleDevice = { id: string; name: string };
+type BleSnapshot = { enabled: boolean; approvedDevice: BleDevice | null; candidates: BleDevice[]; state: string; detail: string; lastRx: string | null };
 
 function GeneralSettings() {
   const [autostartEnabled, setAutostartEnabled] = createSignal(false);
@@ -14,6 +16,21 @@ function GeneralSettings() {
   const [pttBusy, setPttBusy] = createSignal(true);
   const [statusMessage, setStatusMessage] = createSignal("");
   const [statusKind, setStatusKind] = createSignal<StatusKind>("");
+  const [ble, setBle] = createSignal<BleSnapshot | null>(null);
+  const [bleBusy, setBleBusy] = createSignal(false);
+  const [bleError, setBleError] = createSignal("");
+
+  const refreshBle = async () => {
+    try { setBle(await invoke<BleSnapshot>("ble_status")); }
+    catch (error) { setBleError(String(error)); }
+  };
+  const bleAction = async (command: string, args?: Record<string, unknown>) => {
+    setBleBusy(true);
+    setBleError("");
+    try { await invoke(command, args); await refreshBle(); }
+    catch (error) { setBleError(String(error)); }
+    finally { setBleBusy(false); }
+  };
 
   const setStatus = (message = "", kind: StatusKind = "") => {
     setStatusMessage(message);
@@ -121,6 +138,9 @@ function GeneralSettings() {
   onMount(() => {
     void readAutostartState().catch(() => {});
     void readPttAutoSubmitState();
+    void refreshBle();
+    const timer = window.setInterval(() => { void refreshBle(); }, 1000);
+    onCleanup(() => window.clearInterval(timer));
   });
 
   return (
@@ -162,6 +182,26 @@ function GeneralSettings() {
           </p>
         </div>
       </div>
+
+      <section class="ble-section" aria-label="Bluetooth Controller">
+        <h2>Bluetooth Controller</h2>
+        <div class="setting-row">
+          <input id="ble-enabled" type="checkbox" checked={ble()?.enabled ?? false} disabled={bleBusy() || !ble()} onChange={(event) => void bleAction("ble_enable", { enabled: event.currentTarget.checked })} />
+          <div class="setting-copy"><label class="setting-label" for="ble-enabled">啟用 BLE 控制器</label><p class="setting-description">使用已核准的 Android PTT 裝置控制 Windows 麥克風聽寫。</p></div>
+        </div>
+        <p class="ble-state"><strong>狀態：</strong>{({ scanning: "Scanning", connecting: "Connecting", "link-connected": "Link connected", "service-found": "Service found", ready: "Subscribed/Ready", disconnected: "Disconnected", error: "Error" } as Record<string, string>)[ble()?.state ?? ""] ?? "Loading"} · {ble()?.detail}</p>
+        <Show when={ble()?.approvedDevice}><p class="ble-device">已核准：{ble()?.approvedDevice?.name || "未命名裝置"}</p></Show>
+        <div class="ble-actions">
+          <button type="button" disabled={bleBusy()} onClick={() => void bleAction("ble_scan")}>Scan</button>
+          <button type="button" disabled={bleBusy() || !ble()?.approvedDevice} onClick={() => void bleAction("ble_disconnect")}>Disconnect</button>
+          <button type="button" disabled={bleBusy() || !ble()?.approvedDevice} onClick={() => void bleAction("ble_forget")}>Forget</button>
+        </div>
+        <Show when={(ble()?.candidates.length ?? 0) > 0}>
+          <div class="ble-candidates"><For each={ble()?.candidates ?? []}>{(device) => <div class="ble-candidate"><span>{device.name || "未命名裝置"} <small>{device.id}</small></span><button type="button" disabled={bleBusy()} onClick={() => void bleAction("ble_approve", { id: device.id })}>Approve/Connect</button></div>}</For></div>
+        </Show>
+        <Show when={ble()?.lastRx}><p class="setting-description">RX: {ble()?.lastRx}</p></Show>
+        <Show when={bleError()}><p class="status is-error" role="alert">{bleError()}</p></Show>
+      </section>
 
       <div
         class="status"

@@ -68,9 +68,21 @@ Ctrl+0 / Ctrl+Numpad0 while tray-hidden
 
 Shortcut Released
   -> return to the tab captured on Pressed
-  -> finish dictation only if recording actually started
+  -> finish dictation only if the Start button was found and a click was dispatched
   -> if PTT auto submit is enabled (default), wait for transcript in the composer and click Send
   -> otherwise leave the transcript in the composer for manual Send
 ```
 
 The ChatGPT Web DOM is not a public API, so its adapter selectors may need maintenance if the site UI changes.
+
+## BLE PTT integration (Windows)
+
+The shared controller is `handle_ptt_event` in `src-tauri/src/main.rs`. `src-tauri/src/ble_central.rs` uses Windows Runtime BLE scanning and GATT client APIs, then passes `Down(PttSource::Ble)`, `Up(PttSource::Ble)`, `SubmitBle`, and `CancelBle` directly to it on Tauri's main thread. `CancelBle` invalidates BLE-owned input and pending BLE sends without changing a keyboard-owned session. No keyboard shortcut is synthesized.
+
+The controller captures a tab ID on DOWN. BLE UP finishes dictation in that fixed WebView and never reads the keyboard auto-submit setting. Start and Finish operations wait for their corresponding visible DOM control before the next queued PTT edge is processed. BLE Submit queues once if BLE PTT is held; otherwise it requests an explicit send in the captured WebView. For dictated text, the adapter waits for an observable busy-to-idle transition on `[data-testid="transcription-status"][aria-busy]`, a changed composer, and an enabled Send control. If this unverified ChatGPT completion probe is absent or the draft cannot be confirmed within 15 seconds, the draft remains unsent. A logged click only means dispatch was requested; recording readiness and message delivery are unconfirmed. A visible window with no BLE target may submit an existing draft in the active tab; tray-hidden mode refuses this fallback.
+
+In Settings → General → Bluetooth Controller, scan for a device advertising the [shared PTT service](android/.agent_temp/phase-0-shared-ble-contract.md), select it, and explicitly Approve/Connect. Approval stores the Windows `DeviceInformation.Id` in `ble-controller.json` under the app config directory. Only the approved ID may reconnect automatically; a changed Windows identity requires scanning and approval again. The advertised name is only a display hint. Disconnect disables reconnect until Enable is selected again; Forget removes approval. The Android V1 peripheral may use Bluetooth Just Works, so approval here is application authorization, not a claim of authenticated or encrypted pairing. The worker checks the service, Indicate property, and CCCD result before reporting Ready. It logs frame event, sequence, and uptime only.
+
+Radio testing requires a BLE-capable Windows machine and the Android peripheral. Verify both `npm run tauri -- dev` and a packaged executable using the Phase 2 UAT list in `.agent_temp/ble-ptt-integration/phase-2-windows-ble-central.md`; the WinRT Bluetooth capability note for UWP manifests does not establish packaged Tauri behavior. Windows microphone selection and permission remain on the Windows ChatGPT WebView.
+
+Focused checks: `cd src-tauri; cargo test --no-default-features; node tests/chatgpt_adapter.test.cjs`.

@@ -1,13 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ble_central;
 mod general_settings;
 mod project_settings;
 
+use ble_central::{BleCentral, ControlEvent};
 use general_settings::GeneralSettingsState;
 use project_settings::{ProjectSettings, ProjectSettingsState, TabSpec};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -253,25 +255,79 @@ impl TabState {
 
 struct PttTracker {
     held: AtomicBool,
+    owner: Mutex<Option<PttSource>>,
     target_tab_id: Mutex<Option<usize>>,
+    ble_target_tab_id: Mutex<Option<usize>>,
+    ble_send_tab_id: Mutex<Option<usize>>,
+    ble_submit_pending: AtomicBool,
     generation: AtomicUsize,
     scheduled_generation: AtomicUsize,
-    started_generation: AtomicUsize,
+    clicked_generation: AtomicUsize,
+    finish_in_flight: AtomicUsize,
+    start_in_flight: AtomicUsize,
+    finish_tab_id: AtomicUsize,
+    failed_finish_tab_id: AtomicUsize,
+    deferred_events: Mutex<VecDeque<PttEvent>>,
 }
 
 struct PttFinish {
     tab_id: usize,
-    started: bool,
+    generation: usize,
+    start_clicked: bool,
+    submit_pending: bool,
+}
+
+struct PttCancel {
+    tab_id: usize,
+    generation: usize,
+    start_clicked: bool,
+}
+
+enum ClickGuard {
+    Start(Arc<PttTracker>, AppHandle, usize, usize),
+    Finish(Arc<PttTracker>, AppHandle, usize, usize, PttSource, bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PttSource {
+    Keyboard,
+    Ble,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // BLE transport connects these control events in Phase 2.
+enum PttEvent {
+    Down(PttSource),
+    Up(PttSource),
+    SubmitBle,
+    CancelBle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BleSubmitTarget {
+    Queued,
+    Busy,
+    Tab(usize),
+    None,
 }
 
 impl PttTracker {
     fn new() -> Self {
         Self {
             held: AtomicBool::new(false),
+            owner: Mutex::new(None),
             target_tab_id: Mutex::new(None),
+            ble_target_tab_id: Mutex::new(None),
+            ble_send_tab_id: Mutex::new(None),
+            ble_submit_pending: AtomicBool::new(false),
             generation: AtomicUsize::new(0),
             scheduled_generation: AtomicUsize::new(0),
-            started_generation: AtomicUsize::new(0),
+            clicked_generation: AtomicUsize::new(0),
+            finish_in_flight: AtomicUsize::new(0),
+            start_in_flight: AtomicUsize::new(0),
+            finish_tab_id: AtomicUsize::new(0),
+            failed_finish_tab_id: AtomicUsize::new(0),
+            deferred_events: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -279,31 +335,209 @@ impl PttTracker {
         self.held.load(Ordering::SeqCst)
     }
 
-    fn begin(&self, tab_id: usize) -> Option<usize> {
-        if self.held.swap(true, Ordering::SeqCst) {
+    fn defer_during_finish(&self, event: PttEvent) -> bool {
+        let Ok(mut events) = self.deferred_events.lock() else {
+            return true;
+        };
+        if self.finish_in_flight.load(Ordering::SeqCst) == 0
+            && !(matches!(event, PttEvent::Up(_) | PttEvent::CancelBle)
+                && self.start_in_flight.load(Ordering::SeqCst) != 0)
+        {
+            return false;
+        }
+        // A disconnect invalidates any queued BLE button edges and Submit.
+        if event == PttEvent::CancelBle {
+            events.retain(|queued| {
+                !matches!(
+                    queued,
+                    PttEvent::Down(PttSource::Ble)
+                        | PttEvent::Up(PttSource::Ble)
+                        | PttEvent::SubmitBle
+                )
+            });
+        }
+        events.push_back(event);
+        true
+    }
+
+    fn finish_completed(&self, generation: usize) -> Option<VecDeque<PttEvent>> {
+        let mut events = self.deferred_events.lock().ok()?;
+        if self
+            .finish_in_flight
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return None;
         }
+        Some(std::mem::take(&mut *events))
+    }
+
+    fn start_completed(&self, generation: usize) -> Option<VecDeque<PttEvent>> {
+        let mut events = self.deferred_events.lock().ok()?;
+        self.start_in_flight
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(std::mem::take(&mut *events))
+    }
+
+    fn begin(&self, source: PttSource, tab_id: usize) -> Option<usize> {
+        let mut owner = self.owner.lock().ok()?;
+        if owner.is_some() {
+            return None;
+        }
+        *owner = Some(source);
+        self.held.store(true, Ordering::SeqCst);
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.scheduled_generation.store(0, Ordering::SeqCst);
-        self.started_generation.store(0, Ordering::SeqCst);
+        self.clicked_generation.store(0, Ordering::SeqCst);
         if let Ok(mut target) = self.target_tab_id.lock() {
             *target = Some(tab_id);
+        }
+        if source == PttSource::Ble {
+            if let Ok(mut target) = self.ble_target_tab_id.lock() {
+                *target = Some(tab_id);
+            }
+            self.ble_submit_pending.store(false, Ordering::SeqCst);
+            if let Ok(mut send_target) = self.ble_send_tab_id.lock() {
+                *send_target = None;
+            }
         }
         Some(generation)
     }
 
-    fn finish(&self) -> Option<PttFinish> {
-        if !self.held.swap(false, Ordering::SeqCst) {
+    fn finish(&self, source: PttSource) -> Option<PttFinish> {
+        let mut owner = self.owner.lock().ok()?;
+        if *owner != Some(source) {
             return None;
         }
+        *owner = None;
+        self.held.store(false, Ordering::SeqCst);
 
         let generation = self.generation.load(Ordering::SeqCst);
         let tab_id = self.target_tab_id.lock().ok()?.take()?;
         Some(PttFinish {
             tab_id,
-            started: self.started_generation.load(Ordering::SeqCst) == generation,
+            generation,
+            start_clicked: self.clicked_generation.load(Ordering::SeqCst) == generation,
+            submit_pending: source == PttSource::Ble
+                && self.ble_submit_pending.swap(false, Ordering::SeqCst),
         })
+    }
+
+    fn request_ble_submit(&self) -> BleSubmitTarget {
+        let Ok(owner) = self.owner.lock() else {
+            return BleSubmitTarget::None;
+        };
+        if *owner == Some(PttSource::Ble) {
+            self.ble_submit_pending.store(true, Ordering::SeqCst);
+            return BleSubmitTarget::Queued;
+        }
+        if owner.is_some() {
+            return BleSubmitTarget::Busy;
+        }
+        if let Some(tab_id) = self.ble_send_tab_id.lock().ok().and_then(|target| *target) {
+            return BleSubmitTarget::Tab(tab_id);
+        }
+        let tab_id = self
+            .ble_target_tab_id
+            .lock()
+            .ok()
+            .and_then(|mut target| target.take());
+        if let Some(tab_id) = tab_id {
+            self.note_ble_send(tab_id);
+        }
+        tab_id
+            .map(BleSubmitTarget::Tab)
+            .unwrap_or(BleSubmitTarget::None)
+    }
+
+    fn note_ble_send(&self, tab_id: usize) {
+        if let Ok(mut target) = self.ble_send_tab_id.lock() {
+            *target = Some(tab_id);
+        }
+    }
+
+    fn clear_tab(&self, tab_id: usize) {
+        let Ok(mut owner) = self.owner.lock() else {
+            return;
+        };
+        if let Ok(mut target) = self.ble_target_tab_id.lock() {
+            if *target == Some(tab_id) {
+                *target = None;
+            }
+        }
+        if let Ok(mut target) = self.ble_send_tab_id.lock() {
+            if *target == Some(tab_id) {
+                *target = None;
+            }
+        }
+        if self
+            .target_tab_id
+            .lock()
+            .ok()
+            .is_some_and(|target| *target == Some(tab_id))
+        {
+            // Invalidate delayed starts before the WebView is destroyed.
+            self.held.store(false, Ordering::SeqCst);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            *owner = None;
+            if let Ok(mut target) = self.target_tab_id.lock() {
+                *target = None;
+            }
+            self.ble_submit_pending.store(false, Ordering::SeqCst);
+            self.start_in_flight.store(0, Ordering::SeqCst);
+            if let Ok(mut events) = self.deferred_events.lock() {
+                events.clear();
+            }
+        }
+        // The callback checks this token before dispatching a click to a closed tab.
+        if self.finish_tab_id.load(Ordering::SeqCst) == tab_id {
+            self.finish_in_flight.store(0, Ordering::SeqCst);
+            self.finish_tab_id.store(0, Ordering::SeqCst);
+            if let Ok(mut events) = self.deferred_events.lock() {
+                events.clear();
+            }
+        }
+        if self.failed_finish_tab_id.load(Ordering::SeqCst) == tab_id {
+            self.failed_finish_tab_id.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn cancel_ble(&self) -> Option<PttCancel> {
+        let mut owner = self.owner.lock().ok()?;
+        if *owner == Some(PttSource::Keyboard) {
+            return None;
+        }
+        let was_held = *owner == Some(PttSource::Ble);
+        let start_clicked = was_held
+            && self.clicked_generation.load(Ordering::SeqCst)
+                == self.generation.load(Ordering::SeqCst);
+        if was_held {
+            *owner = None;
+            self.held.store(false, Ordering::SeqCst);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.start_in_flight.store(0, Ordering::SeqCst);
+            if let Ok(mut events) = self.deferred_events.lock() {
+                events.clear();
+            }
+        }
+        self.ble_submit_pending.store(false, Ordering::SeqCst);
+        let held_tab = if was_held {
+            self.target_tab_id.lock().ok()?.take()
+        } else {
+            None
+        };
+        let target_tab = self.ble_target_tab_id.lock().ok()?.take();
+        let send_tab = self.ble_send_tab_id.lock().ok()?.take();
+        held_tab
+            .or(send_tab)
+            .or(target_tab)
+            .map(|tab_id| PttCancel {
+                tab_id,
+                generation: self.generation.load(Ordering::SeqCst),
+                start_clicked,
+            })
     }
 
     fn current_generation(&self, tab_id: usize) -> Option<usize> {
@@ -321,13 +555,14 @@ impl PttTracker {
             .is_ok()
     }
 
-    fn mark_started(&self, tab_id: usize, generation: usize) -> bool {
+    fn mark_start_clicked(&self, tab_id: usize, generation: usize) -> bool {
         if !self.is_current(tab_id, generation) {
             return false;
         }
 
-        self.started_generation.store(generation, Ordering::SeqCst);
-        true
+        self.clicked_generation
+            .compare_exchange(0, generation, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     fn is_current(&self, tab_id: usize, generation: usize) -> bool {
@@ -696,6 +931,15 @@ fn create_chatgpt_webview(
     .focused(false)
     .on_page_load(move |webview, payload| {
         if payload.event() == PageLoadEvent::Started {
+            let was_loaded = webview
+                .app_handle()
+                .state::<TabState>()
+                .lock()
+                .map(|mut tabs| tabs.loaded_tabs.remove(&tab_id))
+                .unwrap_or(false);
+            if was_loaded {
+                webview.app_handle().state::<PttState>().0.clear_tab(tab_id);
+            }
             set_tab_status(webview.app_handle(), tab_id, TabStatus::Fallback);
             return;
         }
@@ -1023,6 +1267,7 @@ fn switch_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnaps
 }
 
 fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapshot, String> {
+    app_handle.state::<PttState>().0.clear_tab(tab_id);
     let state = app_handle.state::<TabState>();
     let (was_active, replacement) = {
         let tabs = state.lock()?;
@@ -1358,6 +1603,42 @@ fn set_ptt_auto_submit_enabled(
 }
 
 #[tauri::command]
+fn ble_status(app: AppHandle, webview: Webview) -> Result<ble_central::Snapshot, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<BleCentral>().snapshot()
+}
+
+#[tauri::command]
+fn ble_enable(app: AppHandle, webview: Webview, enabled: bool) -> Result<(), String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<BleCentral>().enable(enabled)
+}
+
+#[tauri::command]
+fn ble_scan(app: AppHandle, webview: Webview) -> Result<(), String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<BleCentral>().scan()
+}
+
+#[tauri::command]
+fn ble_approve(app: AppHandle, webview: Webview, id: String) -> Result<(), String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<BleCentral>().approve(id)
+}
+
+#[tauri::command]
+fn ble_disconnect(app: AppHandle, webview: Webview) -> Result<(), String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<BleCentral>().disconnect()
+}
+
+#[tauri::command]
+fn ble_forget(app: AppHandle, webview: Webview) -> Result<(), String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<BleCentral>().forget()
+}
+
+#[tauri::command]
 fn set_autostart_enabled(app: AppHandle, webview: Webview, enabled: bool) -> Result<bool, String> {
     ensure_settings_webview(&webview)?;
 
@@ -1571,6 +1852,7 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
             TRAY_SETTINGS_ID => open_settings_window(app_handle),
             TRAY_QUIT_ID => {
                 quitting_for_menu.store(true, Ordering::SeqCst);
+                app_handle.state::<BleCentral>().quit();
                 discard_standby_ptt_tab(app_handle);
                 app_handle.exit(0);
             }
@@ -1591,7 +1873,7 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
     Ok(())
 }
 
-fn trusted_click(webview: &Webview, target: DictationTarget) {
+fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Option<ClickGuard>) {
     let script = HSTRING::from(target.rect_script());
 
     let result = webview.with_webview(move |platform_webview| {
@@ -1609,18 +1891,30 @@ fn trusted_click(webview: &Webview, target: DictationTarget) {
 
         unsafe {
             let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
+                let mut clicked = false;
                 if let Err(error) = result {
                     eprintln!("[gpt-wrapper] button lookup script failed: {error:?}");
-                    return Ok(());
-                }
-
-                match serde_json::from_str::<Option<Rect>>(&raw) {
+                } else { match serde_json::from_str::<Option<Rect>>(&raw) {
                     Ok(Some(rect)) => {
+                        match &guard {
+                            Some(ClickGuard::Start(tracker, _, tab_id, generation))
+                                if !tracker.mark_start_clicked(*tab_id, *generation) =>
+                            {
+                                return Ok(())
+                            }
+                            Some(ClickGuard::Finish(tracker, _, _, generation, _, _))
+                                if tracker.finish_in_flight.load(Ordering::SeqCst) != *generation =>
+                            {
+                                return Ok(())
+                            }
+                            _ => {}
+                        }
                         println!(
-                            "[gpt-wrapper] trusted click {:?} at ({:.1}, {:.1})",
+                            "[gpt-wrapper] trusted click dispatch requested {:?} at ({:.1}, {:.1}); recording/delivery unverified",
                             target, rect.x, rect.y
                         );
                         dispatch_trusted_click(&webview_for_callback, rect);
+                        clicked = true;
                     }
                     Ok(None) => {
                         eprintln!(
@@ -1631,6 +1925,20 @@ fn trusted_click(webview: &Webview, target: DictationTarget) {
                     Err(error) => {
                         eprintln!("[gpt-wrapper] could not parse button rect {raw:?}: {error}");
                     }
+                }}
+
+                match guard {
+                    Some(ClickGuard::Finish(tracker, app, tab_id, generation, source, submit_pending)) => {
+                        if clicked {
+                            verify_finish_stopped(app, tracker, tab_id, generation, source, submit_pending, 0);
+                        } else {
+                            complete_finish(app, tracker, tab_id, generation, source, submit_pending, false);
+                        }
+                    }
+                    Some(ClickGuard::Start(tracker, app, tab_id, generation)) if clicked => {
+                        verify_start_visible(app, tracker, tab_id, generation, 0);
+                    }
+                    _ => {}
                 }
 
                 Ok(())
@@ -1647,48 +1955,300 @@ fn trusted_click(webview: &Webview, target: DictationTarget) {
     }
 }
 
+fn complete_finish(
+    app: AppHandle,
+    tracker: Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+    source: PttSource,
+    submit_pending: bool,
+    stopped: bool,
+) {
+    let Some(events) = tracker.finish_completed(generation) else {
+        return;
+    };
+    if !stopped {
+        if events.contains(&PttEvent::CancelBle) {
+            let _ = tracker.cancel_ble();
+        }
+        tracker.failed_finish_tab_id.store(tab_id, Ordering::SeqCst);
+        if let Some(tab) = get_tab_webview(&app, tab_id) {
+            let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
+        }
+        eprintln!("[gpt-wrapper] Finish could not be verified on tab {tab_id}; queued events rejected; recording state uncertain");
+        return;
+    }
+    let disconnected = events.contains(&PttEvent::CancelBle);
+    if let Some(tab) = get_tab_webview(&app, tab_id) {
+        if source == PttSource::Ble {
+            if disconnected {
+                let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
+            } else {
+                let _ = tab.eval("window.__GPT_WRAPPER__?.finishBleSegment?.();");
+            }
+            if submit_pending && !disconnected {
+                tracker.note_ble_send(tab_id);
+                let _ = tab.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();");
+            }
+        } else {
+            let _ = tab.eval("window.__GPT_WRAPPER__?.finishKeyboardSegment?.();");
+            if app
+                .state::<GeneralSettingsState>()
+                .ptt_auto_submit()
+                .unwrap_or(false)
+            {
+                let _ = tab.eval("window.__GPT_WRAPPER__?.waitAndSend?.();");
+            }
+        }
+    }
+    for event in events {
+        handle_ptt_event(&app, event, &tracker);
+    }
+}
+
+fn fail_start(app: AppHandle, tracker: Arc<PttTracker>, tab_id: usize, generation: usize) {
+    if tracker.start_completed(generation).is_none() {
+        return;
+    }
+    let source = tracker.owner.lock().ok().and_then(|owner| *owner);
+    if let Some(source) = source {
+        let _ = tracker.finish(source);
+    }
+    tracker.failed_finish_tab_id.store(tab_id, Ordering::SeqCst);
+    if let Some(tab) = get_tab_webview(&app, tab_id) {
+        let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
+    }
+    eprintln!("[gpt-wrapper] Start could not be verified on tab {tab_id}; queued release rejected; recording state uncertain");
+}
+
+fn verify_start_visible(
+    app: AppHandle,
+    tracker: Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+    attempt: u8,
+) {
+    if tracker.start_in_flight.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    if attempt >= 30 {
+        fail_start(app, tracker, tab_id, generation);
+        return;
+    }
+    let Some(tab) = get_tab_webview(&app, tab_id) else {
+        fail_start(app, tracker, tab_id, generation);
+        return;
+    };
+    let script = HSTRING::from(DictationTarget::Finish.rect_script());
+    let result = tab.with_webview(move |platform| {
+        let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
+            return;
+        };
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
+            if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(Some(_))) {
+                if let Some(events) = tracker.start_completed(generation) {
+                    for event in events {
+                        handle_ptt_event(&app, event, &tracker);
+                    }
+                }
+            } else {
+                thread::spawn({
+                    let app = app.clone();
+                    let tracker = Arc::clone(&tracker);
+                    move || {
+                        thread::sleep(Duration::from_millis(100));
+                        verify_start_visible(app, tracker, tab_id, generation, attempt + 1);
+                    }
+                });
+            }
+            Ok(())
+        }));
+        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
+            eprintln!("[gpt-wrapper] Start verification query failed: {error:?}");
+        }
+    });
+    if let Err(error) = result {
+        eprintln!("[gpt-wrapper] Start verification WebView unavailable: {error:?}");
+    }
+}
+
+fn watch_start_callback(
+    app_handle: AppHandle,
+    tracker: Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        let app = app_handle.clone();
+        let _ = app_handle.run_on_main_thread(move || {
+            fail_start(app, tracker, tab_id, generation);
+        });
+    });
+}
+
+fn verify_finish_stopped(
+    app: AppHandle,
+    tracker: Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+    source: PttSource,
+    submit_pending: bool,
+    attempt: u8,
+) {
+    if tracker.finish_in_flight.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    if attempt >= 30 {
+        complete_finish(
+            app,
+            tracker,
+            tab_id,
+            generation,
+            source,
+            submit_pending,
+            false,
+        );
+        return;
+    }
+    let Some(tab) = get_tab_webview(&app, tab_id) else {
+        complete_finish(
+            app,
+            tracker,
+            tab_id,
+            generation,
+            source,
+            submit_pending,
+            false,
+        );
+        return;
+    };
+    let script = HSTRING::from(DictationTarget::Finish.rect_script());
+    let result = tab.with_webview(move |platform| {
+        let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
+            return;
+        };
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
+            if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(None)) {
+                complete_finish(
+                    app.clone(),
+                    Arc::clone(&tracker),
+                    tab_id,
+                    generation,
+                    source,
+                    submit_pending,
+                    true,
+                );
+            } else {
+                thread::spawn({
+                    let app = app.clone();
+                    let tracker = Arc::clone(&tracker);
+                    move || {
+                        thread::sleep(Duration::from_millis(100));
+                        verify_finish_stopped(
+                            app,
+                            tracker,
+                            tab_id,
+                            generation,
+                            source,
+                            submit_pending,
+                            attempt + 1,
+                        );
+                    }
+                });
+            }
+            Ok(())
+        }));
+        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
+            eprintln!("[gpt-wrapper] Finish verification query failed: {error:?}");
+        }
+    });
+    if let Err(error) = result {
+        eprintln!("[gpt-wrapper] Finish verification WebView unavailable: {error:?}");
+    }
+}
+
+fn watch_finish_callback(
+    app_handle: AppHandle,
+    tracker: Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        let app = app_handle.clone();
+        let _ = app_handle.run_on_main_thread(move || {
+            if let Some(events) = tracker.finish_completed(generation) {
+                if events.contains(&PttEvent::CancelBle) {
+                    let _ = tracker.cancel_ble();
+                }
+                tracker.failed_finish_tab_id.store(tab_id, Ordering::SeqCst);
+                if let Some(tab) = get_tab_webview(&app, tab_id) {
+                    let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
+                }
+                eprintln!("[gpt-wrapper] Finish callback timed out on tab {tab_id}; queued events rejected; recording state uncertain");
+            }
+        });
+    });
+}
+
 fn schedule_ptt_start(
     webview: Webview,
     tracker: Arc<PttTracker>,
     tab_id: usize,
     generation: usize,
-    consider_started_immediately: bool,
+    _consider_started_immediately: bool,
 ) {
     if !tracker.claim_start(tab_id, generation) {
         return;
     }
-    if consider_started_immediately && !tracker.mark_started(tab_id, generation) {
-        return;
-    }
+    tracker.start_in_flight.store(generation, Ordering::SeqCst);
+    watch_start_callback(
+        webview.app_handle().clone(),
+        Arc::clone(&tracker),
+        tab_id,
+        generation,
+    );
 
-    println!("[gpt-wrapper] starting dictation on tab {tab_id}");
+    println!(
+        "[gpt-wrapper] scheduling dictation Start on tab {tab_id}; recording readiness unverified"
+    );
     let _ = webview.eval("window.__GPT_WRAPPER__?.prepareStart?.();");
 
     thread::spawn(move || {
-        let mut needs_started_mark = !consider_started_immediately;
         for delay_ms in [180_u64, 300_u64] {
             thread::sleep(Duration::from_millis(delay_ms));
             if !tracker.is_current(tab_id, generation) {
                 return;
             }
-            if needs_started_mark {
-                if !tracker.mark_started(tab_id, generation) {
-                    return;
-                }
-                needs_started_mark = false;
-            }
-            trusted_click(&webview, DictationTarget::Start);
+            trusted_click_guarded(
+                &webview,
+                DictationTarget::Start,
+                Some(ClickGuard::Start(
+                    Arc::clone(&tracker),
+                    webview.app_handle().clone(),
+                    tab_id,
+                    generation,
+                )),
+            );
         }
     });
 }
 
-fn handle_ptt_shortcut(
-    app_handle: &AppHandle,
-    event_state: ShortcutState,
-    tracker: &Arc<PttTracker>,
-) {
-    match event_state {
-        ShortcutState::Pressed => {
+// Phase 2 BLE transport calls this with Down(Ble), Up(Ble), SubmitBle, or CancelBle.
+// It must never synthesize a keyboard shortcut.
+fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTracker>) {
+    if tracker.defer_during_finish(event) {
+        return;
+    }
+    if tracker.failed_finish_tab_id.load(Ordering::SeqCst) != 0
+        && matches!(event, PttEvent::Down(_) | PttEvent::SubmitBle)
+    {
+        eprintln!("[gpt-wrapper] PTT/Submit rejected: previous Finish failed; resolve dictation in the affected tab or reload it");
+        return;
+    }
+    match event {
+        PttEvent::Down(source) => {
             if tracker.is_held() {
                 return;
             }
@@ -1737,7 +2297,7 @@ fn handle_ptt_shortcut(
                     return;
                 }
 
-                let Some(generation) = tracker.begin(tab_id) else {
+                let Some(generation) = tracker.begin(source, tab_id) else {
                     return;
                 };
 
@@ -1774,7 +2334,7 @@ fn handle_ptt_shortcut(
                 eprintln!("[gpt-wrapper] active ChatGPT webview missing");
                 return;
             };
-            let Some(generation) = tracker.begin(tab_id) else {
+            let Some(generation) = tracker.begin(source, tab_id) else {
                 return;
             };
 
@@ -1786,16 +2346,19 @@ fn handle_ptt_shortcut(
             println!("[gpt-wrapper] hotkey pressed on tab {tab_id}");
             schedule_ptt_start(webview, Arc::clone(tracker), tab_id, generation, true);
         }
-        ShortcutState::Released => {
-            let Some(finish) = tracker.finish() else {
+        PttEvent::Up(source) => {
+            let Some(finish) = tracker.finish(source) else {
                 return;
             };
 
-            if !finish.started {
+            if !finish.start_clicked {
                 println!(
-                    "[gpt-wrapper] hotkey released before dictation start on tab {}",
+                    "[gpt-wrapper] PTT released before dictation Start click on tab {}",
                     finish.tab_id
                 );
+                if source == PttSource::Ble {
+                    tracker.clear_tab(finish.tab_id);
+                }
                 return;
             }
 
@@ -1808,13 +2371,90 @@ fn handle_ptt_shortcut(
             };
 
             println!("[gpt-wrapper] hotkey released on tab {}", finish.tab_id);
-            trusted_click(&webview, DictationTarget::Finish);
-            match app_handle.state::<GeneralSettingsState>().ptt_auto_submit() {
-                Ok(true) => {
-                    let _ = webview.eval("window.__GPT_WRAPPER__?.waitAndSend?.();");
+            tracker.finish_tab_id.store(finish.tab_id, Ordering::SeqCst);
+            tracker
+                .finish_in_flight
+                .store(finish.generation, Ordering::SeqCst);
+            trusted_click_guarded(
+                &webview,
+                DictationTarget::Finish,
+                Some(ClickGuard::Finish(
+                    Arc::clone(tracker),
+                    app_handle.clone(),
+                    finish.tab_id,
+                    finish.generation,
+                    source,
+                    finish.submit_pending,
+                )),
+            );
+            watch_finish_callback(
+                app_handle.clone(),
+                Arc::clone(tracker),
+                finish.tab_id,
+                finish.generation,
+            );
+        }
+        PttEvent::SubmitBle => match tracker.request_ble_submit() {
+            BleSubmitTarget::Queued => println!("[gpt-wrapper] BLE Submit queued for held PTT"),
+            BleSubmitTarget::Busy => {
+                eprintln!("[gpt-wrapper] BLE Submit refused while keyboard PTT is held")
+            }
+            BleSubmitTarget::Tab(tab_id) => {
+                if is_tab_loaded(app_handle, tab_id) {
+                    if let Some(webview) = get_tab_webview(app_handle, tab_id) {
+                        let _ = webview.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();");
+                    }
+                } else {
+                    eprintln!("[gpt-wrapper] BLE Submit target tab {tab_id} unavailable");
                 }
-                Ok(false) => {}
-                Err(error) => eprintln!("[gpt-wrapper] failed to read PTT auto submit: {error}"),
+            }
+            BleSubmitTarget::None => {
+                if app_handle
+                    .state::<TrayVisibilityState>()
+                    .tray_hidden
+                    .load(Ordering::SeqCst)
+                {
+                    eprintln!("[gpt-wrapper] BLE Submit refused: no target while tray-hidden");
+                } else if let Some(tab_id) = active_tab_id(app_handle) {
+                    if is_tab_loaded(app_handle, tab_id) {
+                        if let Some(webview) = get_tab_webview(app_handle, tab_id) {
+                            tracker.note_ble_send(tab_id);
+                            let _ =
+                                webview.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();");
+                        }
+                    }
+                }
+            }
+        },
+        PttEvent::CancelBle => {
+            if let Some(cancel) = tracker.cancel_ble() {
+                if let Some(webview) = get_tab_webview(app_handle, cancel.tab_id) {
+                    let _ = webview.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
+                    if cancel.start_clicked {
+                        tracker.finish_tab_id.store(cancel.tab_id, Ordering::SeqCst);
+                        tracker
+                            .finish_in_flight
+                            .store(cancel.generation, Ordering::SeqCst);
+                        trusted_click_guarded(
+                            &webview,
+                            DictationTarget::Finish,
+                            Some(ClickGuard::Finish(
+                                Arc::clone(tracker),
+                                app_handle.clone(),
+                                cancel.tab_id,
+                                cancel.generation,
+                                PttSource::Ble,
+                                false,
+                            )),
+                        );
+                        watch_finish_callback(
+                            app_handle.clone(),
+                            Arc::clone(tracker),
+                            cancel.tab_id,
+                            cancel.generation,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1834,6 +2474,12 @@ fn main() {
             set_autostart_enabled,
             get_ptt_auto_submit_enabled,
             set_ptt_auto_submit_enabled,
+            ble_status,
+            ble_enable,
+            ble_scan,
+            ble_approve,
+            ble_disconnect,
+            ble_forget,
             get_project_settings,
             create_project,
             edit_project,
@@ -1860,6 +2506,22 @@ fn main() {
             app.manage(ProjectSettingsState::load(project_settings_path));
             let general_settings_path = app.path().app_config_dir()?.join("general-settings.json");
             app.manage(GeneralSettingsState::load(general_settings_path));
+            let ble_app = app.handle().clone();
+            let ble_tracker = Arc::clone(&ptt_tracker);
+            let ble_path = app.path().app_config_dir()?.join("ble-controller.json");
+            app.manage(BleCentral::start(ble_path, move |control| {
+                let app = ble_app.clone();
+                let tracker = Arc::clone(&ble_tracker);
+                let _ = ble_app.run_on_main_thread(move || {
+                    let event = match control {
+                        ControlEvent::Down => PttEvent::Down(PttSource::Ble),
+                        ControlEvent::Up => PttEvent::Up(PttSource::Ble),
+                        ControlEvent::Submit => PttEvent::SubmitBle,
+                        ControlEvent::Cancel => PttEvent::CancelBle,
+                    };
+                    handle_ptt_event(&app, event, &tracker);
+                });
+            }));
 
             let window = WindowBuilder::new(app, MAIN_WINDOW_LABEL)
                 .title("GPT Wrapper")
@@ -1939,7 +2601,14 @@ fn main() {
             app.global_shortcut().on_shortcut(
                 primary_shortcut,
                 move |app_handle, _shortcut, event| {
-                    handle_ptt_shortcut(app_handle, event.state(), &tracker_for_primary);
+                    handle_ptt_event(
+                        app_handle,
+                        match event.state() {
+                            ShortcutState::Pressed => PttEvent::Down(PttSource::Keyboard),
+                            ShortcutState::Released => PttEvent::Up(PttSource::Keyboard),
+                        },
+                        &tracker_for_primary,
+                    );
                 },
             )?;
 
@@ -1947,7 +2616,14 @@ fn main() {
             app.global_shortcut().on_shortcut(
                 numpad_shortcut,
                 move |app_handle, _shortcut, event| {
-                    handle_ptt_shortcut(app_handle, event.state(), &tracker_for_numpad);
+                    handle_ptt_event(
+                        app_handle,
+                        match event.state() {
+                            ShortcutState::Pressed => PttEvent::Down(PttSource::Keyboard),
+                            ShortcutState::Released => PttEvent::Up(PttSource::Keyboard),
+                        },
+                        &tracker_for_numpad,
+                    );
                 },
             )?;
 
@@ -1960,6 +2636,131 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running GPT Wrapper");
+}
+
+#[cfg(test)]
+mod ptt_tests {
+    use super::*;
+
+    #[test]
+    fn source_owns_the_held_session_and_repeated_events_are_safe() {
+        let ptt = PttTracker::new();
+        let generation = ptt.begin(PttSource::Keyboard, 4).unwrap();
+        assert!(ptt.begin(PttSource::Keyboard, 4).is_none());
+        assert!(ptt.begin(PttSource::Ble, 5).is_none());
+        assert!(ptt.finish(PttSource::Ble).is_none());
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Busy);
+        assert!(ptt.mark_start_clicked(4, generation));
+        let finish = ptt.finish(PttSource::Keyboard).unwrap();
+        assert_eq!(finish.tab_id, 4);
+        assert!(finish.start_clicked);
+        assert!(!finish.submit_pending);
+        assert!(ptt.finish(PttSource::Keyboard).is_none());
+    }
+
+    #[test]
+    fn ble_segments_keep_target_until_submit_and_queue_only_once() {
+        let ptt = PttTracker::new();
+        let first = ptt.begin(PttSource::Ble, 7).unwrap();
+        assert!(ptt.mark_start_clicked(7, first));
+        assert!(!ptt.finish(PttSource::Ble).unwrap().submit_pending);
+        let second = ptt.begin(PttSource::Ble, 7).unwrap();
+        assert!(ptt.mark_start_clicked(7, second));
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Queued);
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Queued);
+        assert!(ptt.finish(PttSource::Ble).unwrap().submit_pending);
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Tab(7));
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Tab(7));
+    }
+
+    #[test]
+    fn disconnect_and_tab_close_invalidate_only_owned_work() {
+        let ptt = PttTracker::new();
+        ptt.begin(PttSource::Keyboard, 2).unwrap();
+        assert!(ptt.cancel_ble().is_none());
+        assert!(ptt.is_held());
+        ptt.finish(PttSource::Keyboard);
+
+        let generation = ptt.begin(PttSource::Ble, 3).unwrap();
+        let cancel = ptt.cancel_ble().unwrap();
+        assert_eq!(cancel.tab_id, 3);
+        assert!(!cancel.start_clicked);
+        assert!(!ptt.is_current(3, generation));
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+        ptt.begin(PttSource::Ble, 5).unwrap();
+        ptt.clear_tab(5);
+        assert!(!ptt.is_held());
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+
+        let generation = ptt.begin(PttSource::Ble, 6).unwrap();
+        assert!(ptt.mark_start_clicked(6, generation));
+        let cancel = ptt.cancel_ble().unwrap();
+        assert_eq!(cancel.tab_id, 6);
+        assert!(cancel.start_clicked);
+    }
+
+    #[test]
+    fn delayed_finish_orders_next_session_and_disconnect_drops_ble_edges() {
+        let ptt = PttTracker::new();
+        let first = ptt.begin(PttSource::Ble, 7).unwrap();
+        assert!(ptt.mark_start_clicked(7, first));
+        ptt.finish(PttSource::Ble).unwrap();
+        ptt.finish_tab_id.store(7, Ordering::SeqCst);
+        ptt.finish_in_flight.store(first, Ordering::SeqCst);
+        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Ble)));
+        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Ble)));
+        assert_eq!(
+            ptt.finish_completed(first)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::Down(PttSource::Ble), PttEvent::Up(PttSource::Ble)]
+        );
+
+        let second = ptt.begin(PttSource::Ble, 7).unwrap();
+        assert!(second > first);
+        assert!(ptt.mark_start_clicked(7, second));
+        ptt.finish(PttSource::Ble).unwrap();
+        ptt.finish_in_flight.store(second, Ordering::SeqCst);
+        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Ble)));
+        assert!(ptt.defer_during_finish(PttEvent::SubmitBle));
+        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert_eq!(
+            ptt.finish_completed(second)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::CancelBle]
+        );
+    }
+
+    #[test]
+    fn closing_finish_tab_invalidates_its_pending_callback() {
+        let ptt = PttTracker::new();
+        let generation = ptt.begin(PttSource::Ble, 8).unwrap();
+        assert!(ptt.mark_start_clicked(8, generation));
+        ptt.finish(PttSource::Ble).unwrap();
+        ptt.finish_tab_id.store(8, Ordering::SeqCst);
+        ptt.finish_in_flight.store(generation, Ordering::SeqCst);
+        ptt.clear_tab(8);
+        assert!(ptt.finish_completed(generation).is_none());
+    }
+
+    #[test]
+    fn release_and_disconnect_wait_for_delayed_start_observation() {
+        let ptt = PttTracker::new();
+        let generation = ptt.begin(PttSource::Ble, 9).unwrap();
+        ptt.start_in_flight.store(generation, Ordering::SeqCst);
+        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Ble)));
+        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert_eq!(
+            ptt.start_completed(generation)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::CancelBle]
+        );
+    }
 }
 
 #[cfg(test)]
