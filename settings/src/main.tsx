@@ -6,7 +6,7 @@ import ProjectBookmarks from "./ProjectBookmarks";
 
 type SettingsTab = "general" | "bookmarks";
 type StatusKind = "" | "success" | "error";
-type BleDevice = { id: string; name: string };
+type BleDevice = { id: string; name: string; label: string };
 type BleSnapshot = { enabled: boolean; approvedDevice: BleDevice | null; candidates: BleDevice[]; state: string; detail: string; lastRx: string | null };
 
 function GeneralSettings() {
@@ -189,7 +189,7 @@ function GeneralSettings() {
           <input id="ble-enabled" type="checkbox" checked={ble()?.enabled ?? false} disabled={bleBusy() || !ble()} onChange={(event) => void bleAction("ble_enable", { enabled: event.currentTarget.checked })} />
           <div class="setting-copy"><label class="setting-label" for="ble-enabled">啟用 BLE 控制器</label><p class="setting-description">使用已核准的 Android PTT 裝置控制 Windows 麥克風聽寫。</p></div>
         </div>
-        <p class="ble-state"><strong>狀態：</strong>{({ scanning: "Scanning", connecting: "Connecting", "link-connected": "Link connected", "service-found": "Service found", ready: "Subscribed/Ready", disconnected: "Disconnected", error: "Error" } as Record<string, string>)[ble()?.state ?? ""] ?? "Loading"} · {ble()?.detail}</p>
+        <p class="ble-state"><strong>狀態：</strong>{({ scanning: "Scanning", "waiting-for-device": "Waiting for approved device", "approved-identity-mismatch": "Approved identity mismatch", "bond-required": "Windows pairing required", pairing: "Pairing", "pairing-failed": "Pairing failed", "gatt-unreachable": "GATT unreachable", "cccd-failed": "CCCD subscription failed", connecting: "Connecting", "link-connected": "Link connected", "service-found": "Service found", ready: "Subscribed/Ready", disconnected: "Disconnected", error: "Error" } as Record<string, string>)[ble()?.state ?? ""] ?? "Loading"} · {ble()?.detail}</p>
         <Show when={ble()?.approvedDevice}><p class="ble-device">已核准：{ble()?.approvedDevice?.name || "未命名裝置"}</p></Show>
         <div class="ble-actions">
           <button type="button" disabled={bleBusy()} onClick={() => void bleAction("ble_scan")}>Scan</button>
@@ -197,7 +197,7 @@ function GeneralSettings() {
           <button type="button" disabled={bleBusy() || !ble()?.approvedDevice} onClick={() => void bleAction("ble_forget")}>Forget</button>
         </div>
         <Show when={(ble()?.candidates.length ?? 0) > 0}>
-          <div class="ble-candidates"><For each={ble()?.candidates ?? []}>{(device) => <div class="ble-candidate"><span>{device.name || "未命名裝置"} <small>{device.id}</small></span><button type="button" disabled={bleBusy()} onClick={() => void bleAction("ble_approve", { id: device.id })}>Approve/Connect</button></div>}</For></div>
+          <div class="ble-candidates"><For each={ble()?.candidates ?? []}>{(device) => <div class="ble-candidate"><span>{device.name || "未命名裝置"} <small>裝置識別 {device.label}</small></span><button type="button" disabled={bleBusy()} onClick={() => void bleAction("ble_approve", { id: device.id })}>Pair/Approve</button></div>}</For></div>
         </Show>
         <Show when={ble()?.lastRx}><p class="setting-description">RX: {ble()?.lastRx}</p></Show>
         <Show when={bleError()}><p class="status is-error" role="alert">{bleError()}</p></Show>
