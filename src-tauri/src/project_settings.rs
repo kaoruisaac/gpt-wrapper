@@ -6,9 +6,12 @@ use uuid::Uuid;
 pub const CHATGPT_URL: &str = "https://chatgpt.com";
 pub const CHATGPT_TITLE: &str = "ChatGPT";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabSpec {
     pub url: Url,
     pub title: String,
+    pub project_id: Option<Uuid>,
+    pub message_prefix: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,6 +41,8 @@ impl ProjectSettings {
         Ok(TabSpec {
             url: valid_url(&project.url)?,
             title: project.name.clone(),
+            project_id: Some(project.id),
+            message_prefix: project.message_prefix.clone(),
         })
     }
 
@@ -48,14 +53,19 @@ impl ProjectSettings {
                 valid_url(&project.url).ok().map(|url| TabSpec {
                     url,
                     title: project.name.clone(),
+                    project_id: Some(project.id),
+                    message_prefix: project.message_prefix.clone(),
                 })
             })
             .unwrap_or_else(|| TabSpec {
                 url: Url::parse(CHATGPT_URL).expect("built-in URL is valid"),
                 title: CHATGPT_TITLE.to_string(),
+                project_id: None,
+                message_prefix: String::new(),
             })
     }
 
+    #[cfg(test)]
     pub fn resolved_url(&self) -> Url {
         self.default_tab_spec().url
     }
@@ -139,14 +149,14 @@ impl ProjectSettingsState {
             .data
             .lock()
             .map_err(|_| "project settings lock was poisoned".to_string())?;
-        let old_url = current.resolved_url();
+        let old_spec = current.default_tab_spec();
         let mut next = current.clone();
         change(&mut next)?;
         next.normalize_reference();
-        let url_changed = old_url != next.resolved_url();
+        let default_changed = old_spec != next.default_tab_spec();
         self.persist(&next)?;
         *current = next.clone();
-        Ok((next, url_changed))
+        Ok((next, default_changed))
     }
 
     fn persist(&self, data: &ProjectSettings) -> Result<(), String> {
@@ -272,6 +282,8 @@ mod tests {
         let default = data.default_tab_spec();
         assert_eq!(default.url.as_str(), "https://example.com/project");
         assert_eq!(default.title, "Renamed");
+        assert_eq!(default.project_id, Some(first));
+        assert_eq!(default.message_prefix, "text");
         delete(&mut data, first).unwrap();
         assert_eq!(data.default_project_id, None);
         assert_eq!(data.projects[0].id, second);
@@ -334,6 +346,8 @@ mod tests {
         let selected = data.project_tab_spec(id).unwrap();
         assert_eq!(selected.url.as_str(), "https://example.com/new");
         assert_eq!(selected.title, "Renamed");
+        assert_eq!(selected.project_id, Some(id));
+        assert_eq!(selected.message_prefix, "");
         assert_eq!(data.default_project_id, None);
         delete(&mut data, id).unwrap();
         assert!(data.project_tab_spec(id).is_err());
@@ -345,11 +359,14 @@ mod tests {
         let fallback = data.default_tab_spec();
         assert_eq!(fallback.url.as_str(), "https://chatgpt.com/");
         assert_eq!(fallback.title, CHATGPT_TITLE);
+        assert_eq!(fallback.project_id, None);
+        assert_eq!(fallback.message_prefix, "");
 
         data.default_project_id = Some(Uuid::new_v4());
         let missing = data.default_tab_spec();
         assert_eq!(missing.url.as_str(), "https://chatgpt.com/");
         assert_eq!(missing.title, CHATGPT_TITLE);
+        assert_eq!(missing.project_id, None);
 
         create(
             &mut data,
@@ -373,6 +390,36 @@ mod tests {
         assert_eq!(original.title, "Old Name");
         assert_eq!(renamed.title, "New Name");
         assert_eq!(renamed.url, original.url);
+    }
+
+    #[test]
+    fn default_context_changes_even_when_url_does_not() {
+        let mut data = ProjectSettings::default();
+        create(&mut data, "A".into(), CHATGPT_URL.into(), "A ".into()).unwrap();
+        let a = data.projects[0].id;
+        create(&mut data, "B".into(), CHATGPT_URL.into(), "B\n".into()).unwrap();
+        let b = data.projects[0].id;
+        set_default(&mut data, Some(a)).unwrap();
+        let a_spec = data.default_tab_spec();
+        set_default(&mut data, Some(b)).unwrap();
+        let b_spec = data.default_tab_spec();
+        assert_eq!(a_spec.url, b_spec.url);
+        assert_ne!(a_spec, b_spec);
+        assert_eq!(b_spec.project_id, Some(b));
+        assert_eq!(b_spec.message_prefix, "B\n");
+
+        edit(
+            &mut data,
+            b,
+            "B renamed".into(),
+            CHATGPT_URL.into(),
+            "NEW ".into(),
+        )
+        .unwrap();
+        let edited = data.default_tab_spec();
+        assert_ne!(edited, b_spec);
+        assert_eq!(edited.title, "B renamed");
+        assert_eq!(edited.message_prefix, "NEW ");
     }
 
     #[test]

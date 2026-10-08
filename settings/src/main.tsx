@@ -9,7 +9,9 @@ type StatusKind = "" | "success" | "error";
 
 function GeneralSettings() {
   const [autostartEnabled, setAutostartEnabled] = createSignal(false);
-  const [busy, setBusy] = createSignal(true);
+  const [autostartBusy, setAutostartBusy] = createSignal(true);
+  const [pttAutoSubmitEnabled, setPttAutoSubmitEnabled] = createSignal(true);
+  const [pttBusy, setPttBusy] = createSignal(true);
   const [statusMessage, setStatusMessage] = createSignal("");
   const [statusKind, setStatusKind] = createSignal<StatusKind>("");
 
@@ -19,29 +21,28 @@ function GeneralSettings() {
   };
 
   const readAutostartState = async () => {
-    setBusy(true);
+    setAutostartBusy(true);
     try {
       const enabled = Boolean(await invoke<boolean>("get_autostart_enabled"));
       setAutostartEnabled(enabled);
-      setStatus();
       return enabled;
     } catch (error) {
       console.error("[gpt-wrapper] failed to read autostart state:", error);
       setStatus("無法讀取開機自動啟動狀態。", "error");
       throw error;
     } finally {
-      setBusy(false);
+      setAutostartBusy(false);
     }
   };
 
   const handleAutostartChange = async (event: Event & { currentTarget: HTMLInputElement }) => {
-    if (busy()) return;
+    if (autostartBusy()) return;
 
     const previous = autostartEnabled();
     const desired = event.currentTarget.checked;
 
     setAutostartEnabled(desired);
-    setBusy(true);
+    setAutostartBusy(true);
     setStatus();
 
     try {
@@ -71,12 +72,55 @@ function GeneralSettings() {
 
       setStatus("更新失敗，已恢復實際設定狀態。", "error");
     } finally {
-      setBusy(false);
+      setAutostartBusy(false);
+    }
+  };
+
+  const readPttAutoSubmitState = async () => {
+    setPttBusy(true);
+    try {
+      setPttAutoSubmitEnabled(await invoke<boolean>("get_ptt_auto_submit_enabled"));
+    } catch (error) {
+      console.error("[gpt-wrapper] failed to read PTT auto submit state:", error);
+      setStatus("無法讀取 PTT shortcuts 自動送出設定。", "error");
+    } finally {
+      setPttBusy(false);
+    }
+  };
+
+  const handlePttAutoSubmitChange = async (event: Event & { currentTarget: HTMLInputElement }) => {
+    if (pttBusy()) return;
+    const previous = pttAutoSubmitEnabled();
+    const desired = event.currentTarget.checked;
+    setPttAutoSubmitEnabled(desired);
+    setPttBusy(true);
+    setStatus();
+    try {
+      const actual = await invoke<boolean>("set_ptt_auto_submit_enabled", { enabled: desired });
+      setPttAutoSubmitEnabled(actual);
+      setStatus(
+        actual === desired
+          ? desired ? "已啟用 PTT 自動送出。" : "已停用 PTT 自動送出。"
+          : "系統回報的設定狀態與要求不同，已重新同步。",
+        actual === desired ? "success" : "error",
+      );
+    } catch (error) {
+      console.error("[gpt-wrapper] failed to update PTT auto submit:", error);
+      try {
+        setPttAutoSubmitEnabled(await invoke<boolean>("get_ptt_auto_submit_enabled"));
+      } catch (syncError) {
+        console.error("[gpt-wrapper] failed to resync PTT auto submit:", syncError);
+        setPttAutoSubmitEnabled(previous);
+      }
+      setStatus("更新 PTT 自動送出失敗，已恢復實際設定狀態。", "error");
+    } finally {
+      setPttBusy(false);
     }
   };
 
   onMount(() => {
     void readAutostartState().catch(() => {});
+    void readPttAutoSubmitState();
   });
 
   return (
@@ -88,7 +132,7 @@ function GeneralSettings() {
           id="autostart"
           type="checkbox"
           checked={autostartEnabled()}
-          disabled={busy()}
+          disabled={autostartBusy()}
           onChange={handleAutostartChange}
         />
         <div class="setting-copy">
@@ -97,6 +141,24 @@ function GeneralSettings() {
           </label>
           <p class="setting-description">
             Windows 登入後會在背景啟動並常駐 system tray，不會自動顯示主視窗。
+          </p>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <input
+          id="ptt-auto-submit"
+          type="checkbox"
+          checked={pttAutoSubmitEnabled()}
+          disabled={pttBusy()}
+          onChange={handlePttAutoSubmitChange}
+        />
+        <div class="setting-copy">
+          <label class="setting-label" for="ptt-auto-submit">
+            PTT shortcuts 自動送出訊息
+          </label>
+          <p class="setting-description">
+            關閉後，放開 PTT 仍會完成轉錄，但文字會保留在輸入框中，需手動送出。
           </p>
         </div>
       </div>

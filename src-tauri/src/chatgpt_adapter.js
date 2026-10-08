@@ -30,7 +30,66 @@
       q("#composer-submit-button");
   };
 
+  const focusComposerAtEnd = (el) => {
+    el.focus({ preventScroll: true });
+
+    if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+      return (
+        document.activeElement === el &&
+        el.selectionStart === end &&
+        el.selectionEnd === end
+      );
+    }
+
+    if (el.isContentEditable) {
+      const selection = window.getSelection();
+      if (!selection) return false;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return (
+        document.activeElement === el &&
+        selection.rangeCount === 1 &&
+        selection.getRangeAt(0).collapsed &&
+        el.contains(selection.getRangeAt(0).endContainer)
+      );
+    }
+
+    return false;
+  };
+
   window.__GPT_WRAPPER__ = {
+    applyMessagePrefix(prefix) {
+      if (prefix === "") return "success";
+      const el = composer();
+      if (!el || !(el instanceof HTMLElement) || !el.isConnected) return "not-ready";
+
+      try {
+        if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+          if (el.disabled || el.readOnly) return "not-ready";
+          const prototype = el instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+          Object.getOwnPropertyDescriptor(prototype, "value").set.call(el, prefix);
+        } else if (el.isContentEditable) {
+          el.textContent = prefix;
+        } else {
+          return "not-ready";
+        }
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prefix }));
+        const actual = el.value ?? el.innerText ?? el.textContent ?? "";
+        if (actual !== prefix) return "failure";
+        return focusComposerAtEnd(el) ? "success" : "failure";
+      } catch (error) {
+        console.error("[gpt-wrapper] message prefix injection failed", error);
+        return "failure";
+      }
+    },
+
     prepareStart() {
       clearInterval(state.timer);
       state.before = composerText();

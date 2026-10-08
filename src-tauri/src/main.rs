@@ -1,9 +1,13 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod general_settings;
 mod project_settings;
 
+use general_settings::GeneralSettingsState;
 use project_settings::{ProjectSettings, ProjectSettingsState, TabSpec};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -110,6 +114,7 @@ struct TabSnapshot {
 #[derive(Debug)]
 struct TabManager {
     tabs: Vec<TabInfo>,
+    contexts: HashMap<usize, TabContext>,
     loaded_tabs: HashSet<usize>,
     active_tab_id: Option<usize>,
     next_tab_id: usize,
@@ -117,10 +122,30 @@ struct TabManager {
     standby_ptt_ready: bool,
 }
 
+#[derive(Debug)]
+struct TabContext {
+    spec: TabSpec,
+    prefix_applied: bool,
+    prefix_in_progress: bool,
+    background_ptt_pending: bool,
+}
+
+impl TabContext {
+    fn new(spec: TabSpec) -> Self {
+        Self {
+            spec,
+            prefix_applied: false,
+            prefix_in_progress: false,
+            background_ptt_pending: false,
+        }
+    }
+}
+
 impl TabManager {
     fn new() -> Self {
         Self {
             tabs: Vec::new(),
+            contexts: HashMap::new(),
             loaded_tabs: HashSet::new(),
             active_tab_id: None,
             next_tab_id: 1,
@@ -241,6 +266,14 @@ impl PttTracker {
             .map(|target| *target == Some(tab_id))
             .unwrap_or(false)
     }
+
+    fn cancel_pending(&self, tab_id: usize, generation: usize) {
+        if self.is_current(tab_id, generation) {
+            if let Ok(mut target) = self.target_tab_id.lock() {
+                *target = None;
+            }
+        }
+    }
 }
 
 struct PttState(Arc<PttTracker>);
@@ -334,6 +367,149 @@ fn is_tab_loaded(app_handle: &AppHandle, tab_id: usize) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone, Copy)]
+enum PrefixFlow {
+    Normal,
+    BackgroundPtt(usize),
+}
+
+fn prefix_flow_current(app: &AppHandle, tab_id: usize, flow: PrefixFlow) -> bool {
+    let exists = app
+        .state::<TabState>()
+        .lock()
+        .map(|tabs| tabs.contexts.contains_key(&tab_id) && tabs.tabs.iter().any(|t| t.id == tab_id))
+        .unwrap_or(false);
+    exists
+        && match flow {
+            PrefixFlow::Normal => true,
+            PrefixFlow::BackgroundPtt(generation) => {
+                app.state::<PttState>().0.is_current(tab_id, generation)
+            }
+        }
+}
+
+fn finish_prefix_flow(app: &AppHandle, tab_id: usize, flow: PrefixFlow, success: bool) {
+    if !prefix_flow_current(app, tab_id, flow) {
+        return;
+    }
+    if let Ok(mut tabs) = app.state::<TabState>().lock() {
+        if let Some(context) = tabs.contexts.get_mut(&tab_id) {
+            context.prefix_in_progress = false;
+            if success {
+                context.prefix_applied = true;
+            }
+            context.background_ptt_pending = false;
+        }
+    }
+
+    if let PrefixFlow::BackgroundPtt(generation) = flow {
+        let tracker = Arc::clone(&app.state::<PttState>().0);
+        if success {
+            if let Some(webview) = get_tab_webview(app, tab_id) {
+                schedule_ptt_start(webview, tracker, tab_id, generation, false);
+            }
+        } else {
+            tracker.cancel_pending(tab_id, generation);
+        }
+    }
+}
+
+fn inject_prefix_attempt(
+    app: AppHandle,
+    webview: Webview,
+    tab_id: usize,
+    flow: PrefixFlow,
+    prefix: String,
+    attempt: usize,
+) {
+    if !prefix_flow_current(&app, tab_id, flow) {
+        return;
+    }
+    let script = HSTRING::from(format!(
+        "window.__GPT_WRAPPER__?.applyMessagePrefix?.({}) ?? 'not-ready'",
+        serde_json::to_string(&prefix).expect("prefix is serializable")
+    ));
+    let app_for_callback = app.clone();
+    let webview_for_callback = webview.clone();
+    let result = webview.with_webview(move |platform_webview| {
+        let core = match unsafe { platform_webview.controller().CoreWebView2() } {
+            Ok(core) => core,
+            Err(error) => {
+                eprintln!("[gpt-wrapper] prefix injection WebView2 unavailable on tab {tab_id}: {error:?}");
+                finish_prefix_flow(&app_for_callback, tab_id, flow, false);
+                return;
+            }
+        };
+        let app_for_result = app_for_callback.clone();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
+            if !prefix_flow_current(&app_for_result, tab_id, flow) {
+                return Ok(());
+            }
+            let status = if let Err(error) = result {
+                eprintln!("[gpt-wrapper] prefix injection script failed on tab {tab_id}: {error:?}");
+                "failure".to_string()
+            } else {
+                serde_json::from_str::<String>(&raw).unwrap_or_else(|_| "failure".to_string())
+            };
+            match status.as_str() {
+                "success" => finish_prefix_flow(&app_for_result, tab_id, flow, true),
+                "not-ready" if attempt < 10 => {
+                    let app = app_for_result.clone();
+                    let webview = webview_for_callback.clone();
+                    let prefix = prefix.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(200));
+                        inject_prefix_attempt(app, webview, tab_id, flow, prefix, attempt + 1);
+                    });
+                }
+                _ => {
+                    eprintln!("[gpt-wrapper] message prefix injection failed on tab {tab_id}: {status} (attempt {})", attempt + 1);
+                    finish_prefix_flow(&app_for_result, tab_id, flow, false);
+                }
+            }
+            Ok(())
+        }));
+        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
+            eprintln!("[gpt-wrapper] prefix injection ExecuteScript failed on tab {tab_id}: {error:?}");
+            finish_prefix_flow(&app_for_callback, tab_id, flow, false);
+        }
+    });
+    if let Err(error) = result {
+        eprintln!("[gpt-wrapper] prefix injection with_webview failed on tab {tab_id}: {error:?}");
+        finish_prefix_flow(&app, tab_id, flow, false);
+    }
+}
+
+fn begin_prefix_flow(app: &AppHandle, webview: Webview, tab_id: usize, flow: PrefixFlow) {
+    if !prefix_flow_current(app, tab_id, flow) {
+        return;
+    }
+    let prefix = {
+        let state = app.state::<TabState>();
+        let Ok(mut tabs) = state.lock() else {
+            return;
+        };
+        let Some(context) = tabs.contexts.get_mut(&tab_id) else {
+            return;
+        };
+        if context.prefix_in_progress {
+            return;
+        }
+        if context.prefix_applied || context.spec.message_prefix.is_empty() {
+            context.prefix_applied = true;
+            String::new()
+        } else {
+            context.prefix_in_progress = true;
+            context.spec.message_prefix.clone()
+        }
+    };
+    if prefix.is_empty() {
+        finish_prefix_flow(app, tab_id, flow, true);
+    } else {
+        inject_prefix_attempt(app.clone(), webview, tab_id, flow, prefix, 0);
+    }
+}
+
 fn create_chatgpt_webview(
     app_handle: &AppHandle,
     tab_id: usize,
@@ -400,8 +576,23 @@ fn create_chatgpt_webview(
 
         if became_normal_loaded {
             let tracker = Arc::clone(&app_handle.state::<PttState>().0);
-            if let Some(generation) = tracker.current_generation(tab_id) {
-                schedule_ptt_start(webview.clone(), tracker, tab_id, generation, false);
+            let background_pending = app_handle
+                .state::<TabState>()
+                .lock()
+                .ok()
+                .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c| c.background_ptt_pending))
+                .unwrap_or(false);
+            if background_pending {
+                if let Some(generation) = tracker.current_generation(tab_id) {
+                    begin_prefix_flow(
+                        app_handle,
+                        webview.clone(),
+                        tab_id,
+                        PrefixFlow::BackgroundPtt(generation),
+                    );
+                }
+            } else {
+                begin_prefix_flow(app_handle, webview.clone(), tab_id, PrefixFlow::Normal);
             }
         }
     });
@@ -434,10 +625,14 @@ fn create_tab_internal(app_handle: &AppHandle) -> Result<TabSnapshot, String> {
         .state::<ProjectSettingsState>()
         .snapshot()?
         .default_tab_spec();
-    create_tab_with_spec(app_handle, spec)
+    create_tab_with_spec(app_handle, spec, false)
 }
 
-fn create_tab_with_spec(app_handle: &AppHandle, spec: TabSpec) -> Result<TabSnapshot, String> {
+fn create_tab_with_spec(
+    app_handle: &AppHandle,
+    spec: TabSpec,
+    background_ptt: bool,
+) -> Result<TabSnapshot, String> {
     let state = app_handle.state::<TabState>();
     let (tab_id, previous_active) = {
         let mut tabs = state.lock()?;
@@ -446,8 +641,11 @@ fn create_tab_with_spec(app_handle: &AppHandle, spec: TabSpec) -> Result<TabSnap
         let previous_active = tabs.active_tab_id;
         tabs.tabs.push(TabInfo {
             id: tab_id,
-            title: spec.title,
+            title: spec.title.clone(),
         });
+        let mut context = TabContext::new(spec.clone());
+        context.background_ptt_pending = background_ptt;
+        tabs.contexts.insert(tab_id, context);
         tabs.active_tab_id = Some(tab_id);
         (tab_id, previous_active)
     };
@@ -455,6 +653,7 @@ fn create_tab_with_spec(app_handle: &AppHandle, spec: TabSpec) -> Result<TabSnap
     if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url) {
         let mut tabs = state.lock()?;
         tabs.tabs.retain(|tab| tab.id != tab_id);
+        tabs.contexts.remove(&tab_id);
         tabs.loaded_tabs.remove(&tab_id);
         tabs.active_tab_id = previous_active;
         return Err(error);
@@ -472,10 +671,10 @@ fn create_tab_with_spec(app_handle: &AppHandle, spec: TabSpec) -> Result<TabSnap
 }
 
 fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
-    let url = app_handle
+    let spec = app_handle
         .state::<ProjectSettingsState>()
         .snapshot()?
-        .resolved_url();
+        .default_tab_spec();
     let state = app_handle.state::<TabState>();
     let tab_id = {
         let mut tabs = state.lock()?;
@@ -487,16 +686,18 @@ fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
         tabs.next_tab_id += 1;
         tabs.standby_ptt_tab_id = Some(tab_id);
         tabs.standby_ptt_ready = false;
+        tabs.contexts.insert(tab_id, TabContext::new(spec.clone()));
         tab_id
     };
 
-    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, url) {
+    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url) {
         let mut tabs = state.lock()?;
         if tabs.standby_ptt_tab_id == Some(tab_id) {
             tabs.standby_ptt_tab_id = None;
             tabs.standby_ptt_ready = false;
         }
         tabs.loaded_tabs.remove(&tab_id);
+        tabs.contexts.remove(&tab_id);
         return Err(error);
     }
 
@@ -515,6 +716,7 @@ fn discard_standby_ptt_tab(app_handle: &AppHandle) {
         tabs.standby_ptt_ready = false;
         if let Some(tab_id) = standby_id {
             tabs.loaded_tabs.remove(&tab_id);
+            tabs.contexts.remove(&tab_id);
         }
         standby_id
     };
@@ -529,19 +731,23 @@ fn discard_standby_ptt_tab(app_handle: &AppHandle) {
 }
 
 fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), String> {
-    let state = app_handle.state::<TabState>();
-    let standby_id = state
-        .lock()?
-        .standby_ptt_tab_id
-        .ok_or_else(|| "standby PTT tab is missing".to_string())?;
-    let webview = get_tab_webview(app_handle, standby_id)
-        .ok_or_else(|| format!("standby PTT webview {standby_id} is missing"))?;
-    let title = app_handle
+    let current_spec = app_handle
         .state::<ProjectSettingsState>()
         .snapshot()?
-        .default_tab_spec()
-        .title;
-
+        .default_tab_spec();
+    let state = app_handle.state::<TabState>();
+    let standby_id = {
+        let tabs = state.lock()?;
+        let standby_id = tabs
+            .standby_ptt_tab_id
+            .ok_or_else(|| "standby PTT tab is missing".to_string())?;
+        if tabs.contexts.get(&standby_id).map(|c| &c.spec) != Some(&current_spec) {
+            return Err("standby Project context is outdated".to_string());
+        }
+        standby_id
+    };
+    let webview = get_tab_webview(app_handle, standby_id)
+        .ok_or_else(|| format!("standby PTT webview {standby_id} is missing"))?;
     let (previous_active, ready) = {
         let mut tabs = state.lock()?;
         if tabs.standby_ptt_tab_id != Some(standby_id) {
@@ -552,6 +758,12 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
         let ready = tabs.standby_ptt_ready;
         tabs.standby_ptt_tab_id = None;
         tabs.standby_ptt_ready = false;
+        let context = tabs
+            .contexts
+            .get_mut(&standby_id)
+            .ok_or("standby context missing")?;
+        context.background_ptt_pending = true;
+        let title = context.spec.title.clone();
         tabs.tabs.push(TabInfo {
             id: standby_id,
             title,
@@ -662,6 +874,7 @@ fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapsh
         let mut tabs = state.lock()?;
         tabs.tabs.retain(|tab| tab.id != tab_id);
         tabs.loaded_tabs.remove(&tab_id);
+        tabs.contexts.remove(&tab_id);
         if was_active {
             tabs.active_tab_id = replacement;
         }
@@ -721,7 +934,7 @@ async fn create_project_tab(
         .state::<ProjectSettingsState>()
         .snapshot()?
         .project_tab_spec(project_id)?;
-    create_tab_with_spec(&app, spec)
+    create_tab_with_spec(&app, spec, false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,8 +1051,8 @@ fn update_project_settings(
     app: &AppHandle,
     change: impl FnOnce(&mut ProjectSettings) -> Result<(), String>,
 ) -> Result<ProjectSettings, String> {
-    let (settings, url_changed) = app.state::<ProjectSettingsState>().update(change)?;
-    if url_changed {
+    let (settings, default_changed) = app.state::<ProjectSettingsState>().update(change)?;
+    if default_changed {
         let has_standby = app.state::<TabState>().lock()?.standby_ptt_tab_id.is_some();
         if has_standby {
             discard_standby_ptt_tab(app);
@@ -917,6 +1130,23 @@ fn get_autostart_enabled(app: AppHandle, webview: Webview) -> Result<bool, Strin
         eprintln!("[gpt-wrapper] {message}");
         message
     })
+}
+
+#[tauri::command]
+fn get_ptt_auto_submit_enabled(app: AppHandle, webview: Webview) -> Result<bool, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<GeneralSettingsState>().ptt_auto_submit()
+}
+
+#[tauri::command]
+fn set_ptt_auto_submit_enabled(
+    app: AppHandle,
+    webview: Webview,
+    enabled: bool,
+) -> Result<bool, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<GeneralSettingsState>()
+        .set_ptt_auto_submit(enabled)
 }
 
 #[tauri::command]
@@ -1257,14 +1487,19 @@ fn handle_ptt_shortcut(
                 .swap(false, Ordering::SeqCst);
 
             if was_tray_hidden {
-                let (tab_id, ready_before_session) = match promote_standby_ptt_tab(app_handle) {
-                    Ok((tab_id, ready)) => (tab_id, ready),
+                let tab_id = match promote_standby_ptt_tab(app_handle) {
+                    Ok((tab_id, _ready)) => tab_id,
                     Err(error) => {
                         eprintln!(
                             "[gpt-wrapper] standby promotion failed, creating fallback tab: {error}"
                         );
                         discard_standby_ptt_tab(app_handle);
-                        if let Err(create_error) = create_tab_internal(app_handle) {
+                        let fallback = app_handle
+                            .state::<ProjectSettingsState>()
+                            .snapshot()
+                            .map(|settings| settings.default_tab_spec())
+                            .and_then(|spec| create_tab_with_spec(app_handle, spec, true));
+                        if let Err(create_error) = fallback {
                             eprintln!(
                                 "[gpt-wrapper] failed to create fallback PTT tab: {create_error}"
                             );
@@ -1279,12 +1514,8 @@ fn handle_ptt_shortcut(
                             eprintln!("[gpt-wrapper] fallback PTT tab missing");
                             return;
                         };
-                        (tab_id, is_tab_loaded(app_handle, tab_id))
+                        tab_id
                     }
-                };
-
-                let Some(generation) = tracker.begin(tab_id) else {
-                    return;
                 };
 
                 if let Some(window) = app_handle.get_window(MAIN_WINDOW_LABEL) {
@@ -1294,18 +1525,21 @@ fn handle_ptt_shortcut(
                     return;
                 }
 
+                let Some(generation) = tracker.begin(tab_id) else {
+                    return;
+                };
+
                 refresh_tab_host(app_handle);
 
                 if is_tab_loaded(app_handle, tab_id) {
                     if let Some(webview) = get_tab_webview(app_handle, tab_id) {
                         let _ = webview.show();
                         let _ = webview.set_focus();
-                        schedule_ptt_start(
+                        begin_prefix_flow(
+                            app_handle,
                             webview,
-                            Arc::clone(tracker),
                             tab_id,
-                            generation,
-                            ready_before_session,
+                            PrefixFlow::BackgroundPtt(generation),
                         );
                     }
                 } else {
@@ -1363,7 +1597,13 @@ fn handle_ptt_shortcut(
 
             println!("[gpt-wrapper] hotkey released on tab {}", finish.tab_id);
             trusted_click(&webview, DictationTarget::Finish);
-            let _ = webview.eval("window.__GPT_WRAPPER__?.waitAndSend?.();");
+            match app_handle.state::<GeneralSettingsState>().ptt_auto_submit() {
+                Ok(true) => {
+                    let _ = webview.eval("window.__GPT_WRAPPER__?.waitAndSend?.();");
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("[gpt-wrapper] failed to read PTT auto submit: {error}"),
+            }
         }
     }
 }
@@ -1379,6 +1619,8 @@ fn main() {
             close_tab,
             get_autostart_enabled,
             set_autostart_enabled,
+            get_ptt_auto_submit_enabled,
+            set_ptt_auto_submit_enabled,
             get_project_settings,
             create_project,
             edit_project,
@@ -1403,6 +1645,8 @@ fn main() {
             let project_settings_path: PathBuf =
                 app.path().app_config_dir()?.join("project-settings.json");
             app.manage(ProjectSettingsState::load(project_settings_path));
+            let general_settings_path = app.path().app_config_dir()?.join("general-settings.json");
+            app.manage(GeneralSettingsState::load(general_settings_path));
 
             let window = WindowBuilder::new(app, MAIN_WINDOW_LABEL)
                 .title("GPT Wrapper")
