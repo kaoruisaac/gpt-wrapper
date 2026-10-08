@@ -10,6 +10,12 @@
   };
   const buttons = () => [...document.querySelectorAll("button")];
   const aria = (b) => (b?.getAttribute("aria-label") || "").trim();
+  // Observed ChatGPT button labels in Traditional Chinese and English.
+  const CONTROL_LABELS = {
+    stop: ["停止", "Stop"],
+    send: ["傳送", "Send"],
+    voice: ["開始語音對話", "Start Voice"],
+  };
 
   const composer = () =>
     q("textarea#mobile-composer-prompt") ||
@@ -24,10 +30,63 @@
   };
 
   const sendButton = () => {
-    const labels = ["傳送訊息", "Send message", "Send prompt"];
+    const labels = [...CONTROL_LABELS.send, "傳送訊息", "Send message", "Send prompt"];
     return buttons().find((b) => visible(b) && labels.includes(aria(b))) ||
       q('[data-testid="send-button"]') ||
       q("#composer-submit-button");
+  };
+
+  // The composer may be rerendered, so search it first and then fall back to the page.
+  const matchingAriaButton = (labels) => {
+    const find = (root) =>
+      [...root.querySelectorAll("button[aria-label]")].find(
+        (button) => visible(button) && labels.includes(aria(button))
+      );
+    const form = composer()?.closest("form");
+    return (form && find(form)) || find(document);
+  };
+
+  const startStatusObserver = () => {
+    let lastStatus = null;
+    let pending = null;
+    const update = () => {
+      const status = matchingAriaButton(CONTROL_LABELS.stop) ? "working" :
+        matchingAriaButton(CONTROL_LABELS.send) ? "send" :
+        matchingAriaButton(CONTROL_LABELS.voice) ? "voice" : "fallback";
+      if (status === lastStatus) return;
+      const webview = window.chrome?.webview;
+      if (!webview?.postMessage) return;
+      try {
+        webview.postMessage(JSON.stringify({ kind: "gpt-wrapper-tab-status", status }));
+        lastStatus = status;
+      } catch (error) {
+        console.debug("[gpt-wrapper] tab status delivery failed", error);
+      }
+    };
+    // Rust requests a fresh snapshot after navigation in case the first message was missed.
+    window.__GPT_WRAPPER__.reportStatus = () => {
+      lastStatus = null;
+      update();
+    };
+    const scheduleUpdate = () => {
+      if (pending !== null) return;
+      pending = setTimeout(() => {
+        pending = null;
+        update();
+      }, 100);
+    };
+    const observer = new MutationObserver(scheduleUpdate);
+    observer.observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["aria-label", "class", "style", "hidden", "disabled", "aria-disabled"],
+    });
+    update();
+    window.addEventListener("pagehide", () => {
+      observer.disconnect();
+      if (pending !== null) clearTimeout(pending);
+    }, { once: true });
   };
 
   const focusComposerAtEnd = (el) => {
@@ -121,4 +180,10 @@
       }, 250);
     },
   };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", startStatusObserver, { once: true });
+  } else {
+    startStatusObserver();
+  }
 })();

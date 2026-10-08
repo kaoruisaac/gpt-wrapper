@@ -27,17 +27,17 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
 use webview2_com::{
-    CallDevToolsProtocolMethodCompletedHandler, ExecuteScriptCompletedHandler,
-    Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
+    Microsoft::Web::WebView2::Win32::ICoreWebView2, WebMessageReceivedEventHandler,
 };
 use windows::{
-    core::{HSTRING, PCWSTR},
+    core::{HSTRING, PCWSTR, PWSTR},
     Win32::UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, ShowWindow,
-            TrackPopupMenuEx, MF_CHECKED, MF_DISABLED, MF_STRING, SW_RESTORE, TPM_LEFTBUTTON,
-            TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
+            TrackPopupMenuEx, MF_CHECKED, MF_STRING, SW_RESTORE, TPM_LEFTBUTTON, TPM_NONOTIFY,
+            TPM_RETURNCMD, TPM_RIGHTALIGN,
         },
     },
 };
@@ -97,11 +97,45 @@ impl DictationTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TabStatus {
+    Working,
+    Send,
+    Voice,
+    Fallback,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabStatusMessage {
+    kind: String,
+    status: TabStatus,
+}
+
+fn decode_tab_status(source: &str, payload: &str) -> Result<TabStatus, &'static str> {
+    let trusted = url::Url::parse(source)
+        .map(|url| {
+            url.scheme() == "https"
+                && matches!(url.host_str(), Some("chatgpt.com" | "chat.openai.com"))
+        })
+        .unwrap_or(false);
+    if !trusted {
+        return Err("source rejected");
+    }
+    let message: TabStatusMessage =
+        serde_json::from_str(payload).map_err(|_| "payload rejected")?;
+    if message.kind != "gpt-wrapper-tab-status" {
+        return Err("payload rejected");
+    }
+    Ok(message.status)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TabInfo {
     id: usize,
     title: String,
+    status: TabStatus,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,6 +159,7 @@ struct TabManager {
 #[derive(Debug)]
 struct TabContext {
     spec: TabSpec,
+    status: TabStatus,
     prefix_applied: bool,
     prefix_in_progress: bool,
     background_ptt_pending: bool,
@@ -134,6 +169,7 @@ impl TabContext {
     fn new(spec: TabSpec) -> Self {
         Self {
             spec,
+            status: TabStatus::Fallback,
             prefix_applied: false,
             prefix_in_progress: false,
             background_ptt_pending: false,
@@ -151,6 +187,23 @@ impl TabManager {
             next_tab_id: 1,
             standby_ptt_tab_id: None,
             standby_ptt_ready: false,
+        }
+    }
+
+    fn update_status(&mut self, tab_id: usize, status: TabStatus) -> bool {
+        let Some(context) = self.contexts.get_mut(&tab_id) else {
+            return false;
+        };
+        if context.status == status {
+            return false;
+        }
+        context.status = status;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.status = status;
+            true
+        } else {
+            // Standby PTT tabs are not shown until promoted.
+            false
         }
     }
 
@@ -510,6 +563,98 @@ fn begin_prefix_flow(app: &AppHandle, webview: Webview, tab_id: usize, flow: Pre
     }
 }
 
+fn set_tab_status(app_handle: &AppHandle, tab_id: usize, status: TabStatus) {
+    let should_refresh = {
+        let state = app_handle.state::<TabState>();
+        let Ok(mut tabs) = state.lock() else {
+            return;
+        };
+        tabs.update_status(tab_id, status)
+    };
+    if should_refresh {
+        refresh_tab_host(app_handle);
+    }
+}
+
+fn install_tab_status_listener(
+    app_handle: &AppHandle,
+    webview: &Webview,
+    tab_id: usize,
+) -> Result<(), String> {
+    let app_handle = app_handle.clone();
+    let setup_error = Arc::new(Mutex::new(None));
+    let setup_error_for_callback = Arc::clone(&setup_error);
+    webview
+        .with_webview(move |platform_webview| {
+            let Ok(core) = (unsafe { platform_webview.controller().CoreWebView2() }) else {
+                *setup_error_for_callback.lock().unwrap() =
+                    Some(format!("WebView2 missing on tab {tab_id}"));
+                return;
+            };
+            let rejected_source = AtomicBool::new(false);
+            let rejected_payload = AtomicBool::new(false);
+            let handler = WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
+                let Some(args) = args else {
+                    if !rejected_payload.swap(true, Ordering::Relaxed) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected (missing event args)");
+                    }
+                    return Ok(());
+                };
+                let mut source = PWSTR(std::ptr::null_mut());
+                if unsafe { args.Source(&mut source) }.is_err() {
+                    if !rejected_source.swap(true, Ordering::Relaxed) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[gpt-wrapper] status tab {tab_id}: source rejected (read failed)");
+                    }
+                    return Ok(());
+                }
+                let source = CoTaskMemPWSTR::from(source).to_string();
+                let mut raw = PWSTR(std::ptr::null_mut());
+                if unsafe { args.TryGetWebMessageAsString(&mut raw) }.is_err() {
+                    if !rejected_payload.swap(true, Ordering::Relaxed) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected (not a string)");
+                    }
+                    return Ok(());
+                }
+                let raw = CoTaskMemPWSTR::from(raw).to_string();
+                match decode_tab_status(&source, &raw) {
+                    Ok(status) => {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[gpt-wrapper] status tab {tab_id}: accepted {status:?}");
+                        set_tab_status(&app_handle, tab_id, status);
+                    }
+                    Err("source rejected") => {
+                        if !rejected_source.swap(true, Ordering::Relaxed) {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[gpt-wrapper] status tab {tab_id}: source rejected");
+                        }
+                    }
+                    Err(_) => {
+                        if !rejected_payload.swap(true, Ordering::Relaxed) {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected");
+                        }
+                    }
+                }
+                Ok(())
+            }));
+            let mut token = 0;
+            if let Err(error) = unsafe { core.add_WebMessageReceived(&handler, &mut token) } {
+                *setup_error_for_callback.lock().unwrap() = Some(format!(
+                    "failed to install status observer on tab {tab_id}: {error:?}"
+                ));
+            } else {
+                #[cfg(debug_assertions)]
+                eprintln!("[gpt-wrapper] status listener installed on tab {tab_id}");
+            }
+        })
+        .map_err(|error| format!("failed to access WebView2 for tab {tab_id}: {error}"))?;
+    let result = setup_error.lock().unwrap().take();
+    result.map_or(Ok(()), Err)
+}
+
 fn create_chatgpt_webview(
     app_handle: &AppHandle,
     tab_id: usize,
@@ -528,12 +673,21 @@ fn create_chatgpt_webview(
     .background_color(LOADING_BACKGROUND)
     .focused(false)
     .on_page_load(move |webview, payload| {
+        if payload.event() == PageLoadEvent::Started {
+            set_tab_status(webview.app_handle(), tab_id, TabStatus::Fallback);
+            return;
+        }
         if payload.event() != PageLoadEvent::Finished
             || payload.url().path().ends_with(TAB_BOOTSTRAP_PATH)
         {
             return;
         }
 
+        // Re-report the current DOM state after navigation even if the first event was missed.
+        if let Err(error) = webview.eval("window.__GPT_WRAPPER__?.reportStatus?.();") {
+            #[cfg(debug_assertions)]
+            eprintln!("[gpt-wrapper] status tab {tab_id}: snapshot request failed: {error:?}");
+        }
         let app_handle = webview.app_handle();
         let state = app_handle.state::<TabState>();
         let (should_show, became_normal_loaded) = {
@@ -612,6 +766,11 @@ fn create_chatgpt_webview(
         ));
     }
 
+    if let Err(error) = install_tab_status_listener(app_handle, &webview, tab_id) {
+        let _ = webview.close();
+        return Err(error);
+    }
+
     if let Err(error) = webview.navigate(chatgpt_url) {
         let _ = webview.close();
         return Err(format!("failed to navigate ChatGPT tab {tab_id}: {error}"));
@@ -642,6 +801,7 @@ fn create_tab_with_spec(
         tabs.tabs.push(TabInfo {
             id: tab_id,
             title: spec.title.clone(),
+            status: TabStatus::Fallback,
         });
         let mut context = TabContext::new(spec.clone());
         context.background_ptt_pending = background_ptt;
@@ -764,9 +924,11 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
             .ok_or("standby context missing")?;
         context.background_ptt_pending = true;
         let title = context.spec.title.clone();
+        let status = context.status;
         tabs.tabs.push(TabInfo {
             id: standby_id,
             title,
+            status,
         });
         tabs.active_tab_id = Some(standby_id);
         if ready {
@@ -930,10 +1092,13 @@ async fn create_project_tab(
     project_id: Uuid,
 ) -> Result<TabSnapshot, String> {
     ensure_host_webview(&webview)?;
-    let spec = app
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .project_tab_spec(project_id)?;
+    let spec = if project_id.is_nil() {
+        ProjectSettings::default().default_tab_spec()
+    } else {
+        app.state::<ProjectSettingsState>()
+            .snapshot()?
+            .project_tab_spec(project_id)?
+    };
     create_tab_with_spec(&app, spec, false)
 }
 
@@ -970,11 +1135,15 @@ fn track_project_bookmark_menu(
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     let menu = PopupMenu(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
 
-    if settings.projects.is_empty() {
-        let label: Vec<u16> = "尚無 Project Bookmark\0".encode_utf16().collect();
-        unsafe { AppendMenuW(menu.0, MF_STRING | MF_DISABLED, 1, PCWSTR(label.as_ptr())) }
-            .map_err(|error| error.to_string())?;
+    let builtin_label: Vec<u16> = "ChatGPT.com\0".encode_utf16().collect();
+    let builtin_flags = if settings.default_project_id.is_none() {
+        MF_STRING | MF_CHECKED
     } else {
+        MF_STRING
+    };
+    unsafe { AppendMenuW(menu.0, builtin_flags, 1, PCWSTR(builtin_label.as_ptr())) }
+        .map_err(|error| error.to_string())?;
+    {
         for (index, project) in settings.projects.iter().enumerate() {
             let label: Vec<u16> =
                 format!("{}\0", project.name.replace('&', "&&").replace('\0', ""))
@@ -984,7 +1153,7 @@ fn track_project_bookmark_menu(
             if settings.default_project_id == Some(project.id) {
                 flags |= MF_CHECKED;
             }
-            unsafe { AppendMenuW(menu.0, flags, index + 1, PCWSTR(label.as_ptr())) }
+            unsafe { AppendMenuW(menu.0, flags, index + 2, PCWSTR(label.as_ptr())) }
                 .map_err(|error| error.to_string())?;
         }
     }
@@ -998,9 +1167,13 @@ fn track_project_bookmark_menu(
     let y = origin.y + (anchor.bottom * scale).round() as i32;
     let flags = TPM_LEFTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN;
     let command = unsafe { TrackPopupMenuEx(menu.0, flags.0, x, y, hwnd, None) }.0 as usize;
-    Ok(command
-        .checked_sub(1)
-        .and_then(|index| settings.projects.get(index).map(|p| p.id)))
+    Ok(if command == 1 {
+        Some(Uuid::nil())
+    } else {
+        command
+            .checked_sub(2)
+            .and_then(|index| settings.projects.get(index).map(|p| p.id))
+    })
 }
 
 #[tauri::command]
@@ -1264,8 +1437,12 @@ fn focus_active_tab(app_handle: &AppHandle) {
 fn refresh_tab_host(app_handle: &AppHandle) {
     if let Some(host) = app_handle.get_webview(HOST_WEBVIEW_LABEL) {
         if let Err(error) = host.eval("window.__GPT_WRAPPER_TAB_HOST__?.refresh?.();") {
+            #[cfg(debug_assertions)]
             eprintln!("[gpt-wrapper] failed to refresh tab host: {error:?}");
         }
+    } else {
+        #[cfg(debug_assertions)]
+        eprintln!("[gpt-wrapper] failed to refresh tab host: host webview missing");
     }
 }
 
@@ -1747,4 +1924,89 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running GPT Wrapper");
+}
+
+#[cfg(test)]
+mod tab_status_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_string_wire_format_and_rejects_untrusted_messages() {
+        let source = "https://chatgpt.com/c/123";
+        assert_eq!(
+            decode_tab_status(
+                source,
+                r#"{"kind":"gpt-wrapper-tab-status","status":"working"}"#
+            ),
+            Ok(TabStatus::Working)
+        );
+        assert_eq!(
+            decode_tab_status(
+                "https://chat.openai.com/",
+                r#"{"kind":"gpt-wrapper-tab-status","status":"voice"}"#
+            ),
+            Ok(TabStatus::Voice)
+        );
+        for untrusted in [
+            "http://chatgpt.com/",
+            "https://evil.example/",
+            "https://chatgpt.com.evil.example/",
+        ] {
+            assert_eq!(
+                decode_tab_status(
+                    untrusted,
+                    r#"{"kind":"gpt-wrapper-tab-status","status":"send"}"#
+                ),
+                Err("source rejected")
+            );
+        }
+        assert_eq!(
+            decode_tab_status(source, r#"{"kind":"other","status":"send"}"#),
+            Err("payload rejected")
+        );
+        assert_eq!(
+            decode_tab_status(
+                source,
+                r#"{"kind":"gpt-wrapper-tab-status","status":"unknown"}"#
+            ),
+            Err("payload rejected")
+        );
+        assert_eq!(
+            decode_tab_status(
+                source,
+                r#"{"kind":"gpt-wrapper-tab-status","status":"send"}"#
+            ),
+            Ok(TabStatus::Send)
+        );
+        assert_eq!(
+            decode_tab_status(
+                source,
+                r#"{"kind":"gpt-wrapper-tab-status","status":"fallback"}"#
+            ),
+            Ok(TabStatus::Fallback)
+        );
+    }
+
+    #[test]
+    fn updates_only_the_matching_tab_and_preserves_standby_status() {
+        let mut tabs = TabManager::new();
+        let spec = ProjectSettings::default().default_tab_spec();
+        for id in [1, 2, 3] {
+            tabs.contexts.insert(id, TabContext::new(spec.clone()));
+        }
+        for id in [1, 2] {
+            tabs.tabs.push(TabInfo {
+                id,
+                title: String::new(),
+                status: TabStatus::Fallback,
+            });
+        }
+        assert!(tabs.update_status(2, TabStatus::Working));
+        assert_eq!(tabs.tabs[0].status, TabStatus::Fallback);
+        assert_eq!(tabs.tabs[1].status, TabStatus::Working);
+        assert!(!tabs.update_status(2, TabStatus::Working));
+        assert!(!tabs.update_status(3, TabStatus::Voice));
+        assert_eq!(tabs.contexts[&3].status, TabStatus::Voice);
+        assert!(!tabs.update_status(4, TabStatus::Send));
+    }
 }

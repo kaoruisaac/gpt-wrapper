@@ -89,7 +89,19 @@ body,
   height: 8px;
   flex: 0 0 auto;
   border-radius: 999px;
-  background: #10a37f;
+  background: #9ca3af;
+}
+
+.gpt-wrapper-tab-dot[data-status="working"] {
+  background: #f59e0b;
+}
+
+.gpt-wrapper-tab-dot[data-status="send"] {
+  background: #3b82f6;
+}
+
+.gpt-wrapper-tab-dot[data-status="voice"] {
+  background: #22c55e;
 }
 
 .gpt-wrapper-tab-title {

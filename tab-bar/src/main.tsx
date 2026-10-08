@@ -7,6 +7,7 @@ import "./styles.css";
 type TabInfo = {
   id: number;
   title: string;
+  status: "working" | "send" | "voice" | "fallback";
 };
 
 type TabSnapshot = {
@@ -165,7 +166,7 @@ function TabBarApp() {
                   }
                 }}
               >
-                <span class="gpt-wrapper-tab-dot" aria-hidden="true" />
+                <span class="gpt-wrapper-tab-dot" data-status={tab.status} aria-hidden="true" />
                 <span class="gpt-wrapper-tab-title">{tab.title}</span>
                 <span
                   class="gpt-wrapper-tab-close"
