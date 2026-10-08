@@ -300,6 +300,7 @@ enum PttEvent {
     Down(PttSource),
     Up(PttSource),
     SubmitBle,
+    SubmitKeyboard(usize),
     CancelBle,
 }
 
@@ -336,6 +337,17 @@ impl PttTracker {
     }
 
     fn defer_during_finish(&self, event: PttEvent) -> bool {
+        // A BLE disconnect must cancel an earlier BLE draft even while a
+        // keyboard-owned Start is waiting for its DOM callback.
+        if event == PttEvent::CancelBle
+            && self
+                .owner
+                .lock()
+                .ok()
+                .is_some_and(|owner| *owner == Some(PttSource::Keyboard))
+        {
+            return false;
+        }
         let Ok(mut events) = self.deferred_events.lock() else {
             return true;
         };
@@ -506,9 +518,6 @@ impl PttTracker {
 
     fn cancel_ble(&self) -> Option<PttCancel> {
         let mut owner = self.owner.lock().ok()?;
-        if *owner == Some(PttSource::Keyboard) {
-            return None;
-        }
         let was_held = *owner == Some(PttSource::Ble);
         let start_clicked = was_held
             && self.clicked_generation.load(Ordering::SeqCst)
@@ -1988,7 +1997,7 @@ fn complete_finish(
             }
             if submit_pending && !disconnected {
                 tracker.note_ble_send(tab_id);
-                let _ = tab.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();");
+                request_explicit_send(&app, tab_id);
             }
         } else {
             let _ = tab.eval("window.__GPT_WRAPPER__?.finishKeyboardSegment?.();");
@@ -2235,8 +2244,24 @@ fn schedule_ptt_start(
     });
 }
 
-// Phase 2 BLE transport calls this with Down(Ble), Up(Ble), SubmitBle, or CancelBle.
-// It must never synthesize a keyboard shortcut.
+// Both the BLE Submit signal and the Ctrl+. shortcut invoke this same WebView action.
+// The DOM adapter checks the draft, dictation state, Send button and duplicate requests.
+fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
+    if !is_tab_loaded(app_handle, tab_id) {
+        eprintln!("[gpt-wrapper] Submit target tab {tab_id} is not loaded");
+        return;
+    }
+    match get_tab_webview(app_handle, tab_id) {
+        Some(webview) => {
+            if let Err(error) = webview.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();") {
+                eprintln!("[gpt-wrapper] Submit script failed on tab {tab_id}: {error}");
+            }
+        }
+        None => eprintln!("[gpt-wrapper] Submit target tab {tab_id} is unavailable"),
+    }
+}
+
+// BLE transport dispatches control events, never synthetic keyboard shortcuts.
 fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTracker>) {
     if tracker.defer_during_finish(event) {
         return;
@@ -2399,15 +2424,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
             BleSubmitTarget::Busy => {
                 eprintln!("[gpt-wrapper] BLE Submit refused while keyboard PTT is held")
             }
-            BleSubmitTarget::Tab(tab_id) => {
-                if is_tab_loaded(app_handle, tab_id) {
-                    if let Some(webview) = get_tab_webview(app_handle, tab_id) {
-                        let _ = webview.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();");
-                    }
-                } else {
-                    eprintln!("[gpt-wrapper] BLE Submit target tab {tab_id} unavailable");
-                }
-            }
+            BleSubmitTarget::Tab(tab_id) => request_explicit_send(app_handle, tab_id),
             BleSubmitTarget::None => {
                 if app_handle
                     .state::<TrayVisibilityState>()
@@ -2416,16 +2433,30 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 {
                     eprintln!("[gpt-wrapper] BLE Submit refused: no target while tray-hidden");
                 } else if let Some(tab_id) = active_tab_id(app_handle) {
-                    if is_tab_loaded(app_handle, tab_id) {
-                        if let Some(webview) = get_tab_webview(app_handle, tab_id) {
-                            tracker.note_ble_send(tab_id);
-                            let _ =
-                                webview.eval("window.__GPT_WRAPPER__?.requestExplicitSend?.();");
-                        }
+                    if is_tab_loaded(app_handle, tab_id)
+                        && get_tab_webview(app_handle, tab_id).is_some()
+                    {
+                        tracker.note_ble_send(tab_id);
+                        request_explicit_send(app_handle, tab_id);
                     }
                 }
             }
         },
+        PttEvent::SubmitKeyboard(tab_id) => {
+            if app_handle
+                .state::<TrayVisibilityState>()
+                .tray_hidden
+                .load(Ordering::SeqCst)
+            {
+                eprintln!("[gpt-wrapper] Ctrl+. Submit refused while tray-hidden");
+            } else if tracker.is_held() {
+                eprintln!(
+                    "[gpt-wrapper] Ctrl+. Submit refused while PTT is held; release PTT first"
+                );
+            } else {
+                request_explicit_send(app_handle, tab_id);
+            }
+        }
         PttEvent::CancelBle => {
             if let Some(cancel) = tracker.cancel_ble() {
                 if let Some(webview) = get_tab_webview(app_handle, cancel.tab_id) {
@@ -2592,10 +2623,14 @@ fn main() {
             }
 
             println!("[gpt-wrapper] main window and initial ChatGPT tab created.");
-            println!("[gpt-wrapper] Hold Ctrl+0 or Ctrl+Numpad0 to dictate; release to finish.");
+            println!("[gpt-wrapper] Hold Ctrl+0 or Ctrl+Numpad0 to dictate; Ctrl+. or Ctrl+NumpadDecimal requests Send.");
 
             let primary_shortcut = Shortcut::new(Some(Modifiers::CONTROL), Code::Digit0);
             let numpad_shortcut = Shortcut::new(Some(Modifiers::CONTROL), Code::Numpad0);
+            let submit_shortcuts = [
+                Shortcut::new(Some(Modifiers::CONTROL), Code::Period),
+                Shortcut::new(Some(Modifiers::CONTROL), Code::NumpadDecimal),
+            ];
 
             let tracker_for_primary = Arc::clone(&ptt_tracker);
             app.global_shortcut().on_shortcut(
@@ -2626,6 +2661,26 @@ fn main() {
                     );
                 },
             )?;
+
+            for submit_shortcut in submit_shortcuts {
+                let tracker_for_submit = Arc::clone(&ptt_tracker);
+                app.global_shortcut().on_shortcut(
+                    submit_shortcut,
+                    move |app_handle, _shortcut, event| {
+                        if event.state() == ShortcutState::Pressed {
+                            if let Some(tab_id) = active_tab_id(app_handle) {
+                                handle_ptt_event(
+                                    app_handle,
+                                    PttEvent::SubmitKeyboard(tab_id),
+                                    &tracker_for_submit,
+                                );
+                            } else {
+                                eprintln!("[gpt-wrapper] Submit shortcut refused: no active tab");
+                            }
+                        }
+                    },
+                )?;
+            }
 
             if !launched_by_autostart {
                 window.set_focus()?;
@@ -2681,6 +2736,21 @@ mod ptt_tests {
         assert!(ptt.is_held());
         ptt.finish(PttSource::Keyboard);
 
+        ptt.note_ble_send(11);
+        let keyboard_generation = ptt.begin(PttSource::Keyboard, 2).unwrap();
+        ptt.start_in_flight
+            .store(keyboard_generation, Ordering::SeqCst);
+        assert!(!ptt.defer_during_finish(PttEvent::CancelBle));
+        assert_eq!(ptt.cancel_ble().unwrap().tab_id, 11);
+        assert!(
+            ptt.is_held(),
+            "BLE disconnect must not release keyboard PTT"
+        );
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Busy);
+        assert!(ptt.start_completed(keyboard_generation).unwrap().is_empty());
+        ptt.finish(PttSource::Keyboard);
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+
         let generation = ptt.begin(PttSource::Ble, 3).unwrap();
         let cancel = ptt.cancel_ble().unwrap();
         assert_eq!(cancel.tab_id, 3);
@@ -2731,6 +2801,25 @@ mod ptt_tests {
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec![PttEvent::CancelBle]
+        );
+    }
+
+    #[test]
+    fn keyboard_submit_keeps_its_captured_tab_when_finish_is_pending() {
+        let ptt = PttTracker::new();
+        let generation = ptt.begin(PttSource::Keyboard, 4).unwrap();
+        assert!(ptt.mark_start_clicked(4, generation));
+        ptt.finish(PttSource::Keyboard).unwrap();
+        ptt.finish_in_flight.store(generation, Ordering::SeqCst);
+        assert!(ptt.defer_during_finish(PttEvent::SubmitKeyboard(4)));
+        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert_eq!(
+            ptt.finish_completed(generation)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::SubmitKeyboard(4), PttEvent::CancelBle],
+            "Ctrl+. retains the pressed tab and BLE cleanup cannot discard it",
         );
     }
 

@@ -34,6 +34,7 @@ The SolidJS tab bar and Settings UIs are built automatically by the Tauri dev/bu
 5. When the app is visible, dictation starts in the current active tab.
 6. Speak while holding the shortcut, then release it to finish dictation.
 7. By default, the app waits for transcription and submits the prompt in the same tab where dictation started. In **Settings → General**, you can turn off **PTT shortcuts 自動送出訊息**. The transcript then stays in the composer for editing and manual Send. This setting applies to foreground and background PTT.
+8. Press **Ctrl + .** on the main keyboard or **Ctrl + Numpad .** (numeric keypad decimal key) to explicitly request Send in the active ChatGPT tab. Both shortcuts perform the same action: find the visible, enabled `aria-label="Send"` / `aria-label="傳送"` button and click it, without emulating Enter. They work regardless of the PTT auto-submit setting. Release a held PTT first; Submit shortcuts are ignored while the app is tray-hidden.
 
 Open **Settings → 專案書籤** from the tray menu to save ChatGPT Project URLs. Choose a **Default project** to use it for new tabs, including the first tab after restart and the standby tab prepared while the app is hidden. Existing tabs stay on their current pages. Selecting **chatgpt.com** restores the built-in default. Each bookmark can have a **Message Prefix**, which is prefilled in the composer when a new tab for that project opens. The prefix is inserted once; foreground PTT does not reset it after you edit or remove it.
 
@@ -71,6 +72,11 @@ Shortcut Released
   -> finish dictation only if the Start button was found and a click was dispatched
   -> if PTT auto submit is enabled (default), wait for transcript in the composer and click Send
   -> otherwise leave the transcript in the composer for manual Send
+
+Ctrl+. / Ctrl+NumpadDecimal pressed (independent explicit Submit)
+  -> capture the active visible ChatGPT tab
+  -> use the same guarded DOM Send action as Android BLE Submit
+  -> only click the available Send control when the draft is ready
 ```
 
 The ChatGPT Web DOM is not a public API, so its adapter selectors may need maintenance if the site UI changes.
@@ -79,7 +85,9 @@ The ChatGPT Web DOM is not a public API, so its adapter selectors may need maint
 
 The shared controller is `handle_ptt_event` in `src-tauri/src/main.rs`. `src-tauri/src/ble_central.rs` uses Windows Runtime BLE scanning and GATT client APIs, then passes `Down(PttSource::Ble)`, `Up(PttSource::Ble)`, `SubmitBle`, and `CancelBle` directly to it on Tauri's main thread. `CancelBle` invalidates BLE-owned input and pending BLE sends without changing a keyboard-owned session. No keyboard shortcut is synthesized.
 
-The controller captures a tab ID on DOWN. BLE UP finishes dictation in that fixed WebView and never reads the keyboard auto-submit setting. Start and Finish operations wait for their corresponding visible DOM control before the next queued PTT edge is processed. BLE Submit queues once if BLE PTT is held; otherwise it requests an explicit send in the captured WebView. For dictated text, the adapter waits for an observable busy-to-idle transition on `[data-testid="transcription-status"][aria-busy]`, a changed composer, and an enabled Send control. If this unverified ChatGPT completion probe is absent or the draft cannot be confirmed within 15 seconds, the draft remains unsent. A logged click only means dispatch was requested; recording readiness and message delivery are unconfirmed. A visible window with no BLE target may submit an existing draft in the active tab; tray-hidden mode refuses this fallback.
+The controller captures a tab ID on DOWN. BLE UP finishes dictation in that fixed WebView and never reads the keyboard auto-submit setting. Start and Finish operations wait for their corresponding visible DOM control before the next queued PTT edge is processed. BLE Submit queues once if BLE PTT is held; otherwise it requests an explicit send in the captured WebView. `Ctrl + .` and `Ctrl + Numpad .` use the same `request_explicit_send` WebView action but target the active tab at keypress; it never synthesizes an Enter keypress or another shortcut. Both inputs locate the `aria-label="Send"` / `aria-label="傳送"` DOM button, validate it and the draft, and avoid duplicate clicks.
+
+For dictated text, the adapter first waits for the Rust controller to verify that the Finish dictation control disappeared. It prefers an observable transcription busy-to-idle transition if exposed. Because `[data-testid="transcription-status"][aria-busy]` has **not** been validated against the live ChatGPT DOM, its absence instead activates a best-effort fallback: wait at least two seconds after Finish, require changed composer text and a further one-second stable draft with an enabled Send button. This is a practical heuristic, **not proof** that the final transcript is complete. Without a ready draft/Send within 15 seconds, the request times out and leaves text unsent. A logged click only means dispatch was requested; recording readiness and message delivery are unconfirmed. A visible window with no BLE target may submit an existing draft in the active tab; tray-hidden mode refuses this fallback.
 
 In Settings → General → Bluetooth Controller, scan for a device advertising the [shared PTT service](android/.agent_temp/phase-0-shared-ble-contract.md), select it, and explicitly Approve/Connect. Approval stores the Windows `DeviceInformation.Id` in `ble-controller.json` under the app config directory. Only the approved ID may reconnect automatically; a changed Windows identity requires scanning and approval again. The advertised name is only a display hint. Disconnect disables reconnect until Enable is selected again; Forget removes approval. The Android V1 peripheral may use Bluetooth Just Works, so approval here is application authorization, not a claim of authenticated or encrypted pairing. The worker checks the service, Indicate property, and CCCD result before reporting Ready. It logs frame event, sequence, and uptime only.
 

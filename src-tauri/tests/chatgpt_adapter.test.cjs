@@ -5,12 +5,13 @@ const path = require("node:path");
 
 const script = fs.readFileSync(path.join(__dirname, "../src/chatgpt_adapter.js"), "utf8");
 
-function harness(initialText = "") {
+function harness(initialText = "", sendLabel = "Send") {
   let now = 0;
   let nextTimer = 0;
   const timers = new Map();
   let busy = false;
   let indicatorPresent = true;
+  const documentListeners = {};
   const indicator = { getAttribute(name) { return name === "aria-busy" ? String(busy) : null; } };
   const composer = {
     value: initialText,
@@ -21,7 +22,7 @@ function harness(initialText = "") {
     disabled: false,
     isConnected: true,
     clicks: 0,
-    getAttribute(name) { return name === "aria-label" ? "Send" : null; },
+    getAttribute(name) { return name === "aria-label" ? sendLabel : null; },
     getBoundingClientRect() { return { width: 20, height: 20 }; },
     click() { this.clicks++; },
   };
@@ -32,8 +33,8 @@ function harness(initialText = "") {
       if (selector === '[data-testid="transcription-status"]') return indicatorPresent ? indicator : null;
       return null;
     },
-    querySelectorAll(selector) { return selector === "button" ? [send] : []; },
-    addEventListener() {},
+    querySelectorAll(selector) { return selector === "button" || selector === "button[aria-label]" ? [send] : []; },
+    addEventListener(type, callback) { documentListeners[type] = callback; },
   };
   const window = { addEventListener() {} };
   const context = {
@@ -47,6 +48,7 @@ function harness(initialText = "") {
   return {
     api: window.__GPT_WRAPPER__, composer, send,
     setBusy(value) { busy = value; },
+    emitInput() { documentListeners.input?.(); },
     removeIndicator() { indicatorPresent = false; },
     advance(ms) {
       const end = now + ms;
@@ -173,8 +175,59 @@ function harness(initialText = "") {
   h.api.finishBleSegment();
   h.api.requestExplicitSend();
   h.composer.value = "first second";
+  h.advance(1900);
+  assert.equal(h.send.clicks, 0, "without an explicit completion signal, Submit must wait beyond the Finish settle window");
+  h.advance(1100);
+  assert.equal(h.send.clicks, 1, "missing unverified test ID must not disable BLE Submit forever");
+}
+
+{
+  const h = harness("unchanged");
+  h.api.prepareStart();
+  h.removeIndicator();
+  h.api.finishBleSegment();
+  h.api.requestExplicitSend();
   h.advance(16000);
-  assert.equal(h.send.clicks, 0, "missing busy-to-idle signal must fail closed");
+  assert.equal(h.send.clicks, 0, "no new transcript must not send old draft even with fallback");
+}
+
+{
+  const h = harness("manual draft", "傳送");
+  assert.equal(h.api.requestExplicitSend(), "requested");
+  h.advance(1200);
+  assert.equal(h.send.clicks, 1, "Traditional Chinese Send label must be supported");
+  assert.equal(h.api.requestExplicitSend(), "already-pending", "same draft cannot submit twice");
+  h.composer.value = "another manually typed draft";
+  assert.equal(h.api.requestExplicitSend(), "requested");
+  h.advance(1200);
+  assert.equal(h.send.clicks, 2, "newly typed draft after a successful Send must be allowed");
+  h.composer.value = "";
+  h.emitInput();
+  h.composer.value = "another manually typed draft";
+  h.emitInput();
+  assert.equal(h.api.requestExplicitSend(), "requested");
+  h.advance(1200);
+  assert.equal(h.send.clicks, 3, "same text in a new draft after composer cleared is not a duplicate");
+}
+
+{
+  const h = harness("draft", "Stop");
+  h.api.requestExplicitSend();
+  h.advance(16000);
+  assert.equal(h.send.clicks, 0, "must only click a recognized Send control");
+}
+
+{
+  const h = harness("");
+  h.api.prepareStart();
+  h.removeIndicator();
+  h.api.requestExplicitSend();
+  h.composer.value = "speech appeared before release";
+  h.advance(4000);
+  assert.equal(h.send.clicks, 0, "pending dictation must never be submitted while held");
+  h.api.finishBleSegment();
+  h.advance(3500);
+  assert.equal(h.send.clicks, 1, "a held Submit should proceed after Finish and fallback settling");
 }
 
 {

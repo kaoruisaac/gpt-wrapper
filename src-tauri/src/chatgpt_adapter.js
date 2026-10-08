@@ -38,6 +38,16 @@
     return (el?.value ?? el?.innerText ?? el?.textContent ?? "").trim();
   };
 
+  const clearSubmittedDraftGuardIfChanged = () => {
+    if (!state.sendClicked || state.activeSegment || composerText() === state.lastClickedText) return;
+    state.sendClicked = false;
+    state.sendRequested = false;
+    state.lastClickedText = null;
+  };
+  // A Send usually clears the composer. Remember that transition so another
+  // intentionally typed draft with identical text can also be submitted later.
+  document.addEventListener("input", clearSubmittedDraftGuardIfChanged, true);
+
   // An absent/unknown completion signal is not evidence of a final transcript.
   const transcriptionBusy = () => {
     const indicator = q('[data-testid="transcription-status"]');
@@ -47,12 +57,11 @@
     return null;
   };
 
-  const sendButton = () => {
-    const labels = [...CONTROL_LABELS.send, "傳送訊息", "Send message", "Send prompt"];
-    return buttons().find((b) => visible(b) && labels.includes(aria(b))) ||
-      q('[data-testid="send-button"]') ||
-      q("#composer-submit-button");
-  };
+  // Send is a DOM action, never an Enter keypress. Prefer the observed
+  // Traditional Chinese / English accessible names over unstable test IDs.
+  const sendButton = () =>
+    matchingAriaButton(CONTROL_LABELS.send) ||
+    matchingAriaButton(["傳送訊息", "Send message", "Send prompt"]);
 
   // The composer may be rerendered, so search it first and then fall back to the page.
   const matchingAriaButton = (labels) => {
@@ -103,7 +112,7 @@
     update();
     window.addEventListener("pagehide", () => {
       if (state.timer !== null && state.sendRequested) {
-        console.warn("[gpt-wrapper] BLE send cancelled: page unloaded");
+        console.warn("[gpt-wrapper] Submit cancelled: page unloaded");
       }
       cancelTimer();
       observer.disconnect();
@@ -187,10 +196,15 @@
 
     finishBleSegment() {
       state.activeSegment = false;
-      state.segments.push({ before: state.before, busySeen: transcriptionBusy(), settled: false });
+      state.segments.push({
+        before: state.before,
+        finishedAt: Date.now(),
+        busySeen: transcriptionBusy() === true,
+        settled: false,
+      });
       state.pendingTranscription = true;
       state.segmentVersion++;
-      console.info("[gpt-wrapper] BLE transcription awaiting an observable busy-to-idle transition");
+      console.info("[gpt-wrapper] dictation Finish processed; awaiting transcript readiness");
     },
 
     finishKeyboardSegment() {
@@ -204,12 +218,15 @@
       state.sendClicked = false;
       state.activeSegment = false;
       state.segments = [];
-      console.warn("[gpt-wrapper] BLE send cancelled");
+      console.warn("[gpt-wrapper] pending Submit cancelled");
     },
 
     requestExplicitSend() {
+      // A completed Send must not block later manually typed drafts, while
+      // a still-identical composer is guarded against duplicate BLE/key taps.
+      clearSubmittedDraftGuardIfChanged();
       if (state.sendRequested || state.timer !== null) {
-        console.info("[gpt-wrapper] duplicate BLE send request ignored");
+        console.info("[gpt-wrapper] duplicate Submit request ignored");
         return "already-pending";
       }
       state.sendRequested = true;
@@ -218,7 +235,7 @@
       let lastText = null;
       let stableSince = 0;
       let lastSegmentVersion = state.segmentVersion;
-      console.info("[gpt-wrapper] BLE send requested; delivery remains unconfirmed");
+      console.info("[gpt-wrapper] Submit requested; delivery remains unconfirmed");
 
       const check = () => {
         if (generation !== state.generation) return;
@@ -229,7 +246,16 @@
         const busy = transcriptionBusy();
         for (const segment of state.segments) {
           if (busy === true) segment.busySeen = true;
-          if (segment.busySeen && busy === false && current !== segment.before) segment.settled = true;
+          // Prefer a real busy-to-idle transition if the page exposes one.
+          // ChatGPT currently provides no verified public completion selector;
+          // when absent, require changed text plus a conservative settle window
+          // after the Rust controller verified the Finish button disappeared.
+          const observedCompletion = segment.busySeen && busy === false;
+          const fallbackCompletion = busy !== true &&
+            Date.now() - segment.finishedAt >= 2000;
+          if (current !== segment.before && (observedCompletion || fallbackCompletion)) {
+            segment.settled = true;
+          }
         }
         const settled = !state.activeSegment && busy !== true &&
           state.segments.every((segment) => segment.settled);
@@ -247,13 +273,13 @@
           state.lastClickedText = current;
           state.sendClicked = true;
           send.click();
-          console.info("[gpt-wrapper] BLE Send button clicked; delivery unconfirmed");
+          console.info("[gpt-wrapper] Send button clicked; delivery unconfirmed");
           return;
         }
         if (Date.now() - started >= 15000) {
           cancelTimer();
           state.sendRequested = false;
-          console.warn("[gpt-wrapper] BLE send timed out: latest transcription completion could not be verified, or draft/Send unavailable; draft remains unsent");
+          console.warn("[gpt-wrapper] Submit timed out: transcript/draft/Send unavailable; draft remains unsent");
         }
       };
       state.timer = setInterval(check, 100);
