@@ -1,4 +1,4 @@
-import { For, Show, createSignal, onMount } from "solid-js";
+import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { FiPlus } from "solid-icons/fi";
 
@@ -27,7 +27,8 @@ export default function ProjectBookmarks() {
   const [error, setError] = createSignal("");
   const [draft, setDraft] = createSignal<Draft | null>(null);
 
-  onMount(async () => {
+  const reloadSettings = async () => {
+    if (busy()) return;
     try {
       setSettings(await invoke<ProjectSettings>("get_project_settings"));
     } catch (cause) {
@@ -36,6 +37,14 @@ export default function ProjectBookmarks() {
     } finally {
       setLoading(false);
     }
+  };
+
+  onMount(() => {
+    void reloadSettings();
+    // Background Ctrl+. may change Default while Settings is behind another window.
+    // Reload when Settings receives focus rather than trusting its original onMount snapshot.
+    window.addEventListener("focus", reloadSettings);
+    onCleanup(() => window.removeEventListener("focus", reloadSettings));
   });
 
   const mutate = async (command: string, args: Record<string, unknown>) => {

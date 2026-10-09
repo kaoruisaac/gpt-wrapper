@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Default Project</title>
+  <style>
+    :root { color-scheme: dark; font-family: "Segoe UI", system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; width: 100%; overflow: hidden; }
+    body { background: #1d222b; color: #f1f3f7; }
+    .toast { width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center;
+      border: 1px solid #3b4351; border-radius: 12px; padding: 11px 18px; }
+    .eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 0.14em; color: #9da7b8; }
+    .name { display: block; margin-top: 5px; font-weight: 600; font-size: 17px; line-height: 1.35;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  </style>
+</head>
+<body>
+  <div class="toast" aria-live="polite">
+    <div class="eyebrow">DEFAULT PROJECT</div>
+    <div id="name" class="name" title="ChatGPT.com">ChatGPT.com</div>
+  </div>
+  <script>
+    window.__GPT_PROJECT_TOAST__ = {
+      update(value) {
+        const name = document.getElementById("name");
+        name.textContent = String(value);
+        name.title = String(value);
+      }
+    };
+  </script>
+</body>
+</html>

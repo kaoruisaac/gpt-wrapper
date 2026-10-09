@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background_project_switcher;
 mod ble_central;
 mod general_settings;
 mod project_settings;
@@ -300,7 +301,7 @@ enum PttEvent {
     Down(PttSource),
     Up(PttSource),
     SubmitBle,
-    SubmitKeyboard(usize),
+    SubmitKeyboard(Option<usize>),
     CancelBle,
 }
 
@@ -334,6 +335,27 @@ impl PttTracker {
 
     fn is_held(&self) -> bool {
         self.held.load(Ordering::SeqCst)
+    }
+
+    fn safe_for_background_switch(&self) -> bool {
+        !self.is_held()
+            && self.start_in_flight.load(Ordering::SeqCst) == 0
+            && self.finish_in_flight.load(Ordering::SeqCst) == 0
+            && self.failed_finish_tab_id.load(Ordering::SeqCst) == 0
+            && !self.ble_submit_pending.load(Ordering::SeqCst)
+            && self
+                .deferred_events
+                .lock()
+                .map(|events| events.is_empty())
+                .unwrap_or(false)
+    }
+
+    fn clear_deferred_submits(&self) {
+        if let Ok(mut events) = self.deferred_events.lock() {
+            events.retain(|event| {
+                !matches!(event, PttEvent::SubmitBle | PttEvent::SubmitKeyboard(_))
+            });
+        }
     }
 
     fn defer_during_finish(&self, event: PttEvent) -> bool {
@@ -1518,14 +1540,14 @@ fn update_project_settings(
         let has_standby = app.state::<TabState>().lock()?.standby_ptt_tab_id.is_some();
         if has_standby {
             discard_standby_ptt_tab(app);
-            if app
-                .state::<TrayVisibilityState>()
-                .tray_hidden
-                .load(Ordering::SeqCst)
-            {
-                if let Err(error) = ensure_standby_ptt_tab(app) {
-                    eprintln!("[gpt-wrapper] failed to refresh standby PTT tab: {error}");
-                }
+        }
+        if app
+            .state::<TrayVisibilityState>()
+            .tray_hidden
+            .load(Ordering::SeqCst)
+        {
+            if let Err(error) = ensure_standby_ptt_tab(app) {
+                eprintln!("[gpt-wrapper] failed to refresh standby PTT tab: {error}");
             }
         }
     }
@@ -1772,6 +1794,7 @@ fn refresh_tab_host(app_handle: &AppHandle) {
 }
 
 fn restore_main_window_from_tray(app_handle: &AppHandle) {
+    background_project_switcher::dismiss(app_handle);
     app_handle
         .state::<TrayVisibilityState>()
         .tray_hidden
@@ -1860,6 +1883,7 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
             TRAY_OPEN_ID => restore_main_window_from_tray(app_handle),
             TRAY_SETTINGS_ID => open_settings_window(app_handle),
             TRAY_QUIT_ID => {
+                background_project_switcher::dismiss(app_handle);
                 quitting_for_menu.store(true, Ordering::SeqCst);
                 app_handle.state::<BleCentral>().quit();
                 discard_standby_ptt_tab(app_handle);
@@ -2263,6 +2287,21 @@ fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
 
 // BLE transport dispatches control events, never synthetic keyboard shortcuts.
 fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTracker>) {
+    // Tray-only Submit must never borrow a pending PTT target or a deferred Send.
+    // Run before the foreground defer/target routing; this path needs no active tab.
+    if app_handle
+        .state::<TrayVisibilityState>()
+        .tray_hidden
+        .load(Ordering::SeqCst)
+        && matches!(event, PttEvent::SubmitKeyboard(_) | PttEvent::SubmitBle)
+    {
+        if tracker.safe_for_background_switch() {
+            background_project_switcher::press(app_handle);
+        } else {
+            eprintln!("[gpt-wrapper] background Project switch rejected: PTT/Finish still active");
+        }
+        return;
+    }
     if tracker.defer_during_finish(event) {
         return;
     }
@@ -2284,6 +2323,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 .swap(false, Ordering::SeqCst);
 
             if was_tray_hidden {
+                background_project_switcher::dismiss(app_handle);
                 let tab_id = match promote_standby_ptt_tab(app_handle) {
                     Ok((tab_id, _ready)) => tab_id,
                     Err(error) => {
@@ -2443,18 +2483,14 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
             }
         },
         PttEvent::SubmitKeyboard(tab_id) => {
-            if app_handle
-                .state::<TrayVisibilityState>()
-                .tray_hidden
-                .load(Ordering::SeqCst)
-            {
-                eprintln!("[gpt-wrapper] Ctrl+. Submit refused while tray-hidden");
-            } else if tracker.is_held() {
+            if tracker.is_held() {
                 eprintln!(
                     "[gpt-wrapper] Ctrl+. Submit refused while PTT is held; release PTT first"
                 );
-            } else {
+            } else if let Some(tab_id) = tab_id {
                 request_explicit_send(app_handle, tab_id);
+            } else {
+                eprintln!("[gpt-wrapper] foreground Submit refused: no active tab");
             }
         }
         PttEvent::CancelBle => {
@@ -2531,6 +2567,7 @@ fn main() {
             let ptt_tracker = Arc::new(PttTracker::new());
             app.manage(PttState(Arc::clone(&ptt_tracker)));
             app.manage(TrayVisibilityState::new());
+            app.manage(background_project_switcher::BackgroundProjectSwitcherState::new());
             app.manage(SettingsWindowState::new());
             let project_settings_path: PathBuf =
                 app.path().app_config_dir()?.join("project-settings.json");
@@ -2582,6 +2619,7 @@ fn main() {
             layout_webviews(&window).map_err(|error| tauri::Error::AssetNotFound(error))?;
 
             let window_for_events = window.clone();
+            let tracker_for_events = Arc::clone(&ptt_tracker);
             let app_handle_for_events = app.handle().clone();
             let quitting_for_close = Arc::clone(&quitting);
             window.on_window_event(move |event| match event {
@@ -2592,6 +2630,9 @@ fn main() {
                             .state::<TrayVisibilityState>()
                             .tray_hidden
                             .store(true, Ordering::SeqCst);
+                        // Foreground Submit events deferred during Finish must not become switch presses.
+                        tracker_for_events.clear_deferred_submits();
+                        background_project_switcher::dismiss(&app_handle_for_events);
 
                         if let Err(error) = window_for_events.hide() {
                             eprintln!("[gpt-wrapper] failed to hide main window: {error:?}");
@@ -2662,22 +2703,30 @@ fn main() {
                 },
             )?;
 
-            for submit_shortcut in submit_shortcuts {
+            let submit_keys_down = Arc::new(Mutex::new(HashSet::<usize>::new()));
+            for (index, submit_shortcut) in submit_shortcuts.into_iter().enumerate() {
                 let tracker_for_submit = Arc::clone(&ptt_tracker);
+                let keys_down = Arc::clone(&submit_keys_down);
                 app.global_shortcut().on_shortcut(
                     submit_shortcut,
                     move |app_handle, _shortcut, event| {
-                        if event.state() == ShortcutState::Pressed {
-                            if let Some(tab_id) = active_tab_id(app_handle) {
-                                handle_ptt_event(
-                                    app_handle,
-                                    PttEvent::SubmitKeyboard(tab_id),
-                                    &tracker_for_submit,
-                                );
-                            } else {
-                                eprintln!("[gpt-wrapper] Submit shortcut refused: no active tab");
-                            }
+                        let Ok(mut held) = keys_down.lock() else { return; };
+                        if event.state() == ShortcutState::Released {
+                            held.remove(&index);
+                            return;
                         }
+                        if !held.insert(index) {
+                            return; // Ignore keyboard auto-repeat until this shortcut is released.
+                        }
+                        drop(held);
+                        let hidden = app_handle.state::<TrayVisibilityState>()
+                            .tray_hidden.load(Ordering::SeqCst);
+                        let tab_id = if hidden { None } else { active_tab_id(app_handle) };
+                        handle_ptt_event(
+                            app_handle,
+                            PttEvent::SubmitKeyboard(tab_id),
+                            &tracker_for_submit,
+                        );
                     },
                 )?;
             }
@@ -2696,6 +2745,43 @@ fn main() {
 #[cfg(test)]
 mod ptt_tests {
     use super::*;
+
+    #[test]
+    fn background_switch_only_runs_when_ptt_and_finish_are_idle() {
+        let ptt = PttTracker::new();
+        assert!(ptt.safe_for_background_switch());
+        let generation = ptt.begin(PttSource::Ble, 7).unwrap();
+        assert!(!ptt.safe_for_background_switch());
+        ptt.ble_submit_pending.store(true, Ordering::SeqCst);
+        assert!(!ptt.safe_for_background_switch());
+        ptt.ble_submit_pending.store(false, Ordering::SeqCst);
+        ptt.finish(PttSource::Ble);
+        ptt.finish_in_flight.store(generation, Ordering::SeqCst);
+        assert!(!ptt.safe_for_background_switch());
+        ptt.finish_in_flight.store(0, Ordering::SeqCst);
+        assert!(ptt.safe_for_background_switch());
+        ptt.failed_finish_tab_id.store(7, Ordering::SeqCst);
+        assert!(!ptt.safe_for_background_switch());
+    }
+
+    #[test]
+    fn entering_tray_discards_deferred_submit_but_preserves_ptt_edges() {
+        let ptt = PttTracker::new();
+        let generation = ptt.begin(PttSource::Keyboard, 4).unwrap();
+        ptt.finish(PttSource::Keyboard);
+        ptt.finish_in_flight.store(generation, Ordering::SeqCst);
+        assert!(ptt.defer_during_finish(PttEvent::SubmitKeyboard(Some(4))));
+        assert!(ptt.defer_during_finish(PttEvent::SubmitBle));
+        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Ble)));
+        ptt.clear_deferred_submits();
+        assert_eq!(
+            ptt.finish_completed(generation)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::Down(PttSource::Ble)]
+        );
+    }
 
     #[test]
     fn source_owns_the_held_session_and_repeated_events_are_safe() {
@@ -2811,14 +2897,14 @@ mod ptt_tests {
         assert!(ptt.mark_start_clicked(4, generation));
         ptt.finish(PttSource::Keyboard).unwrap();
         ptt.finish_in_flight.store(generation, Ordering::SeqCst);
-        assert!(ptt.defer_during_finish(PttEvent::SubmitKeyboard(4)));
+        assert!(ptt.defer_during_finish(PttEvent::SubmitKeyboard(Some(4))));
         assert!(ptt.defer_during_finish(PttEvent::CancelBle));
         assert_eq!(
             ptt.finish_completed(generation)
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![PttEvent::SubmitKeyboard(4), PttEvent::CancelBle],
+            vec![PttEvent::SubmitKeyboard(Some(4)), PttEvent::CancelBle],
             "Ctrl+. retains the pressed tab and BLE cleanup cannot discard it",
         );
     }
