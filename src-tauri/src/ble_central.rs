@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{
@@ -43,6 +43,13 @@ const WATCHER_RETRY: Duration = Duration::from_secs(5);
 const MAX_WATCHER_RETRY: Duration = Duration::from_secs(60);
 const ADVERTISEMENT_DEBOUNCE: Duration = Duration::from_secs(2);
 const MANUAL_SCAN_DURATION: Duration = Duration::from_secs(15);
+const APPROVED_ADVERTISEMENT_TTL: Duration = Duration::from_secs(20);
+const FAST_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_millis(3000),
+];
+const CCCD_DESCRIPTOR: GUID = GUID::from_u128(0x00002902_0000_1000_8000_00805f9b34fb);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlEvent {
@@ -129,6 +136,176 @@ fn should_connect(
 
 fn active_session(current: Option<u64>, event_session: u64) -> bool {
     current == Some(event_session)
+}
+
+// One worker-owned burst consists of one normal attempt and at most three
+// fresh-object retries. Slow cooldown is independent and starts on exhaustion.
+#[derive(Default)]
+struct RecoveryBurst {
+    attempts: usize,
+    retry_at: Option<Instant>,
+}
+
+impl RecoveryBurst {
+    fn begin_attempt(&mut self) -> usize {
+        assert!(self.attempts < 1 + FAST_RETRY_DELAYS.len());
+        self.attempts += 1;
+        self.retry_at = None;
+        self.attempts
+    }
+
+    fn failure(&mut self, now: Instant, recoverable: bool) -> Option<Duration> {
+        let delay = if recoverable && self.attempts > 0 {
+            FAST_RETRY_DELAYS.get(self.attempts - 1).copied()
+        } else {
+            None
+        };
+        self.retry_at = delay.map(|delay| now + delay);
+        delay
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|at| now >= at)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ApprovedAdvertisement {
+    candidate: SeenCandidate,
+    received_at: Instant,
+}
+
+impl ApprovedAdvertisement {
+    fn fresh(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.received_at) <= APPROVED_ADVERTISEMENT_TTL
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureKind {
+    Transient,
+    AccessDenied,
+    Security,
+    RadioOff,
+    Invalid,
+}
+
+impl FailureKind {
+    fn recoverable(self) -> bool {
+        matches!(self, Self::Transient)
+    }
+
+    fn from_hresult(code: i32) -> Self {
+        match code as u32 {
+            0x80070005 => Self::AccessDenied,
+            0x80650005 | 0x8065000f => Self::Security,
+            _ => Self::Transient,
+        }
+    }
+
+    fn from_gatt(status: GattCommunicationStatus, protocol: Option<u8>) -> Self {
+        if status == GattCommunicationStatus::AccessDenied {
+            Self::AccessDenied
+        } else if status == GattCommunicationStatus::ProtocolError
+            && matches!(protocol, Some(0x05 | 0x0f))
+        {
+            Self::Security
+        } else {
+            Self::Transient
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectFailure {
+    stage: &'static str,
+    kind: FailureKind,
+    status: Option<GattCommunicationStatus>,
+    hresult: Option<i32>,
+    detail: String,
+}
+
+impl ConnectFailure {
+    fn winrt(stage: &'static str, action: &'static str, error: windows::core::Error) -> Self {
+        let hresult = error.code().0;
+        Self {
+            stage,
+            kind: FailureKind::from_hresult(hresult),
+            status: None,
+            hresult: Some(hresult),
+            detail: format!("{action}: {error}"),
+        }
+    }
+
+    fn gatt(stage: &'static str, status: GattCommunicationStatus, protocol: Option<u8>) -> Self {
+        Self {
+            stage,
+            kind: FailureKind::from_gatt(status, protocol),
+            status: Some(status),
+            hresult: None,
+            detail: gatt_failure(stage, status, protocol),
+        }
+    }
+
+    fn invalid(stage: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            kind: FailureKind::Invalid,
+            status: None,
+            hresult: None,
+            detail: detail.into(),
+        }
+    }
+
+    fn radio(detail: String) -> Self {
+        Self {
+            stage: "radio",
+            kind: FailureKind::RadioOff,
+            status: None,
+            hresult: None,
+            detail,
+        }
+    }
+
+    fn display_state(&self) -> &'static str {
+        if self.kind == FailureKind::Security {
+            "bond-required"
+        } else if matches!(self.kind, FailureKind::AccessDenied | FailureKind::Invalid) {
+            "error"
+        } else if self.stage == "cccd" {
+            "cccd-failed"
+        } else if self.status == Some(GattCommunicationStatus::Unreachable) {
+            "gatt-unreachable"
+        } else {
+            "waiting-for-device"
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+fn readiness_blocked_by_queued_command(
+    current_session: u64,
+    pending: &std::collections::VecDeque<Command>,
+) -> bool {
+    pending.iter().any(|command| {
+        matches!(
+            command,
+            Command::Enable(false)
+                | Command::Disconnect
+                | Command::Forget
+                | Command::Quit
+                | Command::Approve(_)
+        ) || matches!(command, Command::Lost(session, _) if *session == current_session)
+    })
 }
 
 impl Sequence {
@@ -543,6 +720,7 @@ fn gatt_failure(
     format!("{stage}: GattCommunicationStatus={result:?}, ATT protocol error={protocol_error:?}; {diagnosis}")
 }
 
+#[cfg(test)]
 fn connection_failure_state(error: &str) -> &'static str {
     if error.contains("CCCD Indicate write") {
         "cccd-failed"
@@ -591,108 +769,168 @@ fn persist(path: &PathBuf, approval: &Approval) -> Result<(), String> {
 fn connect(
     id: &str,
     session: u64,
+    attempt: usize,
     tx: &Sender<Command>,
     state: &Arc<Mutex<Snapshot>>,
-) -> Result<Link, String> {
-    status(state, "connecting", "Opening Windows BLE device");
-    check_radio()?;
-    let device = BluetoothLEDevice::FromIdAsync(&HSTRING::from(id))
-        .map_err(|e| format!("device open: {e}"))?
-        .join()
-        .map_err(|e| format!("device open: {e}"))?;
-    let mut pending = PendingLink::new(device);
+) -> Result<Link, ConnectFailure> {
+    let started = Instant::now();
+    let label = format!("Opening fresh Windows BLE session (attempt {attempt}/4)");
     status(
         state,
-        "link-connected",
-        "BLE device opened; checking GATT service",
+        if attempt == 1 {
+            "connecting"
+        } else {
+            "retrying"
+        },
+        label,
     );
+    check_radio().map_err(ConnectFailure::radio)?;
+    let device = BluetoothLEDevice::FromIdAsync(&HSTRING::from(id))
+        .map_err(|e| ConnectFailure::winrt("open", "device open start", e))?
+        .join()
+        .map_err(|e| ConnectFailure::winrt("open", "device open", e))?;
+    let mut pending = PendingLink::new(device);
+    // Last two attempts may warm cached enumeration, but all authoritative
+    // objects below are ALWAYS derived from this session's uncached chain.
+    if attempt >= 3 {
+        let warm = pending
+            .device
+            .as_ref()
+            .unwrap()
+            .GetGattServicesForUuidWithCacheModeAsync(SERVICE, BluetoothCacheMode::Cached)
+            .and_then(|op| op.join());
+        trace_stage(
+            "service-cache-warmup",
+            &format!(
+                "session={session} attempt={attempt} result={:?}",
+                warm.as_ref().map(|response| response.Status())
+            ),
+        );
+    }
+
     let services = pending
         .device
         .as_ref()
         .unwrap()
         .GetGattServicesForUuidWithCacheModeAsync(SERVICE, BluetoothCacheMode::Uncached)
-        .map_err(|e| format!("Uncached PTT service query start: {e}"))?
+        .map_err(|e| ConnectFailure::winrt("service", "Uncached PTT service query start", e))?
         .join()
-        .map_err(|e| format!("Uncached PTT service query completion: {e}"))?;
+        .map_err(|e| {
+            ConnectFailure::winrt("service", "Uncached PTT service query completion", e)
+        })?;
     let service_status = services
         .Status()
-        .map_err(|e| format!("Uncached PTT service status: {e}"))?;
+        .map_err(|e| ConnectFailure::winrt("service", "Uncached PTT service status", e))?;
     if service_status != GattCommunicationStatus::Success {
-        let protocol_error = services
-            .ProtocolError()
-            .ok()
-            .and_then(|value| value.Value().ok());
-        return Err(gatt_failure(
-            "Uncached PTT service query",
-            service_status,
-            protocol_error,
-        ));
+        let protocol = services.ProtocolError().ok().and_then(|v| v.Value().ok());
+        return Err(ConnectFailure::gatt("service", service_status, protocol));
     }
     let service_list = services
         .Services()
-        .map_err(|e| format!("Uncached PTT service list: {e}"))?;
+        .map_err(|e| ConnectFailure::winrt("service", "Uncached PTT service list", e))?;
     if service_list
         .Size()
-        .map_err(|e| format!("Uncached PTT service list size: {e}"))?
+        .map_err(|e| ConnectFailure::winrt("service", "Service count", e))?
         == 0
     {
-        return Err(
-            "Uncached PTT service query: required PTT service absent (zero matches)".into(),
+        return Err(ConnectFailure::invalid(
+            "service",
+            "Required PTT service absent (zero matches)",
+        ));
+    }
+    pending.service = Some(
+        service_list
+            .GetAt(0)
+            .map_err(|e| ConnectFailure::winrt("service", "Service list first item", e))?,
+    );
+    if attempt >= 3 {
+        let warm = pending
+            .service
+            .as_ref()
+            .unwrap()
+            .GetCharacteristicsForUuidWithCacheModeAsync(CONTROL, BluetoothCacheMode::Cached)
+            .and_then(|op| op.join());
+        trace_stage(
+            "characteristic-cache-warmup",
+            &format!(
+                "session={session} attempt={attempt} result={:?}",
+                warm.as_ref().map(|response| response.Status())
+            ),
         );
     }
-    let service = service_list
-        .GetAt(0)
-        .map_err(|e| format!("Uncached PTT service list first item: {e}"))?;
-    pending.service = Some(service);
-    status(
-        state,
-        "service-found",
-        "PTT GATT service found; subscribing",
-    );
     let chars = pending
         .service
         .as_ref()
         .unwrap()
         .GetCharacteristicsForUuidWithCacheModeAsync(CONTROL, BluetoothCacheMode::Uncached)
-        .map_err(|e| format!("Uncached PTT characteristic query start: {e}"))?
+        .map_err(|e| {
+            ConnectFailure::winrt(
+                "characteristic",
+                "Uncached PTT characteristic query start",
+                e,
+            )
+        })?
         .join()
-        .map_err(|e| format!("Uncached PTT characteristic query completion: {e}"))?;
-    let characteristic_status = chars
-        .Status()
-        .map_err(|e| format!("Uncached PTT characteristic status: {e}"))?;
+        .map_err(|e| {
+            ConnectFailure::winrt(
+                "characteristic",
+                "Uncached PTT characteristic query completion",
+                e,
+            )
+        })?;
+    let characteristic_status = chars.Status().map_err(|e| {
+        ConnectFailure::winrt("characteristic", "Uncached PTT characteristic status", e)
+    })?;
     if characteristic_status != GattCommunicationStatus::Success {
-        let protocol_error = chars
-            .ProtocolError()
-            .ok()
-            .and_then(|value| value.Value().ok());
-        return Err(gatt_failure(
-            "Uncached PTT characteristic query",
+        let protocol = chars.ProtocolError().ok().and_then(|v| v.Value().ok());
+        return Err(ConnectFailure::gatt(
+            "characteristic",
             characteristic_status,
-            protocol_error,
+            protocol,
         ));
     }
-    let characteristic_list = chars
-        .Characteristics()
-        .map_err(|e| format!("Uncached PTT characteristic list: {e}"))?;
+    let characteristic_list = chars.Characteristics().map_err(|e| {
+        ConnectFailure::winrt("characteristic", "Uncached PTT characteristic list", e)
+    })?;
     if characteristic_list
         .Size()
-        .map_err(|e| format!("Uncached PTT characteristic list size: {e}"))?
+        .map_err(|e| ConnectFailure::winrt("characteristic", "Characteristic count", e))?
         == 0
     {
-        return Err("Uncached PTT characteristic query: required PTT control characteristic absent (zero matches)".into());
+        return Err(ConnectFailure::invalid(
+            "characteristic",
+            "Required PTT control characteristic absent",
+        ));
     }
-    let characteristic = characteristic_list
-        .GetAt(0)
-        .map_err(|e| format!("Uncached PTT characteristic list first item: {e}"))?;
-    pending.characteristic = Some(characteristic);
+    pending.characteristic = Some(characteristic_list.GetAt(0).map_err(|e| {
+        ConnectFailure::winrt("characteristic", "Characteristic list first item", e)
+    })?);
     let characteristic = pending.characteristic.as_ref().unwrap();
     if !characteristic
         .CharacteristicProperties()
-        .map_err(|e| format!("PTT characteristic properties: {e}"))?
+        .map_err(|e| ConnectFailure::winrt("characteristic", "PTT characteristic properties", e))?
         .contains(GattCharacteristicProperties::Indicate)
     {
-        return Err("PTT characteristic properties: control characteristic lacks INDICATE".into());
+        return Err(ConnectFailure::invalid(
+            "characteristic",
+            "PTT control characteristic lacks INDICATE",
+        ));
     }
+    // A single uncached 0x2902 query precedes every CCCD write. Discovery is
+    // best effort: even zero results or transient errors retain the normal
+    // characteristic-owned CCCD write fallback, never a guessed handle.
+    let descriptor_query = characteristic
+        .GetDescriptorsForUuidWithCacheModeAsync(CCCD_DESCRIPTOR, BluetoothCacheMode::Uncached)
+        .and_then(|op| op.join());
+    match descriptor_query {
+        Ok(result) => {
+            let status = result.Status();
+            let count = result.Descriptors().and_then(|descriptors| descriptors.Size());
+            trace_stage("cccd-discovery", &format!("session={session} attempt={attempt} status={status:?} count={count:?}"));
+        }
+        Err(error) => trace_stage("cccd-discovery", &format!("session={session} attempt={attempt} error_hresult=0x{:08x} fallback=characteristic-write", error.code().0 as u32)),
+    }
+
     let frame_tx = tx.clone();
     let accepting_frames = Arc::clone(&pending.accepting_frames);
     pending.value_token = Some(
@@ -714,7 +952,6 @@ fn connect(
                                         let _ = frame_tx.send(Command::Frame(session, bytes));
                                     }
                                 } else {
-                                    // Avoid allocating from an untrusted length; decoder logs rejection.
                                     let _ = frame_tx.send(Command::Frame(session, Vec::new()));
                                 }
                             }
@@ -723,7 +960,7 @@ fn connect(
                 }
                 Ok(())
             }))
-            .map_err(|e| format!("ValueChanged handler registration: {e}"))?,
+            .map_err(|e| ConnectFailure::winrt("handler", "ValueChanged registration", e))?,
     );
     let invalidated = Arc::new(AtomicBool::new(false));
     let lost_tx = tx.clone();
@@ -745,7 +982,9 @@ fn connect(
                 }
                 Ok(())
             }))
-            .map_err(|e| format!("ConnectionStatusChanged handler registration: {e}"))?,
+            .map_err(|e| {
+                ConnectFailure::winrt("handler", "ConnectionStatusChanged registration", e)
+            })?,
     );
     let service_tx = tx.clone();
     let service_invalidated = Arc::clone(&invalidated);
@@ -762,41 +1001,278 @@ fn connect(
                 let _ = service_tx.send(Command::Lost(session, ShutdownReason::ServiceChanged));
                 Ok(())
             }))
-            .map_err(|e| format!("GattServicesChanged handler registration: {e}"))?,
+            .map_err(|e| ConnectFailure::winrt("handler", "GattServicesChanged registration", e))?,
     );
-    let result = pending
-        .characteristic
-        .as_ref()
-        .unwrap()
+    let result = characteristic
         .WriteClientCharacteristicConfigurationDescriptorAsync(
             GattClientCharacteristicConfigurationDescriptorValue::Indicate,
         )
         .and_then(|op| op.join());
     match result {
-        Ok(GattCommunicationStatus::Success) => trace_stage("cccd-success", "Indicate"),
-        Ok(other) => return Err(gatt_failure("CCCD Indicate write", other, "unavailable")),
-        Err(error) => {
-            return Err(format!(
-                "CCCD Indicate write WinRT failure (HRESULT, timeout or cancellation): {error}"
-            ))
-        }
+        Ok(GattCommunicationStatus::Success) => trace_stage(
+            "cccd-success",
+            &format!("session={session} attempt={attempt}"),
+        ),
+        Ok(other) => return Err(ConnectFailure::gatt("cccd", other, None)),
+        Err(error) => return Err(ConnectFailure::winrt("cccd", "CCCD Indicate write", error)),
     }
     if invalidated.load(Ordering::Acquire) {
-        return Err("GATT service or BLE connection changed during subscription".into());
+        return Err(ConnectFailure {
+            stage: "validate",
+            kind: FailureKind::Transient,
+            status: None,
+            hresult: None,
+            detail: "GATT service or BLE connection changed during subscription".into(),
+        });
     }
     if pending
         .device
         .as_ref()
         .unwrap()
         .ConnectionStatus()
-        .map_err(|e| format!("BLE connection status after CCCD write: {e}"))?
+        .map_err(|e| ConnectFailure::winrt("validate", "BLE connection after CCCD", e))?
         != BluetoothConnectionStatus::Connected
     {
-        return Err("GATT subscription completed but BLE link is disconnected".into());
+        return Err(ConnectFailure {
+            stage: "validate",
+            kind: FailureKind::Transient,
+            status: None,
+            hresult: None,
+            detail: "GATT subscription completed but BLE link is disconnected".into(),
+        });
     }
-    pending.accepting_frames.store(true, Ordering::Release);
-    status(state, "ready", "Indicate subscription ready");
+    // Keep frames disabled until the worker has processed any queued cancellation
+    // or Lost event. CCCD completion alone is not activation of the new session.
+    trace_stage(
+        "subscribed",
+        &format!(
+            "session={session} attempt={attempt} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    );
     Ok(pending.finish(session))
+}
+
+// Run only on the existing MTA worker, after processing the next queued command.
+// Each attempt owns a new WinRT link and never overlaps another connect().
+fn drive_recovery(
+    approval: &Approval,
+    approved_seen: &mut Option<ApprovedAdvertisement>,
+    burst: &mut RecoveryBurst,
+    reconnect: &mut ReconnectGate,
+    suspended: &mut bool,
+    link: &mut Option<Link>,
+    sequence: &mut Sequence,
+    session: &mut u64,
+    rx: &Receiver<Command>,
+    pending_commands: &mut VecDeque<Command>,
+    tx: &Sender<Command>,
+    state: &Arc<Mutex<Snapshot>>,
+) {
+    if !approval.enabled || approval.device_id.is_none() || link.is_some() || *suspended {
+        return;
+    }
+    let now = Instant::now();
+    let due = if burst.attempts == 0 {
+        reconnect.ready(now)
+    } else {
+        burst.due(now)
+    };
+    if !due {
+        return;
+    }
+    let Some(ad) = approved_seen.filter(|ad| ad.fresh(now)) else {
+        if approved_seen.take().is_some() {
+            burst.reset();
+            status(
+                state,
+                "waiting-for-device",
+                "等待裝置重新廣播／持續自動重連",
+            );
+        }
+        return;
+    };
+    // A fresh ad is not enough: pairing and exact Windows identity must
+    // still be verified before EACH new GATT session.
+    let identity = match resolve_identity(ad.candidate.address, ad.candidate.address_type) {
+        Ok(identity)
+            if approval.device_id.as_deref() == Some(identity.id.as_str()) && identity.paired =>
+        {
+            identity
+        }
+        Ok(identity) if approval.device_id.as_deref() == Some(identity.id.as_str()) => {
+            *approved_seen = None;
+            burst.reset();
+            *suspended = true;
+            status(
+                state,
+                "bond-required",
+                "Approved device is no longer paired; Scan/Approve to pair",
+            );
+            return;
+        }
+        Ok(_) => {
+            *approved_seen = None;
+            burst.reset();
+            status(
+                state,
+                "approved-identity-mismatch",
+                "Approved device identity changed; ignored",
+            );
+            return;
+        }
+        Err(error) => {
+            *approved_seen = None;
+            burst.reset();
+            status(
+                state,
+                "waiting-for-device",
+                format!(
+                "Could not validate device identity: {error}; waiting for approved advertisement"
+            ),
+            );
+            return;
+        }
+    };
+    if burst.attempts == 0
+        && !should_connect(
+            approval,
+            &identity.id,
+            identity.paired,
+            link.is_some(),
+            reconnect,
+            now,
+        )
+    {
+        return;
+    }
+    pending_commands.extend(rx.try_iter());
+    let user_cancel = pending_commands.iter().any(|command| {
+        matches!(
+            command,
+            Command::Enable(false)
+                | Command::Disconnect
+                | Command::Forget
+                | Command::Quit
+                | Command::Approve(_)
+        )
+    });
+    if user_cancel {
+        return;
+    }
+    *session = session.wrapping_add(1);
+    let number = burst.begin_attempt();
+    let started = Instant::now();
+    trace_stage(
+        "attempt-start",
+        &format!("session={session} attempt={number}/4"),
+    );
+    let result = connect(&identity.id, *session, number, tx, state);
+    pending_commands.extend(rx.try_iter());
+    let lost_or_canceled = readiness_blocked_by_queued_command(*session, pending_commands);
+    let result = match result {
+        Ok(new_link) if lost_or_canceled => {
+            new_link.close(ShutdownReason::LinkLost);
+            Err(ConnectFailure {
+                stage: "validate",
+                kind: FailureKind::Transient,
+                status: None,
+                hresult: None,
+                detail: "New GATT link was canceled before activation".into(),
+            })
+        }
+        other => other,
+    };
+    match result {
+        Ok(new_link) => {
+            new_link.accepting_frames.store(true, Ordering::Release);
+            *link = Some(new_link);
+            sequence.reset();
+            if let Ok(mut snapshot) = state.lock() {
+                snapshot.last_rx = None;
+            }
+            reconnect.reset(Instant::now());
+            burst.reset();
+            status(state, "ready", "Indicate subscription ready");
+            trace_stage(
+                "attempt-ready",
+                &format!(
+                    "session={session} attempt={number} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
+            );
+        }
+        Err(error) => {
+            let user_cancel = pending_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::Enable(false)
+                        | Command::Disconnect
+                        | Command::Forget
+                        | Command::Quit
+                        | Command::Approve(_)
+                )
+            });
+            let delay = burst.failure(Instant::now(), error.kind.recoverable() && !user_cancel);
+            trace_stage("attempt-failed", &format!(
+                "session={session} attempt={number} stage={} kind={:?} gatt={:?} hresult={} elapsed_ms={} next_retry_ms={}",
+                error.stage, error.kind, error.status,
+                error.hresult.map(|code| format!("0x{:08x}", code as u32))
+                    .unwrap_or_else(|| "none".into()),
+                started.elapsed().as_millis(),
+                delay.map(|d| d.as_millis().to_string()).unwrap_or_else(|| "none".into())
+            ));
+            if let Some(delay) = delay {
+                status(
+                    state,
+                    "retrying",
+                    format!(
+                        "正在恢復連線（第 {}/4 次，{}ms 後）；{}: {}",
+                        number + 1,
+                        delay.as_millis(),
+                        error.display_state(),
+                        error
+                    ),
+                );
+            } else {
+                burst.reset();
+                if user_cancel {
+                    status(
+                        state,
+                        "waiting-for-device",
+                        "Connection canceled; processing user action",
+                    );
+                } else if matches!(
+                    error.kind,
+                    FailureKind::Security | FailureKind::AccessDenied | FailureKind::Invalid
+                ) {
+                    *suspended = true;
+                    status(
+                        state,
+                        error.display_state(),
+                        format!(
+                            "{}; check Bluetooth access and pairing before retrying",
+                            error
+                        ),
+                    );
+                } else {
+                    if error.kind == FailureKind::RadioOff {
+                        *approved_seen = None;
+                    }
+                    reconnect.delay(Instant::now(), CONNECT_COOLDOWN, MAX_CONNECT_COOLDOWN);
+                    status(
+                        state,
+                        "waiting-for-device",
+                        format!(
+                            "等待裝置重新廣播／持續自動重連；{}: {}",
+                            error.display_state(),
+                            error
+                        ),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn worker(
@@ -818,8 +1294,16 @@ fn worker(
     let mut manual_until: Option<Instant> = None;
     let mut reconnect = ReconnectGate::new(Instant::now());
     let mut watcher_retry = ReconnectGate::new(Instant::now());
+    let mut approved_seen: Option<ApprovedAdvertisement> = None;
+    let mut burst = RecoveryBurst::default();
+    let mut suspended = false;
+    let mut pending_commands = VecDeque::new();
     loop {
-        let command = rx.recv_timeout(Duration::from_millis(250));
+        let command = if let Some(command) = pending_commands.pop_front() {
+            Ok(command)
+        } else {
+            rx.recv_timeout(Duration::from_millis(250))
+        };
         let mut shutdown = None;
         match command {
             Ok(Command::Enable(enabled)) => {
@@ -831,6 +1315,9 @@ fn worker(
                     s.enabled = enabled;
                 }
                 if !enabled {
+                    approved_seen = None;
+                    burst.reset();
+                    suspended = false;
                     shutdown = Some(ShutdownReason::User);
                     stop_watcher(&mut watcher);
                     scan_epoch = scan_epoch.wrapping_add(1);
@@ -839,11 +1326,13 @@ fn worker(
                     unknown_addresses.clear();
                     status(&state, "disconnected", "Bluetooth controller disabled");
                 } else {
+                    suspended = false;
                     reconnect.reset(Instant::now());
                     watcher_retry.reset(Instant::now());
                 }
             }
             Ok(Command::Scan) => {
+                suspended = false;
                 manual_until = Some(Instant::now() + MANUAL_SCAN_DURATION);
                 seen.clear();
                 if let Ok(mut s) = state.lock() {
@@ -905,45 +1394,37 @@ fn worker(
                                     });
                                 }
                             }
-                            if should_connect(
-                                &approval,
-                                &id,
-                                identity.paired,
-                                link.is_some(),
-                                &reconnect,
-                                Instant::now(),
-                            ) {
-                                session = session.wrapping_add(1);
-                                // The worker does not process another Seen while connect blocks.
-                                match connect(&id, session, &tx, &state) {
-                                    Ok(new_link) => {
-                                        link = Some(new_link);
-                                        sequence.reset();
-                                        reconnect.reset(Instant::now());
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[gpt-wrapper] BLE approved device connection failed: {e}");
-                                        reconnect.delay(
-                                            Instant::now(),
-                                            CONNECT_COOLDOWN,
-                                            MAX_CONNECT_COOLDOWN,
-                                        );
-                                        status(&state, connection_failure_state(&e), format!("Connection failed: {e}; waiting for another advertisement"));
-                                    }
-                                }
+                            if awaiting
+                                && approval.device_id.as_deref() == Some(id.as_str())
+                                && identity.paired
+                            {
+                                approved_seen = Some(ApprovedAdvertisement {
+                                    candidate: SeenCandidate {
+                                        address,
+                                        address_type,
+                                    },
+                                    received_at,
+                                });
                             } else if awaiting
                                 && approval.device_id.as_deref() == Some(id.as_str())
                                 && !identity.paired
                             {
-                                status(&state, "bond-required", "Approved device is not paired in Windows; Scan and select it once to pair");
+                                approved_seen = None;
+                                burst.reset();
+                                suspended = true;
+                                status(&state, "bond-required",
+                                    "Approved device is not paired in Windows; Scan and select it once to pair");
                             } else if awaiting && approval.device_id.as_deref() != Some(id.as_str())
                             {
                                 if unknown_addresses.len() > 128 {
                                     unknown_addresses.clear();
                                 }
                                 if unknown_addresses.insert(address) {
-                                    trace_stage("identity-mismatch", &format!("approved_slot={approved_label} seen_slot={resolved_label}; ignored"));
-                                    status(&state, "approved-identity-mismatch", "PTT advertisement identity differs from approved Windows device; ignored");
+                                    trace_stage("identity-mismatch", &format!(
+                                        "approved_slot={approved_label} seen_slot={resolved_label}; ignored"
+                                    ));
+                                    status(&state, "approved-identity-mismatch",
+                                        "PTT advertisement identity differs from approved Windows device; ignored");
                                 }
                             } else if awaiting && !reconnect.ready(Instant::now()) {
                                 trace_stage("attempt-gated", "reconnect cooldown");
@@ -993,6 +1474,9 @@ fn worker(
                         identity_label(&approval, &paired_id),
                         paired_id != id
                     );
+                    approved_seen = None;
+                    burst.reset();
+                    suspended = false;
                     shutdown = Some(ShutdownReason::User);
                     stop_watcher(&mut watcher);
                     scan_epoch = scan_epoch.wrapping_add(1);
@@ -1043,6 +1527,9 @@ fn worker(
                 }
             }
             Ok(Command::Disconnect) => {
+                approved_seen = None;
+                burst.reset();
+                suspended = false;
                 shutdown = Some(ShutdownReason::User);
                 approval.enabled = false;
                 stop_watcher(&mut watcher);
@@ -1064,6 +1551,9 @@ fn worker(
                 }
             }
             Ok(Command::Forget) => {
+                approved_seen = None;
+                burst.reset();
+                suspended = false;
                 shutdown = Some(ShutdownReason::User);
                 stop_watcher(&mut watcher);
                 scan_epoch = scan_epoch.wrapping_add(1);
@@ -1113,6 +1603,7 @@ fn worker(
             Ok(Command::Lost(lost_session, reason)) => {
                 if active_session(link.as_ref().map(|current| current.session), lost_session) {
                     shutdown = Some(reason);
+                    burst.reset();
                     reconnect.reset(Instant::now());
                     status(
                         &state,
@@ -1127,6 +1618,8 @@ fn worker(
                     scan_epoch = scan_epoch.wrapping_add(1);
                     recent_addresses.clear();
                     unknown_addresses.clear();
+                    approved_seen = None;
+                    burst.reset();
                     watcher_retry.delay(Instant::now(), WATCHER_RETRY, MAX_WATCHER_RETRY);
                     eprintln!("[gpt-wrapper] {reason}");
                     if link.is_none() {
@@ -1179,6 +1672,20 @@ fn worker(
                 );
             }
         }
+        drive_recovery(
+            &approval,
+            &mut approved_seen,
+            &mut burst,
+            &mut reconnect,
+            &mut suspended,
+            &mut link,
+            &mut sequence,
+            &mut session,
+            &rx,
+            &mut pending_commands,
+            &tx,
+            &state,
+        );
         let awaiting = approval.enabled && approval.device_id.is_some() && link.is_none();
         let manual = manual_until.is_some();
         if (awaiting || manual) && watcher.is_none() && watcher_retry.ready(Instant::now()) {
@@ -1189,11 +1696,13 @@ fn worker(
                 Ok(w) => {
                     watcher = Some(w);
                     if awaiting {
-                        status(
-                            &state,
-                            "waiting-for-device",
-                            "Waiting for approved device advertisement",
-                        );
+                        if burst.retry_at.is_none() && !suspended {
+                            status(
+                                &state,
+                                "waiting-for-device",
+                                "Waiting for approved device advertisement / automatic reconnect",
+                            );
+                        }
                     } else if link.is_none() {
                         status(
                             &state,
@@ -1314,6 +1823,119 @@ fn check_radio() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_burst_has_three_timed_retries_and_returns_to_slow_gate() {
+        let start = Instant::now();
+        let mut burst = RecoveryBurst::default();
+        assert_eq!(burst.begin_attempt(), 1);
+        for (index, delay) in FAST_RETRY_DELAYS.iter().enumerate() {
+            let at = start + Duration::from_secs(index as u64 * 6);
+            assert_eq!(burst.failure(at, true), Some(*delay));
+            assert!(!burst.due(at + *delay - Duration::from_millis(1)));
+            assert!(burst.due(at + *delay));
+            assert_eq!(burst.begin_attempt(), index + 2);
+        }
+        assert_eq!(burst.failure(start + Duration::from_secs(20), true), None);
+        assert!(!burst.due(start + Duration::from_secs(60)));
+        let mut gate = ReconnectGate::new(start);
+        gate.delay(start, CONNECT_COOLDOWN, MAX_CONNECT_COOLDOWN);
+        assert!(!gate.ready(start + Duration::from_secs(4)));
+        assert!(gate.ready(start + Duration::from_secs(5)));
+        // A subsequent success clears both the retry schedule and slow failures.
+        burst.reset();
+        gate.reset(start);
+        assert_eq!(burst.begin_attempt(), 1);
+        assert_eq!(gate.failures, 0);
+    }
+
+    #[test]
+    fn recoverable_failures_are_not_security_or_permission_failures() {
+        assert_eq!(
+            FailureKind::from_hresult(0x80650003_u32 as i32),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            FailureKind::from_hresult(0x80650001_u32 as i32),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            FailureKind::from_hresult(0x80650005_u32 as i32),
+            FailureKind::Security
+        );
+        assert_eq!(
+            FailureKind::from_hresult(0x8065000f_u32 as i32),
+            FailureKind::Security
+        );
+        assert_eq!(
+            FailureKind::from_hresult(0x80070005_u32 as i32),
+            FailureKind::AccessDenied
+        );
+        assert_eq!(
+            FailureKind::from_gatt(GattCommunicationStatus::ProtocolError, Some(0x05)),
+            FailureKind::Security
+        );
+        assert_eq!(
+            FailureKind::from_gatt(GattCommunicationStatus::Unreachable, None),
+            FailureKind::Transient
+        );
+        assert!(!FailureKind::RadioOff.recoverable());
+        assert!(!FailureKind::AccessDenied.recoverable());
+        assert!(!FailureKind::Security.recoverable());
+        assert!(!FailureKind::Invalid.recoverable());
+        let mut burst = RecoveryBurst::default();
+        burst.begin_attempt();
+        assert_eq!(burst.failure(Instant::now(), false), None);
+    }
+
+    #[test]
+    fn advertisement_must_be_recent_and_session_queue_cannot_override_cancel() {
+        let now = Instant::now();
+        let ad = ApprovedAdvertisement {
+            candidate: SeenCandidate {
+                address: 0,
+                address_type: BluetoothAddressType::Public,
+            },
+            received_at: now,
+        };
+        assert!(ad.fresh(now + APPROVED_ADVERTISEMENT_TTL));
+        assert!(!ad.fresh(now + APPROVED_ADVERTISEMENT_TTL + Duration::from_millis(1)));
+        let mut queue = VecDeque::new();
+        assert!(!readiness_blocked_by_queued_command(42, &queue));
+        queue.push_back(Command::Frame(41, vec![1]));
+        queue.push_back(Command::Lost(41, ShutdownReason::LinkLost));
+        assert!(!readiness_blocked_by_queued_command(42, &queue));
+        queue.push_back(Command::Lost(42, ShutdownReason::ServiceChanged));
+        assert!(readiness_blocked_by_queued_command(42, &queue));
+        queue.clear();
+        queue.push_back(Command::Disconnect);
+        assert!(readiness_blocked_by_queued_command(42, &queue));
+        queue.clear();
+        queue.push_back(Command::Forget);
+        assert!(readiness_blocked_by_queued_command(42, &queue));
+        queue.clear();
+        queue.push_back(Command::Enable(false));
+        assert!(readiness_blocked_by_queued_command(42, &queue));
+        queue.clear();
+        queue.push_back(Command::Quit);
+        assert!(readiness_blocked_by_queued_command(42, &queue));
+    }
+
+    #[test]
+    fn first_attempt_failure_then_success_has_no_remaining_retry() {
+        let now = Instant::now();
+        let mut burst = RecoveryBurst::default();
+        assert_eq!(burst.begin_attempt(), 1);
+        assert_eq!(burst.failure(now, true), Some(FAST_RETRY_DELAYS[0]));
+        assert!(burst.due(now + FAST_RETRY_DELAYS[0]));
+        assert_eq!(burst.begin_attempt(), 2);
+        // Worker calls reset on READY, before processing any further advertisement.
+        burst.reset();
+        assert_eq!(burst.attempts, 0);
+        assert_eq!(burst.retry_at, None);
+        assert!(!burst.due(now + Duration::from_secs(30)));
+    }
+
     #[test]
     fn strict_packets() {
         let good = [1, 1, 1, 0, 232, 3, 0, 0];
