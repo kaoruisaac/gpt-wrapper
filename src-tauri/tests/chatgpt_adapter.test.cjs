@@ -273,9 +273,11 @@ function harness(initialText = "", sendLabel = "Send") {
   h.api.prepareStart();
   h.api.requestExplicitSend(); // queued explicit Submit, already dispatched in another code path
   h.api.finishPttSegment(true); // native Finish control submitted to ChatGPT directly
-  h.composer.value = "prefix done";
   h.advance(16000);
   assert.equal(h.send.clicks, 0, "native send-on-finish must cancel pending duplicate Send");
+  h.api.requestExplicitSend();
+  h.advance(16000);
+  assert.equal(h.send.clicks, 0, "same draft must not send again after native Submit");
 }
 
 console.log("chatgpt_adapter explicit-send and unified PTT tests passed");

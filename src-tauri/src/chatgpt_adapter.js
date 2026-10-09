@@ -153,6 +153,29 @@
   };
 
   window.__GPT_WRAPPER__ = {
+    showRecoveryStatus(message) {
+      let notice = document.getElementById("gpt-wrapper-ptt-recovery");
+      if (!notice) {
+        notice = document.createElement("div");
+        notice.id = "gpt-wrapper-ptt-recovery";
+        notice.setAttribute("role", "status");
+        Object.assign(notice.style, {
+          position: "fixed", right: "16px", bottom: "20px", zIndex: "2147483647",
+          maxWidth: "360px", padding: "10px 14px", borderRadius: "9px",
+          background: "#303030", color: "#fff", fontSize: "13px",
+          boxShadow: "0 4px 18px #0005", pointerEvents: "none",
+        });
+        document.body?.append(notice);
+      }
+      notice.textContent = message;
+      // Stale timers must not remove a newer warning.
+      const version = Number(notice.dataset.version || 0) + 1;
+      notice.dataset.version = String(version);
+      setTimeout(() => {
+        if (notice.isConnected && Number(notice.dataset.version) === version) notice.remove();
+      }, 4500);
+    },
+
     applyMessagePrefix(prefix) {
       if (prefix === "") return "success";
       const el = composer();
@@ -204,6 +227,8 @@
         state.sendRequested = false;
         state.segments = [];
         state.segmentVersion++;
+        state.lastClickedText = composerText();
+        state.sendClicked = true;
         console.info("[gpt-wrapper] native dictation Send handled by ChatGPT");
         return;
       }

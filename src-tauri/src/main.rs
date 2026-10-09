@@ -98,15 +98,25 @@ impl DictationTarget {
         // "Submit dictation" inserts the transcription into the composer; a
         // "Transcribe and send" control can submit the entire message instead.
         let insert_labels = [
-            "Submit dictation", "提交听写内容", "送出聽寫內容",
-            "Insert transcription", "完成轉錄", "完成转录",
+            "停止聽寫",
+            "Stop dictation",
+            "Submit dictation",
+            "提交听写内容",
+            "送出聽寫內容",
+            "Insert transcription",
+            "完成轉錄",
+            "完成转录",
         ];
         let native_send_labels = ["Transcribe and send", "轉錄並傳送"];
         let (labels, native_labels): (Vec<&str>, Vec<&str>) = match self {
             Self::Start => (start_labels.to_vec(), vec![]),
             Self::Finish { allow_native_send } => (
                 insert_labels.to_vec(),
-                if allow_native_send { native_send_labels.to_vec() } else { vec![] },
+                if allow_native_send {
+                    native_send_labels.to_vec()
+                } else {
+                    vec![]
+                },
             ),
         };
 
@@ -293,7 +303,9 @@ struct PttTracker {
     finish_in_flight: AtomicUsize,
     start_in_flight: AtomicUsize,
     finish_tab_id: AtomicUsize,
-    failed_finish_tab_id: AtomicUsize,
+    // An uncertain dictation state must never lock unrelated tabs.
+    recovery_needed_tabs: Mutex<HashSet<usize>>,
+    recovery_in_flight: AtomicUsize,
     deferred_events: Mutex<VecDeque<PttEvent>>,
 }
 
@@ -356,7 +368,8 @@ impl PttTracker {
             finish_in_flight: AtomicUsize::new(0),
             start_in_flight: AtomicUsize::new(0),
             finish_tab_id: AtomicUsize::new(0),
-            failed_finish_tab_id: AtomicUsize::new(0),
+            recovery_needed_tabs: Mutex::new(HashSet::new()),
+            recovery_in_flight: AtomicUsize::new(0),
             deferred_events: Mutex::new(VecDeque::new()),
         }
     }
@@ -369,13 +382,86 @@ impl PttTracker {
         !self.is_held()
             && self.start_in_flight.load(Ordering::SeqCst) == 0
             && self.finish_in_flight.load(Ordering::SeqCst) == 0
-            && self.failed_finish_tab_id.load(Ordering::SeqCst) == 0
+            && self.recovery_in_flight.load(Ordering::SeqCst) == 0
             && !self.ble_submit_pending.load(Ordering::SeqCst)
             && self
                 .deferred_events
                 .lock()
                 .map(|events| events.is_empty())
                 .unwrap_or(false)
+    }
+
+    fn recovery_needed(&self, tab_id: usize) -> bool {
+        self.recovery_needed_tabs
+            .lock()
+            .map(|tabs| tabs.contains(&tab_id))
+            .unwrap_or(true)
+    }
+
+    fn mark_recovery_needed(&self, tab_id: usize) {
+        if let Ok(mut tabs) = self.recovery_needed_tabs.lock() {
+            tabs.insert(tab_id);
+        }
+    }
+
+    fn clear_recovery_needed(&self, tab_id: usize) {
+        if let Ok(mut tabs) = self.recovery_needed_tabs.lock() {
+            tabs.remove(&tab_id);
+        }
+    }
+
+    fn begin_recovery(&self, source: PttSource, tab_id: usize) -> Option<usize> {
+        if !self.recovery_needed(tab_id) {
+            return None;
+        }
+        let generation = self.begin(source, tab_id)?;
+        // Defer any Up/Cancel until the DOM probe has returned. In particular,
+        // a release before callback delivery must never trigger a late Start.
+        self.start_in_flight.store(generation, Ordering::SeqCst);
+        self.recovery_in_flight.store(generation, Ordering::SeqCst);
+        Some(generation)
+    }
+
+    fn is_recovering(&self, tab_id: usize, generation: usize) -> bool {
+        self.recovery_in_flight.load(Ordering::SeqCst) == generation
+            && self.is_current(tab_id, generation)
+    }
+
+    // A successful probe consumes the recovery operation. Only a still-held
+    // original Down may proceed to Start. A recovery Stop requires a new press.
+    fn complete_recovery(&self, tab_id: usize, generation: usize, can_start: bool) -> bool {
+        if !self.is_recovering(tab_id, generation) {
+            return false;
+        }
+        let Some(events) = self.start_completed(generation) else {
+            return false;
+        };
+        if self
+            .recovery_in_flight
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        self.clear_recovery_needed(tab_id);
+        self.ble_submit_pending.store(false, Ordering::SeqCst);
+        let was_released = events
+            .iter()
+            .any(|event| matches!(event, PttEvent::Up(_) | PttEvent::CancelBle));
+        if !can_start || was_released {
+            self.clear_tab(tab_id);
+            return false;
+        }
+        true
+    }
+
+    fn abort_recovery(&self, tab_id: usize, generation: usize) -> bool {
+        if !self.is_recovering(tab_id, generation) {
+            return false;
+        }
+        self.clear_tab(tab_id);
+        self.mark_recovery_needed(tab_id);
+        true
     }
 
     fn clear_deferred_submits(&self) {
@@ -431,6 +517,7 @@ impl PttTracker {
         {
             return None;
         }
+        self.finish_tab_id.store(0, Ordering::SeqCst);
         Some(std::mem::take(&mut *events))
     }
 
@@ -549,6 +636,7 @@ impl PttTracker {
             }
             self.ble_submit_pending.store(false, Ordering::SeqCst);
             self.start_in_flight.store(0, Ordering::SeqCst);
+            self.recovery_in_flight.store(0, Ordering::SeqCst);
             if let Ok(mut events) = self.deferred_events.lock() {
                 events.clear();
             }
@@ -561,9 +649,7 @@ impl PttTracker {
                 events.clear();
             }
         }
-        if self.failed_finish_tab_id.load(Ordering::SeqCst) == tab_id {
-            self.failed_finish_tab_id.store(0, Ordering::SeqCst);
-        }
+        self.clear_recovery_needed(tab_id);
     }
 
     fn cancel_ble(&self) -> Option<PttCancel> {
@@ -2097,21 +2183,26 @@ fn complete_finish(
         if events.contains(&PttEvent::CancelBle) {
             let _ = tracker.cancel_ble();
         }
-        tracker.failed_finish_tab_id.store(tab_id, Ordering::SeqCst);
+        tracker.clear_tab(tab_id);
+        tracker.mark_recovery_needed(tab_id);
         if let Some(tab) = get_tab_webview(&app, tab_id) {
             let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
         }
-        eprintln!("[gpt-wrapper] Finish could not be verified on tab {tab_id}; no safe transcription-only control or recording state uncertain. No Send requested.");
+        report_ptt_recovery(
+            &app,
+            tab_id,
+            generation,
+            "無法確認聽寫已結束；下次按 PTT 將自動檢查狀態。",
+        );
         return;
     }
     let disconnected = events.contains(&PttEvent::CancelBle);
+    tracker.clear_recovery_needed(tab_id);
     if let Some(tab) = get_tab_webview(&app, tab_id) {
         if disconnected {
             let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
         } else {
-            let script = format!(
-                "window.__GPT_WRAPPER__?.finishPttSegment?.({native_sent});"
-            );
+            let script = format!("window.__GPT_WRAPPER__?.finishPttSegment?.({native_sent});");
             let _ = tab.eval(&script);
             if submit_pending {
                 tracker.note_ble_send(tab_id);
@@ -2122,6 +2213,11 @@ fn complete_finish(
         }
     }
     for event in events {
+        // A second Submit pressed while native Finish was still resolving
+        // belongs to the same already-sent dictation, not a second message.
+        if native_sent && matches!(event, PttEvent::SubmitBle | PttEvent::SubmitKeyboard(_)) {
+            continue;
+        }
         handle_ptt_event(&app, event, &tracker);
     }
 }
@@ -2130,15 +2226,17 @@ fn fail_start(app: AppHandle, tracker: Arc<PttTracker>, tab_id: usize, generatio
     if tracker.start_completed(generation).is_none() {
         return;
     }
-    let source = tracker.owner.lock().ok().and_then(|owner| *owner);
-    if let Some(source) = source {
-        let _ = tracker.finish(source);
-    }
-    tracker.failed_finish_tab_id.store(tab_id, Ordering::SeqCst);
+    tracker.clear_tab(tab_id);
+    tracker.mark_recovery_needed(tab_id);
     if let Some(tab) = get_tab_webview(&app, tab_id) {
         let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
     }
-    eprintln!("[gpt-wrapper] Start could not be verified on tab {tab_id}; queued release rejected; recording state uncertain");
+    report_ptt_recovery(
+        &app,
+        tab_id,
+        generation,
+        "無法確認聽寫已開始；下次按 PTT 將自動檢查狀態。",
+    );
 }
 
 fn verify_start_visible(
@@ -2159,7 +2257,12 @@ fn verify_start_visible(
         fail_start(app, tracker, tab_id, generation);
         return;
     };
-    let script = HSTRING::from(DictationTarget::Finish { allow_native_send: true }.rect_script());
+    let script = HSTRING::from(
+        DictationTarget::Finish {
+            allow_native_send: true,
+        }
+        .rect_script(),
+    );
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
             return;
@@ -2222,20 +2325,37 @@ fn verify_finish_stopped(
     }
     if attempt >= 30 {
         complete_finish(
-            app, tracker, tab_id, generation, auto_submit, submit_pending, false, native_sent,
+            app,
+            tracker,
+            tab_id,
+            generation,
+            auto_submit,
+            submit_pending,
+            false,
+            native_sent,
         );
         return;
     }
     let Some(tab) = get_tab_webview(&app, tab_id) else {
         complete_finish(
-            app, tracker, tab_id, generation, auto_submit, submit_pending, false, native_sent,
+            app,
+            tracker,
+            tab_id,
+            generation,
+            auto_submit,
+            submit_pending,
+            false,
+            native_sent,
         );
         return;
     };
     // Check every known recording completion control, not just the selected
     // action, so a remaining Send/Insert choice isn't mistaken for completion.
     let script = HSTRING::from(
-        DictationTarget::Finish { allow_native_send: true }.rect_script()
+        DictationTarget::Finish {
+            allow_native_send: true,
+        }
+        .rect_script(),
     );
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
@@ -2244,8 +2364,14 @@ fn verify_finish_stopped(
         let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
             if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(None)) {
                 complete_finish(
-                    app.clone(), Arc::clone(&tracker), tab_id, generation,
-                    auto_submit, submit_pending, true, native_sent,
+                    app.clone(),
+                    Arc::clone(&tracker),
+                    tab_id,
+                    generation,
+                    auto_submit,
+                    submit_pending,
+                    true,
+                    native_sent,
                 );
             } else {
                 thread::spawn({
@@ -2254,8 +2380,14 @@ fn verify_finish_stopped(
                     move || {
                         thread::sleep(Duration::from_millis(100));
                         verify_finish_stopped(
-                            app, tracker, tab_id, generation, auto_submit,
-                            submit_pending, native_sent, attempt + 1,
+                            app,
+                            tracker,
+                            tab_id,
+                            generation,
+                            auto_submit,
+                            submit_pending,
+                            native_sent,
+                            attempt + 1,
                         );
                     }
                 });
@@ -2285,11 +2417,17 @@ fn watch_finish_callback(
                 if events.contains(&PttEvent::CancelBle) {
                     let _ = tracker.cancel_ble();
                 }
-                tracker.failed_finish_tab_id.store(tab_id, Ordering::SeqCst);
+                tracker.clear_tab(tab_id);
+                tracker.mark_recovery_needed(tab_id);
                 if let Some(tab) = get_tab_webview(&app, tab_id) {
                     let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
                 }
-                eprintln!("[gpt-wrapper] Finish callback timed out on tab {tab_id}; queued events rejected; recording state uncertain");
+                report_ptt_recovery(
+                    &app,
+                    tab_id,
+                    generation,
+                    "停止聽寫逾時；下次按 PTT 將自動檢查狀態。",
+                );
             }
         });
     });
@@ -2343,6 +2481,162 @@ fn schedule_ptt_start(
     });
 }
 
+// Reuse the exact Start/Finish selectors for the recovery probe. Only the
+// safe (nativeSend=false) Finish can be clicked during recovery.
+fn recovery_probe_script() -> String {
+    format!(
+        r#"(() => {{
+  const start = {};
+  const finish = {};
+  if (finish) return {{kind: finish.nativeSend ? "unsafe" : "safe", x: finish.x, y: finish.y}};
+  if (start) return {{kind: "idle"}};
+  return {{kind: "unknown"}};
+}})()"#,
+        DictationTarget::Start.rect_script(),
+        DictationTarget::Finish {
+            allow_native_send: true
+        }
+        .rect_script()
+    )
+}
+
+fn report_ptt_recovery(app: &AppHandle, tab_id: usize, generation: usize, message: &str) {
+    eprintln!("[gpt-wrapper] PTT recovery tab {tab_id} generation {generation}: {message}");
+    if let Some(tab) = get_tab_webview(app, tab_id) {
+        let text = serde_json::to_string(message).unwrap_or_default();
+        let _ = tab.eval(&format!(
+            "window.__GPT_WRAPPER__?.showRecoveryStatus?.({text});"
+        ));
+    }
+}
+
+fn abort_ptt_recovery(
+    app: &AppHandle,
+    tracker: &Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+    reason: &str,
+) {
+    if !tracker.abort_recovery(tab_id, generation) {
+        return;
+    }
+    if let Some(tab) = get_tab_webview(app, tab_id) {
+        let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
+    }
+    report_ptt_recovery(app, tab_id, generation, reason);
+}
+
+fn probe_ptt_recovery(
+    app: AppHandle,
+    tracker: Arc<PttTracker>,
+    tab_id: usize,
+    generation: usize,
+    attempt: u8,
+    safe_stop_clicked: bool,
+) {
+    if !tracker.is_recovering(tab_id, generation) {
+        return;
+    }
+    if attempt >= 25 {
+        abort_ptt_recovery(
+            &app,
+            &tracker,
+            tab_id,
+            generation,
+            "聽寫狀態仍不確定，請再次按下 PTT 重試。",
+        );
+        return;
+    }
+    let Some(tab) = get_tab_webview(&app, tab_id).filter(|_| is_tab_loaded(&app, tab_id)) else {
+        abort_ptt_recovery(
+            &app,
+            &tracker,
+            tab_id,
+            generation,
+            "ChatGPT 分頁尚未準備好，請再試一次。",
+        );
+        return;
+    };
+    let script = HSTRING::from(recovery_probe_script());
+    let result = tab.with_webview(move |platform| {
+        let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
+            abort_ptt_recovery(&app, &tracker, tab_id, generation, "無法讀取 ChatGPT 聽寫狀態，請再試一次。");
+            return;
+        };
+        let click_core = core.clone();
+        let app_for_callback = app.clone();
+        let tracker_for_callback = Arc::clone(&tracker);
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
+            let app = app_for_callback.clone();
+            let tracker = Arc::clone(&tracker_for_callback);
+            if !tracker.is_recovering(tab_id, generation) {
+                return Ok(());
+            }
+            let value = if result.is_ok() {
+                serde_json::from_str::<serde_json::Value>(&raw).ok()
+            } else {
+                None
+            };
+            let kind = value.as_ref().and_then(|v| v.get("kind")).and_then(|v| v.as_str());
+            match kind {
+                Some("idle") => {
+                    // A safe Stop only ends the old segment. Never start a new
+                    // recording from an old/released recovery press.
+                    let start_now = tracker.complete_recovery(tab_id, generation, !safe_stop_clicked);
+                    if start_now {
+                        if let Some(webview) = get_tab_webview(&app, tab_id) {
+                            schedule_ptt_start(webview, Arc::clone(&tracker), tab_id, generation, true);
+                        }
+                    } else if safe_stop_clicked {
+                        report_ptt_recovery(&app, tab_id, generation, "已安全結束上一段聽寫，請再次按下 PTT。");
+                    }
+                    println!("[gpt-wrapper] PTT recovery idle tab {tab_id} generation {generation}; start={start_now}");
+                }
+                Some("safe") if !safe_stop_clicked => {
+                    let x = value.as_ref().and_then(|v| v.get("x")).and_then(|v| v.as_f64());
+                    let y = value.as_ref().and_then(|v| v.get("y")).and_then(|v| v.as_f64());
+                    if let (Some(x), Some(y)) = (x, y) {
+                        if tracker.is_recovering(tab_id, generation) {
+                            // Trusted click only on a known transcription-only Finish.
+                            let rect = Rect { x, y, native_send: false };
+                            dispatch_trusted_click(&click_core, rect);
+                        }
+                    } else {
+                        abort_ptt_recovery(&app, &tracker, tab_id, generation, "無法定位停止聽寫按鈕，請再試一次。");
+                        return Ok(());
+                    }
+                    let app = app.clone();
+                    let tracker = Arc::clone(&tracker);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(150));
+                        probe_ptt_recovery(app, tracker, tab_id, generation, attempt + 1, true);
+                    });
+                }
+                Some("unsafe") => {
+                    abort_ptt_recovery(&app, &tracker, tab_id, generation,
+                        "目前只找到會送出訊息的按鈕，請手動停止聽寫後再按 PTT。");
+                }
+                _ => {
+                    let app = app.clone();
+                    let tracker = Arc::clone(&tracker);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(120));
+                        probe_ptt_recovery(app, tracker, tab_id, generation, attempt + 1, safe_stop_clicked);
+                    });
+                }
+            }
+            Ok(())
+        }));
+        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
+            eprintln!("[gpt-wrapper] recovery probe ExecuteScript failed: {error:?}");
+            abort_ptt_recovery(&app, &tracker, tab_id, generation, "讀取聽寫狀態失敗，請再試一次。");
+        }
+    });
+    if let Err(error) = result {
+        eprintln!("[gpt-wrapper] recovery WebView unavailable: {error:?}");
+    }
+}
+
 // Both the BLE Submit signal and the Ctrl+. shortcut invoke this same WebView action.
 // The DOM adapter checks the draft, dictation state, Send button and duplicate requests.
 fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
@@ -2378,12 +2672,6 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
         return;
     }
     if tracker.defer_during_finish(event) {
-        return;
-    }
-    if tracker.failed_finish_tab_id.load(Ordering::SeqCst) != 0
-        && matches!(event, PttEvent::Down(_) | PttEvent::SubmitBle)
-    {
-        eprintln!("[gpt-wrapper] PTT/Submit rejected: previous Finish failed; resolve dictation in the affected tab or reload it");
         return;
     }
     match event {
@@ -2474,6 +2762,33 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 eprintln!("[gpt-wrapper] active ChatGPT webview missing");
                 return;
             };
+            if tracker.recovery_needed(tab_id) {
+                let Some(generation) = tracker.begin_recovery(source, tab_id) else {
+                    return;
+                };
+                println!("[gpt-wrapper] PTT recovery probe tab {tab_id} generation {generation}");
+                probe_ptt_recovery(
+                    app_handle.clone(),
+                    Arc::clone(tracker),
+                    tab_id,
+                    generation,
+                    0,
+                    false,
+                );
+                let app = app_handle.clone();
+                let tracker = Arc::clone(tracker);
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_secs(5));
+                    abort_ptt_recovery(
+                        &app,
+                        &tracker,
+                        tab_id,
+                        generation,
+                        "聽寫狀態檢查逾時，請再次按下 PTT 重試。",
+                    );
+                });
+                return;
+            }
             if let Err(reason) = microphone_inventory::ptt_start_guard(app_handle, tab_id) {
                 microphone_inventory::show_ptt_error(app_handle, Some(tab_id), &reason);
                 return;
@@ -2516,10 +2831,15 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
 
             // Read the setting for both keyboard and BLE releases, using the
             // state at release time. A queued BLE Submit is an explicit intent.
-            let auto_submit = app_handle.state::<GeneralSettingsState>()
-                .ptt_auto_submit().unwrap_or(false);
+            let auto_submit = app_handle
+                .state::<GeneralSettingsState>()
+                .ptt_auto_submit()
+                .unwrap_or(false);
             let allow_native_send = auto_submit || finish.submit_pending;
-            println!("[gpt-wrapper] hotkey released on tab {}; auto submit: {auto_submit}", finish.tab_id);
+            println!(
+                "[gpt-wrapper] hotkey released on tab {}; auto submit: {auto_submit}",
+                finish.tab_id
+            );
             tracker.finish_tab_id.store(finish.tab_id, Ordering::SeqCst);
             tracker
                 .finish_in_flight
@@ -2543,36 +2863,52 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 finish.generation,
             );
         }
-        PttEvent::SubmitBle => match tracker.request_ble_submit() {
-            BleSubmitTarget::Queued => println!("[gpt-wrapper] BLE Submit queued for held PTT"),
-            BleSubmitTarget::Busy => {
-                eprintln!("[gpt-wrapper] BLE Submit refused while keyboard PTT is held")
-            }
-            BleSubmitTarget::Tab(tab_id) => request_explicit_send(app_handle, tab_id),
-            BleSubmitTarget::None => {
-                if app_handle
-                    .state::<TrayVisibilityState>()
-                    .tray_hidden
-                    .load(Ordering::SeqCst)
-                {
-                    eprintln!("[gpt-wrapper] BLE Submit refused: no target while tray-hidden");
-                } else if let Some(tab_id) = active_tab_id(app_handle) {
-                    if is_tab_loaded(app_handle, tab_id)
-                        && get_tab_webview(app_handle, tab_id).is_some()
-                    {
-                        tracker.note_ble_send(tab_id);
+        PttEvent::SubmitBle => {
+            match tracker.request_ble_submit() {
+                BleSubmitTarget::Queued => println!("[gpt-wrapper] BLE Submit queued for held PTT"),
+                BleSubmitTarget::Busy => {
+                    eprintln!("[gpt-wrapper] BLE Submit refused while keyboard PTT is held")
+                }
+                BleSubmitTarget::Tab(tab_id) => {
+                    if tracker.recovery_needed(tab_id) {
+                        eprintln!("[gpt-wrapper] BLE Submit blocked on uncertain tab {tab_id}; retry PTT recovery");
+                    } else {
                         request_explicit_send(app_handle, tab_id);
                     }
                 }
+                BleSubmitTarget::None => {
+                    if app_handle
+                        .state::<TrayVisibilityState>()
+                        .tray_hidden
+                        .load(Ordering::SeqCst)
+                    {
+                        eprintln!("[gpt-wrapper] BLE Submit refused: no target while tray-hidden");
+                    } else if let Some(tab_id) = active_tab_id(app_handle) {
+                        if is_tab_loaded(app_handle, tab_id)
+                            && get_tab_webview(app_handle, tab_id).is_some()
+                        {
+                            if tracker.recovery_needed(tab_id) {
+                                eprintln!("[gpt-wrapper] BLE Submit blocked on uncertain active tab {tab_id}");
+                            } else {
+                                tracker.note_ble_send(tab_id);
+                                request_explicit_send(app_handle, tab_id);
+                            }
+                        }
+                    }
+                }
             }
-        },
+        }
         PttEvent::SubmitKeyboard(tab_id) => {
             if tracker.is_held() {
                 eprintln!(
                     "[gpt-wrapper] Ctrl+. Submit refused while PTT is held; release PTT first"
                 );
             } else if let Some(tab_id) = tab_id {
-                request_explicit_send(app_handle, tab_id);
+                if tracker.recovery_needed(tab_id) {
+                    eprintln!("[gpt-wrapper] Ctrl+. Submit blocked on uncertain tab {tab_id}; retry PTT recovery");
+                } else {
+                    request_explicit_send(app_handle, tab_id);
+                }
             } else {
                 eprintln!("[gpt-wrapper] foreground Submit refused: no active tab");
             }
@@ -2588,7 +2924,9 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                             .store(cancel.generation, Ordering::SeqCst);
                         trusted_click_guarded(
                             &webview,
-                            DictationTarget::Finish { allow_native_send: false },
+                            DictationTarget::Finish {
+                                allow_native_send: false,
+                            },
                             Some(ClickGuard::Finish(
                                 Arc::clone(tracker),
                                 app_handle.clone(),
@@ -2837,11 +3175,19 @@ mod ptt_tests {
 
     #[test]
     fn finish_selectors_never_offer_native_send_when_auto_submit_is_off() {
-        let insert_only = DictationTarget::Finish { allow_native_send: false }.rect_script();
+        let insert_only = DictationTarget::Finish {
+            allow_native_send: false,
+        }
+        .rect_script();
+        assert!(insert_only.contains("停止聽寫"));
+        assert!(insert_only.contains("Stop dictation"));
         assert!(insert_only.contains("Submit dictation"));
         assert!(!insert_only.contains("Transcribe and send"));
         assert!(!insert_only.contains("轉錄並傳送"));
-        let with_fallback = DictationTarget::Finish { allow_native_send: true }.rect_script();
+        let with_fallback = DictationTarget::Finish {
+            allow_native_send: true,
+        }
+        .rect_script();
         assert!(with_fallback.contains("Transcribe and send"));
         let native: Rect = serde_json::from_str(r#"{"x":1,"y":2,"nativeSend":true}"#).unwrap();
         assert!(native.native_send);
@@ -2872,8 +3218,97 @@ mod ptt_tests {
         assert!(!ptt.safe_for_background_switch());
         ptt.finish_in_flight.store(0, Ordering::SeqCst);
         assert!(ptt.safe_for_background_switch());
-        ptt.failed_finish_tab_id.store(7, Ordering::SeqCst);
+        ptt.mark_recovery_needed(7);
+        assert!(
+            ptt.safe_for_background_switch(),
+            "historical failure must not block tray project switching"
+        );
+    }
+
+    #[test]
+    fn recovery_is_per_tab_and_never_locks_unrelated_tabs_or_background_switch() {
+        let ptt = PttTracker::new();
+        ptt.mark_recovery_needed(7);
+        ptt.mark_recovery_needed(9);
+        assert!(ptt.recovery_needed(7));
+        assert!(ptt.recovery_needed(9));
+        assert!(!ptt.recovery_needed(11));
+        assert!(ptt.safe_for_background_switch());
+        assert!(ptt.begin(PttSource::Ble, 11).is_some());
+        assert!(ptt.is_held());
+        ptt.clear_tab(11);
+        assert!(ptt.safe_for_background_switch());
+        ptt.clear_tab(9);
+        assert!(ptt.recovery_needed(7));
+        assert!(!ptt.recovery_needed(9));
+        assert!(!ptt.is_held());
+    }
+
+    #[test]
+    fn recovered_idle_resumes_only_a_still_held_ptt_press() {
+        let ptt = PttTracker::new();
+        ptt.mark_recovery_needed(2);
+        let generation = ptt.begin_recovery(PttSource::Keyboard, 2).unwrap();
         assert!(!ptt.safe_for_background_switch());
+        assert!(ptt.complete_recovery(2, generation, true));
+        assert!(!ptt.recovery_needed(2));
+        assert!(ptt.is_current(2, generation));
+        assert_eq!(ptt.start_in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(ptt.recovery_in_flight.load(Ordering::SeqCst), 0);
+        ptt.clear_tab(2);
+
+        ptt.mark_recovery_needed(2);
+        let second = ptt.begin_recovery(PttSource::Keyboard, 2).unwrap();
+        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Keyboard)));
+        assert!(!ptt.complete_recovery(2, second, true));
+        assert!(!ptt.recovery_needed(2), "verified idle clears uncertainty");
+        assert!(!ptt.is_held(), "released PTT must not produce a late Start");
+        assert_eq!(ptt.start_in_flight.load(Ordering::SeqCst), 0);
+        assert!(ptt.safe_for_background_switch());
+    }
+
+    #[test]
+    fn safe_recovery_stop_never_restarts_or_replays_submit() {
+        let ptt = PttTracker::new();
+        ptt.mark_recovery_needed(4);
+        let generation = ptt.begin_recovery(PttSource::Ble, 4).unwrap();
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Queued);
+        assert!(!ptt.complete_recovery(4, generation, false));
+        assert!(!ptt.is_held());
+        assert!(!ptt.recovery_needed(4));
+        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+        assert!(ptt.safe_for_background_switch());
+        assert!(!ptt.abort_recovery(4, generation), "late watchdog ignored");
+    }
+
+    #[test]
+    fn recovery_abort_is_bounded_and_old_generation_cannot_clear_new_attempt() {
+        let ptt = PttTracker::new();
+        ptt.mark_recovery_needed(3);
+        let generation = ptt.begin_recovery(PttSource::Ble, 3).unwrap();
+        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert!(ptt.abort_recovery(3, generation));
+        assert!(ptt.recovery_needed(3));
+        assert!(!ptt.is_held());
+        assert_eq!(ptt.start_in_flight.load(Ordering::SeqCst), 0);
+        assert!(ptt.safe_for_background_switch());
+        let next = ptt.begin_recovery(PttSource::Keyboard, 3).unwrap();
+        assert_ne!(generation, next);
+        assert!(!ptt.abort_recovery(3, generation));
+        assert!(ptt.is_recovering(3, next));
+        ptt.clear_tab(3);
+        assert!(!ptt.is_recovering(3, next));
+        assert!(!ptt.is_held());
+    }
+
+    #[test]
+    fn recovery_probe_uses_safe_finish_before_native_send() {
+        let script = recovery_probe_script();
+        assert!(script.contains("停止聽寫"));
+        assert!(script.contains("Stop dictation"));
+        assert!(script.contains("Transcribe and send"));
+        assert!(script.contains("nativeSend"));
+        assert!(script.contains("finish.nativeSend ? \"unsafe\" : \"safe\""));
     }
 
     #[test]

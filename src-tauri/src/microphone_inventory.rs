@@ -188,7 +188,9 @@ pub fn handle_route_message(app: &AppHandle, tab_id: usize, source: &str, raw: &
                     // Avoid stopping a newer session if this Stop is delayed.
                     super::trusted_click_guarded(
                         &tab,
-                        super::DictationTarget::Finish { allow_native_send: false },
+                        super::DictationTarget::Finish {
+                            allow_native_send: false,
+                        },
                         Some(super::ClickGuard::Cancel(
                             std::sync::Arc::clone(tracker),
                             generation + 1,
