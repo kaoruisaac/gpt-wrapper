@@ -10,8 +10,8 @@ use tauri::{
 };
 use uuid::Uuid;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_SHOWNOACTIVATE,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetWindowLongPtrW, IsWindow, IsWindowVisible, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE,
+    SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::{
@@ -24,39 +24,82 @@ const TOAST_DURATION: Duration = Duration::from_secs(3);
 const WIDTH: f64 = 320.0;
 const HEIGHT: f64 = 88.0;
 const MARGIN: f64 = 18.0;
+const HIDE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_HIDE_RETRIES: usize = 6;
 
 #[derive(Default)]
 struct Session {
     deadline: Option<Instant>,
     generation: u64,
     label: Option<String>,
+    hide_pending: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TimerAction {
+    Stale,
+    Wait(Duration),
+    Hide,
 }
 
 impl Session {
     fn active(&self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| now < deadline)
+        !self.hide_pending && self.deadline.is_some_and(|deadline| now < deadline)
     }
 
     fn update(&mut self, now: Instant, label: String) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.deadline = Some(now + TOAST_DURATION);
         self.label = Some(label);
+        self.hide_pending = false;
         self.generation
     }
 
-    fn end(&mut self) {
+    fn dismiss(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.deadline = None;
         self.label = None;
+        self.hide_pending = true;
+        self.generation
     }
 
-    fn expire(&mut self, generation: u64, now: Instant) -> bool {
-        if self.generation == generation && !self.active(now) {
-            self.end();
-            return true;
+    fn timer_action(&self, generation: u64, now: Instant) -> TimerAction {
+        if generation != self.generation {
+            return TimerAction::Stale;
         }
-        false
+        if self.hide_pending {
+            return TimerAction::Hide;
+        }
+        match self.deadline {
+            Some(deadline) if now < deadline => TimerAction::Wait(deadline - now),
+            Some(_) => TimerAction::Hide,
+            None => TimerAction::Stale,
+        }
     }
+
+    fn hide_complete(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.deadline = None;
+            self.label = None;
+            self.hide_pending = false;
+        }
+    }
+}
+
+// hide() is a visibility adapter: it must return Ok only after native visibility
+// has been checked. State is cleared only when the adapter has confirmed success.
+fn attempt_hide(
+    session: &mut Session,
+    generation: u64,
+    now: Instant,
+    hide: impl FnOnce() -> Result<(), String>,
+) -> Result<TimerAction, String> {
+    let action = session.timer_action(generation, now);
+    if action == TimerAction::Hide {
+        hide()?;
+        session.hide_complete(generation);
+    }
+    Ok(action)
 }
 
 pub struct BackgroundProjectSwitcherState {
@@ -121,6 +164,39 @@ fn place_toast(window: &tauri::WebviewWindow) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+// All HWND visibility operations run on the Tauri UI thread. Checking the
+// actual HWND matters: the toast is shown via Win32, not Window::show(), so
+// Tao/Tauri's cached VISIBLE flag can disagree with the native window.
+fn native_visible(window: &tauri::WebviewWindow) -> Result<bool, String> {
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    Ok(unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() })
+}
+
+fn hide_native_confirmed(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    let before = native_visible(window)?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    if native_visible(window)? {
+        // An additional Tauri hide is a fallback, not our visibility proof.
+        if let Err(error) = window.hide() {
+            eprintln!("[gpt-wrapper] toast Tauri hide fallback failed: {error}");
+        }
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+    let after = native_visible(window)?;
+    #[cfg(debug_assertions)]
+    eprintln!("[gpt-wrapper] toast native hide: visible_before={before} visible_after={after}");
+    if after {
+        Err("toast HWND remains visible after native hide".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     unsafe {
@@ -132,7 +208,14 @@ fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> 
         );
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
-    Ok(())
+    let visible = native_visible(window)?;
+    #[cfg(debug_assertions)]
+    eprintln!("[gpt-wrapper] toast native show: visible_after={visible}");
+    if !visible {
+        Err("toast HWND is not visible after native show".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn show_toast(app: &AppHandle, label: &str, generation: u64) -> Result<(), String> {
@@ -156,26 +239,40 @@ fn show_toast(app: &AppHandle, label: &str, generation: u64) -> Result<(), Strin
                 return;
             }
             let app = window.app_handle();
-            let label = app
-                .state::<BackgroundProjectSwitcherState>()
-                .session
-                .lock()
-                .ok()
-                .and_then(|session| {
-                    session
-                        .active(Instant::now())
-                        .then(|| session.label.clone())
-                        .flatten()
-                });
-            if let Some(label) = label {
-                let _ = window.eval(update_script(&label));
-                if let Err(error) =
-                    place_toast(&window).and_then(|_| show_without_activation(&window))
-                {
-                    eprintln!("[gpt-wrapper] toast display failed: {error}");
+            let state = app.state::<BackgroundProjectSwitcherState>();
+            let Ok(mut session) = state.session.lock() else {
+                eprintln!("[gpt-wrapper] toast page-load: session lock unavailable");
+                return;
+            };
+            if session.active(Instant::now()) {
+                // Keep the lock through native show so a late PageLoad cannot
+                // resurrect a toast after timeout or tray restoration.
+                if let Some(label) = &session.label {
+                    if let Err(error) = window
+                        .eval(update_script(label))
+                        .map_err(|error| error.to_string())
+                        .and_then(|_| place_toast(&window))
+                        .and_then(|_| show_without_activation(&window))
+                    {
+                        eprintln!("[gpt-wrapper] toast page-load show failed: {error}");
+                    }
                 }
             } else {
-                let _ = window.hide();
+                if !session.hide_pending {
+                    session.dismiss();
+                }
+                let generation = session.generation;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[gpt-wrapper] toast page-load: no active session, generation={generation}"
+                );
+                let result = attempt_hide(&mut session, generation, Instant::now(), || {
+                    hide_native_confirmed(&window)
+                });
+                if let Err(error) = result {
+                    eprintln!("[gpt-wrapper] toast page-load hide failed: {error}");
+                    schedule_timer(app.clone(), generation, HIDE_RETRY_DELAY, 1);
+                }
             }
         })
         .build()
@@ -205,14 +302,84 @@ fn show_toast(app: &AppHandle, label: &str, generation: u64) -> Result<(), Strin
     show_without_activation(&window)
 }
 
-pub fn dismiss(app: &AppHandle) {
-    if let Ok(mut session) = app.state::<BackgroundProjectSwitcherState>().session.lock() {
-        session.end();
-    }
-    if let Some(window) = app.get_webview_window(TOAST_LABEL) {
-        if let Err(error) = window.hide() {
-            eprintln!("[gpt-wrapper] failed to hide Project toast: {error}");
+// Each timer only handles its own generation. A retry is scheduled by a
+// sleeping worker, but native HWND access always remains on Tauri's UI thread.
+fn schedule_timer(app: AppHandle, generation: u64, delay: Duration, attempt: usize) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        #[cfg(debug_assertions)]
+        eprintln!("[gpt-wrapper] toast timer woke: generation={generation}, retry={attempt}");
+        let callback_app = app.clone();
+        let enqueue_result = app.run_on_main_thread(move || {
+            #[cfg(debug_assertions)]
+            eprintln!("[gpt-wrapper] toast timer UI callback: generation={generation}, retry={attempt}");
+            let state = callback_app.state::<BackgroundProjectSwitcherState>();
+            let Ok(mut session) = state.session.lock() else {
+                eprintln!("[gpt-wrapper] toast timer: session lock unavailable");
+                return;
+            };
+            let result = attempt_hide(&mut session, generation, Instant::now(), || {
+                match callback_app.get_webview_window(TOAST_LABEL) {
+                    Some(window) => hide_native_confirmed(&window),
+                    None => Ok(()), // already destroyed; confirmed not visible
+                }
+            });
+            drop(session);
+            match result {
+                Ok(TimerAction::Stale) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[gpt-wrapper] toast timer stale: generation={generation}");
+                }
+                Ok(TimerAction::Wait(remaining)) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[gpt-wrapper] toast timer early: generation={generation}, remaining_ms={}", remaining.as_millis());
+                    schedule_timer(callback_app, generation, remaining, 0);
+                }
+                Ok(TimerAction::Hide) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[gpt-wrapper] toast hidden and verified: generation={generation}");
+                }
+                Err(error) => {
+                    eprintln!("[gpt-wrapper] toast hide failed: generation={generation}, retry={attempt}: {error}");
+                    if attempt < MAX_HIDE_RETRIES {
+                        schedule_timer(callback_app, generation, HIDE_RETRY_DELAY, attempt + 1);
+                    } else {
+                        eprintln!("[gpt-wrapper] toast hide retries exhausted; retained cleanup state");
+                    }
+                }
+            }
+        });
+        if let Err(error) = enqueue_result {
+            eprintln!("[gpt-wrapper] toast timer UI dispatch failed: generation={generation}, retry={attempt}: {error}");
+            if attempt < MAX_HIDE_RETRIES {
+                schedule_timer(app, generation, HIDE_RETRY_DELAY, attempt + 1);
+            }
+        } else {
+            #[cfg(debug_assertions)]
+            eprintln!("[gpt-wrapper] toast timer UI dispatch queued: generation={generation}");
         }
+    });
+}
+
+pub fn dismiss(app: &AppHandle) {
+    let state = app.state::<BackgroundProjectSwitcherState>();
+    let Ok(mut session) = state.session.lock() else {
+        eprintln!("[gpt-wrapper] toast dismiss: session lock unavailable");
+        return;
+    };
+    let generation = session.dismiss();
+    #[cfg(debug_assertions)]
+    eprintln!("[gpt-wrapper] toast dismiss: generation={generation}");
+    let result = attempt_hide(&mut session, generation, Instant::now(), || {
+        match app.get_webview_window(TOAST_LABEL) {
+            Some(window) => hide_native_confirmed(&window),
+            None => Ok(()),
+        }
+    });
+    drop(session);
+    if let Err(error) = result {
+        eprintln!("[gpt-wrapper] toast dismiss hide failed: {error}");
+        schedule_timer(app.clone(), generation, HIDE_RETRY_DELAY, 1);
     }
 }
 
@@ -231,7 +398,8 @@ pub fn press(app: &AppHandle) {
             }
         };
         let now = Instant::now();
-        let result = if session.active(now) {
+        let continuing_session = session.active(now);
+        let result = if continuing_session {
             let next = next_id(&settings);
             if next != settings.default_project_id {
                 update_project_settings(app, |settings| {
@@ -251,30 +419,28 @@ pub fn press(app: &AppHandle) {
                 "Unable to switch project".to_string()
             }
         };
-        (session.update(Instant::now(), label.clone()), label)
+        let generation = session.update(Instant::now(), label.clone());
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[gpt-wrapper] toast press: generation={generation}, continuing_session={continuing_session}, deadline_reset_ms=3000"
+        );
+        (generation, label)
     };
 
     if let Err(error) = show_toast(app, &label, generation) {
         eprintln!("[gpt-wrapper] failed to show Project toast: {error}");
     }
-    let app = app.clone();
-    thread::spawn(move || {
-        thread::sleep(TOAST_DURATION);
-        let on_main = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            let should_hide = on_main
-                .state::<BackgroundProjectSwitcherState>()
-                .session
-                .lock()
-                .map(|mut session| session.expire(generation, Instant::now()))
-                .unwrap_or(false);
-            if should_hide {
-                if let Some(window) = on_main.get_webview_window(TOAST_LABEL) {
-                    let _ = window.hide();
-                }
-            }
-        });
-    });
+    // The countdown is anchored to the last press, not to WebView creation
+    // or page-load completion.
+    let remaining = state
+        .session
+        .lock()
+        .ok()
+        .filter(|session| session.generation == generation)
+        .and_then(|session| session.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(Duration::ZERO);
+    schedule_timer(app.clone(), generation, remaining, 0);
 }
 
 #[cfg(test)]
@@ -333,13 +499,68 @@ mod tests {
         let start = Instant::now();
         assert!(!session.active(start));
         let first = session.update(start, "ChatGPT.com".into());
-        assert!(session.active(start + Duration::from_millis(2900)));
+        assert_eq!(
+            session.timer_action(first, start + Duration::from_millis(2900)),
+            TimerAction::Wait(Duration::from_millis(100))
+        );
         let second = session.update(start + Duration::from_millis(2900), "Next".into());
-        assert!(!session.expire(first, start + TOAST_DURATION));
+        assert_eq!(
+            session.timer_action(first, start + TOAST_DURATION),
+            TimerAction::Stale
+        );
         assert!(session.active(start + Duration::from_millis(3100)));
-        assert!(session.expire(second, start + Duration::from_millis(5900)));
+        assert_eq!(
+            session.timer_action(second, start + Duration::from_millis(5900)),
+            TimerAction::Hide
+        );
+        assert_eq!(session.label.as_deref(), Some("Next")); // not cleared until HWND hide
+        let mut visible = true;
+        assert_eq!(
+            attempt_hide(
+                &mut session,
+                second,
+                start + Duration::from_millis(5900),
+                || {
+                    visible = false;
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            TimerAction::Hide
+        );
+        assert!(!visible);
         assert!(!session.active(start + Duration::from_millis(5900)));
         assert_eq!(session.label, None);
+    }
+
+    #[test]
+    fn failed_hide_retains_cleanup_state_and_can_retry() {
+        let mut session = Session::default();
+        let start = Instant::now();
+        let generation = session.update(start, "A".into());
+        let mut visible = true;
+        assert!(
+            attempt_hide(&mut session, generation, start + TOAST_DURATION, || {
+                Err("simulated HWND still visible".into())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            session.timer_action(generation, start + TOAST_DURATION),
+            TimerAction::Hide
+        );
+        assert!(visible);
+        assert_eq!(session.label.as_deref(), Some("A"));
+        assert_eq!(
+            attempt_hide(&mut session, generation, start + TOAST_DURATION, || {
+                visible = false;
+                Ok(())
+            })
+            .unwrap(),
+            TimerAction::Hide
+        );
+        assert!(!visible);
+        assert!(session.deadline.is_none());
     }
 
     #[test]
@@ -347,10 +568,55 @@ mod tests {
         let mut session = Session::default();
         let now = Instant::now();
         let old = session.update(now, "A".into());
-        session.end();
-        assert!(!session.expire(old, now + TOAST_DURATION));
+        let dismiss = session.dismiss();
+        assert_eq!(
+            session.timer_action(old, now + TOAST_DURATION),
+            TimerAction::Stale
+        );
+        assert_eq!(session.timer_action(dismiss, now), TimerAction::Hide);
+        assert!(attempt_hide(&mut session, dismiss, now, || Ok(())).is_ok());
         let new = session.update(now + Duration::from_secs(4), "B".into());
         assert_ne!(old, new);
+        assert_eq!(
+            session.timer_action(dismiss, now + Duration::from_secs(4)),
+            TimerAction::Stale
+        );
+    }
+
+    #[test]
+    fn late_page_load_cannot_reveal_expired_or_dismissed_session() {
+        let mut session = Session::default();
+        let start = Instant::now();
+        let generation = session.update(start, "A".into());
+        assert!(!session.active(start + TOAST_DURATION));
+        assert_eq!(
+            session.timer_action(generation, start + TOAST_DURATION),
+            TimerAction::Hide
+        );
+        let _ = session.dismiss();
+        assert!(!session.active(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_stale_timer_cannot_hide_a_new_toast_window() {
+        let mut session = Session::default();
+        let now = Instant::now();
+        let old = session.update(now, "One".into());
+        let new = session.update(now + Duration::from_secs(1), "Two".into());
+        let mut hide_called = false;
+        assert_eq!(
+            attempt_hide(&mut session, old, now + TOAST_DURATION, || {
+                hide_called = true;
+                Ok(())
+            })
+            .unwrap(),
+            TimerAction::Stale
+        );
+        assert!(!hide_called);
+        assert_eq!(
+            session.timer_action(new, now + TOAST_DURATION),
+            TimerAction::Wait(Duration::from_secs(1))
+        );
     }
 
     #[test]
