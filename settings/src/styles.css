@@ -324,3 +324,83 @@ button:disabled {
     padding: 24px 22px;
   }
 }
+
+/* ChatGPT dictation microphone: read-only inventory until audio routing is verified. */
+.microphone-section {
+  margin-top: 22px;
+  border-top: 1px solid #ececec;
+  padding: 18px 0 4px;
+}
+.microphone-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.microphone-heading h2 { margin: 0; font-size: 17px; }
+.microphone-refresh {
+  flex-shrink: 0;
+  padding: 7px 11px;
+  border: 1px solid #d5d5d5;
+  border-radius: 7px;
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.microphone-refresh:disabled { opacity: .65; cursor: default; }
+.microphone-dropdown { position: relative; max-width: 100%; }
+.microphone-trigger {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 9px;
+  background: #fff;
+  font: inherit;
+  font-size: 14px;
+  color: #202123;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.microphone-trigger:focus-visible, .microphone-menu button:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+.microphone-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0; right: 0;
+  background: #fff;
+  border: 1px solid #d0d0d0;
+  border-radius: 9px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 13%);
+  max-height: 250px;
+  overflow-y: auto;
+  z-index: 10;
+}
+.microphone-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.microphone-menu button:hover:not(:disabled) { background: #f3f4f6; }
+.microphone-menu button:disabled { color: #888; cursor: not-allowed; }
+.microphone-menu button small { display: block; margin-top: 3px; color: #777; }
+.microphone-menu-divider { height: 1px; background: #eee; }
+.microphone-empty { padding: 0 12px; font-size: 13px; color: #777; }
+.microphone-warning { margin: 11px 0; font-size: 13px; line-height: 1.6; color: #925e00; }
+.microphone-error { font-size: 13px; color: #b42318; line-height: 1.5; }
+.microphone-note { font-size: 12px; line-height: 1.5; color: #6e6e80; margin: 6px 0; }

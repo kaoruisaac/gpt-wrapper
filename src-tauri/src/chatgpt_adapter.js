@@ -194,8 +194,19 @@
       if (!state.sendRequested) state.lastClickedText = null;
     },
 
-    finishBleSegment() {
+    // Both keyboard and BLE PTT use the same completion tracking. The native
+    // send-on-finish fallback must not also enqueue a second Send click.
+    finishPttSegment(nativeSent = false) {
       state.activeSegment = false;
+      if (nativeSent) {
+        cancelTimer();
+        state.pendingTranscription = false;
+        state.sendRequested = false;
+        state.segments = [];
+        state.segmentVersion++;
+        console.info("[gpt-wrapper] native dictation Send handled by ChatGPT");
+        return;
+      }
       state.segments.push({
         before: state.before,
         finishedAt: Date.now(),
@@ -204,11 +215,7 @@
       });
       state.pendingTranscription = true;
       state.segmentVersion++;
-      console.info("[gpt-wrapper] dictation Finish processed; awaiting transcript readiness");
-    },
-
-    finishKeyboardSegment() {
-      state.activeSegment = false;
+      console.info("[gpt-wrapper] PTT Finish processed; awaiting transcript readiness");
     },
 
     cancelExplicitSend() {
@@ -287,34 +294,7 @@
       return "requested";
     },
 
-    waitAndSend() {
-      cancelTimer();
-      const started = Date.now();
-
-      state.timer = setInterval(() => {
-        const current = composerText();
-        const send = sendButton();
-        const changed = current.length > 0 && current !== state.before;
-        const enabled =
-          !!send &&
-          !send.disabled &&
-          send.getAttribute("aria-disabled") !== "true";
-
-        if (changed && enabled) {
-          clearInterval(state.timer);
-          state.timer = null;
-          send.click();
-          return;
-        }
-
-        if (Date.now() - started > 15000) {
-          clearInterval(state.timer);
-          state.timer = null;
-          console.warn("[gpt-wrapper] Timed out waiting for transcription.");
-        }
-      }, 250);
-    },
-  };
+   };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", startStatusObserver, { once: true });

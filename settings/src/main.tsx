@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
 import ProjectBookmarks from "./ProjectBookmarks";
+import MicrophoneSettings from "./MicrophoneSettings";
 
 type SettingsTab = "general" | "bookmarks";
 type StatusKind = "" | "success" | "error";
@@ -182,6 +183,8 @@ function GeneralSettings() {
           </p>
         </div>
       </div>
+
+      <MicrophoneSettings />
 
       <section class="ble-section" aria-label="Bluetooth Controller">
         <h2>Bluetooth Controller</h2>

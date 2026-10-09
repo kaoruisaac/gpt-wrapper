@@ -3,6 +3,7 @@
 mod background_project_switcher;
 mod ble_central;
 mod general_settings;
+mod microphone_inventory;
 mod project_settings;
 
 use ble_central::{BleCentral, ControlEvent};
@@ -46,6 +47,23 @@ use windows::{
 };
 
 const ADAPTER_SCRIPT: &str = include_str!("chatgpt_adapter.js");
+const MICROPHONE_POC_SCRIPT: &str = include_str!("microphone_poc.js");
+const MICROPHONE_INVENTORY_SCRIPT: &str = include_str!("microphone_inventory.js");
+const MICROPHONE_ROUTE_SCRIPT: &str = include_str!("microphone_route.js");
+
+fn microphone_poc_enabled() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("GPT_WRAPPER_MICROPHONE_POC").is_some()
+}
+
+fn trusted_chatgpt_source(source: &str) -> bool {
+    url::Url::parse(source)
+        .map(|url| {
+            url.scheme() == "https"
+                && matches!(url.host_str(), Some("chatgpt.com" | "chat.openai.com"))
+        })
+        .unwrap_or(false)
+}
+
 const MAIN_WINDOW_LABEL: &str = "main";
 const SETTINGS_WINDOW_LABEL: &str = "settings";
 const HOST_WEBVIEW_LABEL: &str = "tab-host";
@@ -62,40 +80,54 @@ const TRAY_QUIT_ID: &str = "tray-quit";
 struct Rect {
     x: f64,
     y: f64,
+    #[serde(default, rename = "nativeSend")]
+    native_send: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum DictationTarget {
     Start,
-    Finish,
+    // An unsafe Finish control may submit the prompt as part of stopping dictation.
+    // Never use it when the user's auto-submit preference is disabled.
+    Finish { allow_native_send: bool },
 }
 
 impl DictationTarget {
     fn rect_script(self) -> String {
-        let labels = match self {
-            Self::Start => ["聽寫", "開始聽寫", "开始听写", "Start dictation", "Dictate"],
-            Self::Finish => [
-                "轉錄並傳送",
-                "送出聽寫內容",
-                "提交听写内容",
-                "Submit dictation",
-                "Transcribe and send",
-            ],
+        let start_labels = ["聽寫", "開始聽寫", "开始听写", "Start dictation", "Dictate"];
+        // "Submit dictation" inserts the transcription into the composer; a
+        // "Transcribe and send" control can submit the entire message instead.
+        let insert_labels = [
+            "Submit dictation", "提交听写内容", "送出聽寫內容",
+            "Insert transcription", "完成轉錄", "完成转录",
+        ];
+        let native_send_labels = ["Transcribe and send", "轉錄並傳送"];
+        let (labels, native_labels): (Vec<&str>, Vec<&str>) = match self {
+            Self::Start => (start_labels.to_vec(), vec![]),
+            Self::Finish { allow_native_send } => (
+                insert_labels.to_vec(),
+                if allow_native_send { native_send_labels.to_vec() } else { vec![] },
+            ),
         };
 
         format!(
             r#"(() => {{
-  const labels = {};
-  for (const b of document.querySelectorAll("button")) {{
-    const label = (b.getAttribute("aria-label") || "").trim();
-    const r = b.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && labels.includes(label)) {{
-      return {{ x: r.left + r.width / 2, y: r.top + r.height / 2 }};
+  const insertLabels = {};
+  const nativeLabels = {};
+  const buttons = [...document.querySelectorAll("button")];
+  for (const [labels, nativeSend] of [[insertLabels, false], [nativeLabels, true]]) {{
+    for (const b of buttons) {{
+      const label = (b.getAttribute("aria-label") || "").trim();
+      const r = b.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && labels.includes(label)) {{
+        return {{ x: r.left + r.width / 2, y: r.top + r.height / 2, nativeSend }};
+      }}
     }}
   }}
   return null;
 }})()"#,
-            serde_json::to_string(&labels).unwrap()
+            serde_json::to_string(&labels).unwrap(),
+            serde_json::to_string(&native_labels).unwrap(),
         )
     }
 }
@@ -116,13 +148,7 @@ struct TabStatusMessage {
 }
 
 fn decode_tab_status(source: &str, payload: &str) -> Result<TabStatus, &'static str> {
-    let trusted = url::Url::parse(source)
-        .map(|url| {
-            url.scheme() == "https"
-                && matches!(url.host_str(), Some("chatgpt.com" | "chat.openai.com"))
-        })
-        .unwrap_or(false);
-    if !trusted {
+    if !trusted_chatgpt_source(source) {
         return Err("source rejected");
     }
     let message: TabStatusMessage =
@@ -286,7 +312,9 @@ struct PttCancel {
 
 enum ClickGuard {
     Start(Arc<PttTracker>, AppHandle, usize, usize),
-    Finish(Arc<PttTracker>, AppHandle, usize, usize, PttSource, bool),
+    // tracker, app, tab, generation, auto-submit setting, queued explicit Submit
+    Finish(Arc<PttTracker>, AppHandle, usize, usize, bool, bool),
+    Cancel(Arc<PttTracker>, usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -907,6 +935,25 @@ fn install_tab_status_listener(
                     return Ok(());
                 }
                 let raw = CoTaskMemPWSTR::from(raw).to_string();
+                if microphone_inventory::handle_route_message(&app_handle, tab_id, &source, &raw)
+                    || microphone_inventory::handle_message(&app_handle, tab_id, &source, &raw) {
+                    return Ok(());
+                }
+                // Developer-only capture-path evidence. Reject other origins and
+                // never expose these logs in a production build.
+                if microphone_poc_enabled()
+                    && serde_json::from_str::<serde_json::Value>(&raw)
+                        .ok()
+                        .and_then(|value| {
+                            value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned)
+                        })
+                        .as_deref() == Some("gpt-wrapper-microphone-probe")
+                {
+                    if trusted_chatgpt_source(&source) {
+                        println!("[gpt-wrapper] microphone POC tab {tab_id}: {}", raw.chars().take(2048).collect::<String>());
+                    }
+                    return Ok(());
+                }
                 match decode_tab_status(&source, &raw) {
                     Ok(status) => {
                         #[cfg(debug_assertions)]
@@ -958,10 +1005,21 @@ fn create_chatgpt_webview(
         WebviewUrl::App(TAB_BOOTSTRAP_PATH.into()),
     )
     .initialization_script(ADAPTER_SCRIPT)
+    .initialization_script(MICROPHONE_INVENTORY_SCRIPT)
+    .initialization_script(MICROPHONE_ROUTE_SCRIPT)
+    .initialization_script(if microphone_poc_enabled() {
+        MICROPHONE_POC_SCRIPT
+    } else {
+        ""
+    })
     .background_color(LOADING_BACKGROUND)
     .focused(false)
     .on_page_load(move |webview, payload| {
         if payload.event() == PageLoadEvent::Started {
+            webview
+                .app_handle()
+                .state::<microphone_inventory::MicrophoneRouting>()
+                .forget_tab(tab_id);
             let was_loaded = webview
                 .app_handle()
                 .state::<TabState>()
@@ -980,6 +1038,9 @@ fn create_chatgpt_webview(
             return;
         }
 
+        if let Err(error) = microphone_inventory::sync_tab(webview.app_handle(), tab_id, &webview) {
+            eprintln!("[gpt-wrapper] failed to sync microphone selection on tab {tab_id}: {error}");
+        }
         // Re-report the current DOM state after navigation even if the first event was missed.
         if let Err(error) = webview.eval("window.__GPT_WRAPPER__?.reportStatus?.();") {
             #[cfg(debug_assertions)]
@@ -1925,18 +1986,36 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
         unsafe {
             let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
                 let mut clicked = false;
+                let mut native_sent = false;
                 if let Err(error) = result {
                     eprintln!("[gpt-wrapper] button lookup script failed: {error:?}");
                 } else { match serde_json::from_str::<Option<Rect>>(&raw) {
                     Ok(Some(rect)) => {
                         match &guard {
-                            Some(ClickGuard::Start(tracker, _, tab_id, generation))
-                                if !tracker.mark_start_clicked(*tab_id, *generation) =>
-                            {
-                                return Ok(())
+                            Some(ClickGuard::Start(tracker, app, tab_id, generation)) => {
+                                if !tracker.is_current(*tab_id, *generation) {
+                                    return Ok(());
+                                }
+                                // Settings can change in the 180 ms between
+                                // scheduling Start and dispatching the click.
+                                if let Err(reason) = microphone_inventory::ptt_start_guard(app, *tab_id) {
+                                    tracker.clear_tab(*tab_id);
+                                    microphone_inventory::show_ptt_error(app, Some(*tab_id), &reason);
+                                    return Ok(());
+                                }
+                                if !tracker.mark_start_clicked(*tab_id, *generation) {
+                                    return Ok(());
+                                }
                             }
                             Some(ClickGuard::Finish(tracker, _, _, generation, _, _))
                                 if tracker.finish_in_flight.load(Ordering::SeqCst) != *generation =>
+                            {
+                                return Ok(())
+                            }
+                            Some(ClickGuard::Cancel(tracker, cancelled_generation))
+                                if tracker.is_held()
+                                    || tracker.generation.load(Ordering::SeqCst) != *cancelled_generation
+                                    || tracker.finish_in_flight.load(Ordering::SeqCst) != 0 =>
                             {
                                 return Ok(())
                             }
@@ -1946,6 +2025,7 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                             "[gpt-wrapper] trusted click dispatch requested {:?} at ({:.1}, {:.1}); recording/delivery unverified",
                             target, rect.x, rect.y
                         );
+                        native_sent = rect.native_send;
                         dispatch_trusted_click(&webview_for_callback, rect);
                         clicked = true;
                     }
@@ -1961,11 +2041,11 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                 }}
 
                 match guard {
-                    Some(ClickGuard::Finish(tracker, app, tab_id, generation, source, submit_pending)) => {
+                    Some(ClickGuard::Finish(tracker, app, tab_id, generation, auto_submit, submit_pending)) => {
                         if clicked {
-                            verify_finish_stopped(app, tracker, tab_id, generation, source, submit_pending, 0);
+                            verify_finish_stopped(app, tracker, tab_id, generation, auto_submit, submit_pending, native_sent, 0);
                         } else {
-                            complete_finish(app, tracker, tab_id, generation, source, submit_pending, false);
+                            complete_finish(app, tracker, tab_id, generation, auto_submit, submit_pending, false, false);
                         }
                     }
                     Some(ClickGuard::Start(tracker, app, tab_id, generation)) if clicked => {
@@ -1988,14 +2068,27 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
     }
 }
 
+// PTT ends recording first. Only the setting or an independent, explicit
+// Submit signal may request a follow-up composer Send. A native send-on-finish
+// button has already done that job and must never cause a second click.
+fn should_send_after_finish(
+    auto_submit: bool,
+    submit_pending: bool,
+    native_sent: bool,
+    disconnected: bool,
+) -> bool {
+    !disconnected && !native_sent && (auto_submit || submit_pending)
+}
+
 fn complete_finish(
     app: AppHandle,
     tracker: Arc<PttTracker>,
     tab_id: usize,
     generation: usize,
-    source: PttSource,
+    auto_submit: bool,
     submit_pending: bool,
     stopped: bool,
+    native_sent: bool,
 ) {
     let Some(events) = tracker.finish_completed(generation) else {
         return;
@@ -2008,29 +2101,23 @@ fn complete_finish(
         if let Some(tab) = get_tab_webview(&app, tab_id) {
             let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
         }
-        eprintln!("[gpt-wrapper] Finish could not be verified on tab {tab_id}; queued events rejected; recording state uncertain");
+        eprintln!("[gpt-wrapper] Finish could not be verified on tab {tab_id}; no safe transcription-only control or recording state uncertain. No Send requested.");
         return;
     }
     let disconnected = events.contains(&PttEvent::CancelBle);
     if let Some(tab) = get_tab_webview(&app, tab_id) {
-        if source == PttSource::Ble {
-            if disconnected {
-                let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
-            } else {
-                let _ = tab.eval("window.__GPT_WRAPPER__?.finishBleSegment?.();");
-            }
-            if submit_pending && !disconnected {
-                tracker.note_ble_send(tab_id);
-                request_explicit_send(&app, tab_id);
-            }
+        if disconnected {
+            let _ = tab.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
         } else {
-            let _ = tab.eval("window.__GPT_WRAPPER__?.finishKeyboardSegment?.();");
-            if app
-                .state::<GeneralSettingsState>()
-                .ptt_auto_submit()
-                .unwrap_or(false)
-            {
-                let _ = tab.eval("window.__GPT_WRAPPER__?.waitAndSend?.();");
+            let script = format!(
+                "window.__GPT_WRAPPER__?.finishPttSegment?.({native_sent});"
+            );
+            let _ = tab.eval(&script);
+            if submit_pending {
+                tracker.note_ble_send(tab_id);
+            }
+            if should_send_after_finish(auto_submit, submit_pending, native_sent, disconnected) {
+                request_explicit_send(&app, tab_id);
             }
         }
     }
@@ -2072,7 +2159,7 @@ fn verify_start_visible(
         fail_start(app, tracker, tab_id, generation);
         return;
     };
-    let script = HSTRING::from(DictationTarget::Finish.rect_script());
+    let script = HSTRING::from(DictationTarget::Finish { allow_native_send: true }.rect_script());
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
             return;
@@ -2125,8 +2212,9 @@ fn verify_finish_stopped(
     tracker: Arc<PttTracker>,
     tab_id: usize,
     generation: usize,
-    source: PttSource,
+    auto_submit: bool,
     submit_pending: bool,
+    native_sent: bool,
     attempt: u8,
 ) {
     if tracker.finish_in_flight.load(Ordering::SeqCst) != generation {
@@ -2134,29 +2222,21 @@ fn verify_finish_stopped(
     }
     if attempt >= 30 {
         complete_finish(
-            app,
-            tracker,
-            tab_id,
-            generation,
-            source,
-            submit_pending,
-            false,
+            app, tracker, tab_id, generation, auto_submit, submit_pending, false, native_sent,
         );
         return;
     }
     let Some(tab) = get_tab_webview(&app, tab_id) else {
         complete_finish(
-            app,
-            tracker,
-            tab_id,
-            generation,
-            source,
-            submit_pending,
-            false,
+            app, tracker, tab_id, generation, auto_submit, submit_pending, false, native_sent,
         );
         return;
     };
-    let script = HSTRING::from(DictationTarget::Finish.rect_script());
+    // Check every known recording completion control, not just the selected
+    // action, so a remaining Send/Insert choice isn't mistaken for completion.
+    let script = HSTRING::from(
+        DictationTarget::Finish { allow_native_send: true }.rect_script()
+    );
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
             return;
@@ -2164,13 +2244,8 @@ fn verify_finish_stopped(
         let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
             if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(None)) {
                 complete_finish(
-                    app.clone(),
-                    Arc::clone(&tracker),
-                    tab_id,
-                    generation,
-                    source,
-                    submit_pending,
-                    true,
+                    app.clone(), Arc::clone(&tracker), tab_id, generation,
+                    auto_submit, submit_pending, true, native_sent,
                 );
             } else {
                 thread::spawn({
@@ -2179,13 +2254,8 @@ fn verify_finish_stopped(
                     move || {
                         thread::sleep(Duration::from_millis(100));
                         verify_finish_stopped(
-                            app,
-                            tracker,
-                            tab_id,
-                            generation,
-                            source,
-                            submit_pending,
-                            attempt + 1,
+                            app, tracker, tab_id, generation, auto_submit,
+                            submit_pending, native_sent, attempt + 1,
                         );
                     }
                 });
@@ -2233,6 +2303,11 @@ fn schedule_ptt_start(
     _consider_started_immediately: bool,
 ) {
     if !tracker.claim_start(tab_id, generation) {
+        return;
+    }
+    if let Err(reason) = microphone_inventory::ptt_start_guard(webview.app_handle(), tab_id) {
+        tracker.clear_tab(tab_id);
+        microphone_inventory::show_ptt_error(webview.app_handle(), Some(tab_id), &reason);
         return;
     }
     tracker.start_in_flight.store(generation, Ordering::SeqCst);
@@ -2399,6 +2474,10 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 eprintln!("[gpt-wrapper] active ChatGPT webview missing");
                 return;
             };
+            if let Err(reason) = microphone_inventory::ptt_start_guard(app_handle, tab_id) {
+                microphone_inventory::show_ptt_error(app_handle, Some(tab_id), &reason);
+                return;
+            }
             let Some(generation) = tracker.begin(source, tab_id) else {
                 return;
             };
@@ -2435,20 +2514,25 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 return;
             };
 
-            println!("[gpt-wrapper] hotkey released on tab {}", finish.tab_id);
+            // Read the setting for both keyboard and BLE releases, using the
+            // state at release time. A queued BLE Submit is an explicit intent.
+            let auto_submit = app_handle.state::<GeneralSettingsState>()
+                .ptt_auto_submit().unwrap_or(false);
+            let allow_native_send = auto_submit || finish.submit_pending;
+            println!("[gpt-wrapper] hotkey released on tab {}; auto submit: {auto_submit}", finish.tab_id);
             tracker.finish_tab_id.store(finish.tab_id, Ordering::SeqCst);
             tracker
                 .finish_in_flight
                 .store(finish.generation, Ordering::SeqCst);
             trusted_click_guarded(
                 &webview,
-                DictationTarget::Finish,
+                DictationTarget::Finish { allow_native_send },
                 Some(ClickGuard::Finish(
                     Arc::clone(tracker),
                     app_handle.clone(),
                     finish.tab_id,
                     finish.generation,
-                    source,
+                    auto_submit,
                     finish.submit_pending,
                 )),
             );
@@ -2504,13 +2588,13 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                             .store(cancel.generation, Ordering::SeqCst);
                         trusted_click_guarded(
                             &webview,
-                            DictationTarget::Finish,
+                            DictationTarget::Finish { allow_native_send: false },
                             Some(ClickGuard::Finish(
                                 Arc::clone(tracker),
                                 app_handle.clone(),
                                 cancel.tab_id,
                                 cancel.generation,
-                                PttSource::Ble,
+                                false,
                                 false,
                             )),
                         );
@@ -2541,6 +2625,9 @@ fn main() {
             set_autostart_enabled,
             get_ptt_auto_submit_enabled,
             set_ptt_auto_submit_enabled,
+            microphone_inventory::get_preferred_microphone,
+            microphone_inventory::set_preferred_microphone,
+            microphone_inventory::list_microphone_inputs,
             ble_status,
             ble_enable,
             ble_scan,
@@ -2562,6 +2649,8 @@ fn main() {
             let launched_by_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
 
             app.manage(TabState::new());
+            app.manage(microphone_inventory::InventoryBridge::new());
+            app.manage(microphone_inventory::MicrophoneRouting::new());
 
             let quitting = Arc::new(AtomicBool::new(false));
             let ptt_tracker = Arc::new(PttTracker::new());
@@ -2745,6 +2834,29 @@ fn main() {
 #[cfg(test)]
 mod ptt_tests {
     use super::*;
+
+    #[test]
+    fn finish_selectors_never_offer_native_send_when_auto_submit_is_off() {
+        let insert_only = DictationTarget::Finish { allow_native_send: false }.rect_script();
+        assert!(insert_only.contains("Submit dictation"));
+        assert!(!insert_only.contains("Transcribe and send"));
+        assert!(!insert_only.contains("轉錄並傳送"));
+        let with_fallback = DictationTarget::Finish { allow_native_send: true }.rect_script();
+        assert!(with_fallback.contains("Transcribe and send"));
+        let native: Rect = serde_json::from_str(r#"{"x":1,"y":2,"nativeSend":true}"#).unwrap();
+        assert!(native.native_send);
+    }
+
+    #[test]
+    fn keyboard_and_ble_share_ptt_send_policy() {
+        // Both sources must use this same policy; the explicit Submit button
+        // remains independent of Settings, including when pressed during PTT.
+        assert!(!should_send_after_finish(false, false, false, false));
+        assert!(should_send_after_finish(true, false, false, false));
+        assert!(should_send_after_finish(false, true, false, false));
+        assert!(!should_send_after_finish(true, true, true, false));
+        assert!(!should_send_after_finish(true, true, false, true));
+    }
 
     #[test]
     fn background_switch_only_runs_when_ptt_and_finish_are_idle() {

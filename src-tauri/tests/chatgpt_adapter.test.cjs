@@ -71,7 +71,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("Message prefix");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   assert.equal(h.api.requestExplicitSend(), "requested");
   assert.equal(h.api.requestExplicitSend(), "already-pending");
   h.advance(3000);
@@ -83,7 +83,7 @@ function harness(initialText = "", sendLabel = "Send") {
   assert.equal(h.api.requestExplicitSend(), "already-pending");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.composer.value = "Message prefix spoken words next draft";
   h.setBusy(false);
   assert.equal(h.api.requestExplicitSend(), "requested");
@@ -95,7 +95,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("first segment");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.composer.value = "first segment second segment";
   h.setBusy(false);
   h.api.requestExplicitSend();
@@ -118,7 +118,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("previous segment");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.api.requestExplicitSend();
   h.composer.value = "previous segment new words";
   h.api.cancelExplicitSend();
@@ -138,7 +138,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("prefix");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.api.requestExplicitSend();
   h.composer.value = "prefix prior segment";
   h.advance(2500);
@@ -152,7 +152,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("first");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.api.requestExplicitSend();
   h.api.prepareStart();
   h.composer.value = "first second";
@@ -160,7 +160,7 @@ function harness(initialText = "", sendLabel = "Send") {
   h.advance(2000);
   assert.equal(h.send.clicks, 0, "new active segment keeps queued Submit waiting");
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.advance(200);
   h.setBusy(false);
   h.advance(1200);
@@ -172,7 +172,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("first");
   h.api.prepareStart();
   h.removeIndicator();
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.api.requestExplicitSend();
   h.composer.value = "first second";
   h.advance(1900);
@@ -185,7 +185,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("unchanged");
   h.api.prepareStart();
   h.removeIndicator();
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.api.requestExplicitSend();
   h.advance(16000);
   assert.equal(h.send.clicks, 0, "no new transcript must not send old draft even with fallback");
@@ -225,7 +225,7 @@ function harness(initialText = "", sendLabel = "Send") {
   h.composer.value = "speech appeared before release";
   h.advance(4000);
   assert.equal(h.send.clicks, 0, "pending dictation must never be submitted while held");
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.advance(3500);
   assert.equal(h.send.clicks, 1, "a held Submit should proceed after Finish and fallback settling");
 }
@@ -234,7 +234,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("first");
   h.api.prepareStart();
   h.setBusy(true);
-  h.api.finishBleSegment();
+  h.api.finishPttSegment();
   h.api.requestExplicitSend();
   h.composer.value = "first second";
   h.api.cancelExplicitSend(); // pagehide/navigation calls the same cancellation path
@@ -243,4 +243,39 @@ function harness(initialText = "", sendLabel = "Send") {
   assert.equal(h.send.clicks, 0);
 }
 
-console.log("chatgpt_adapter explicit-send tests passed");
+{
+  const h = harness("original draft");
+  h.api.prepareStart();
+  h.removeIndicator();
+  h.api.finishPttSegment(); // keyboard and BLE share this callback
+  h.composer.value = "original draft spoken text";
+  h.advance(16000);
+  assert.equal(h.send.clicks, 0, "PTT completion alone never submits when auto-submit is off");
+  assert.equal(h.composer.value, "original draft spoken text", "draft stays editable");
+  assert.equal(h.api.requestExplicitSend(), "requested", "explicit Submit remains available");
+  h.advance(3500);
+  assert.equal(h.send.clicks, 1);
+}
+
+{
+  const h = harness("prefix");
+  h.api.prepareStart();
+  h.removeIndicator();
+  h.api.finishPttSegment();
+  h.api.requestExplicitSend(); // both PTT sources call this when auto-submit is on
+  h.composer.value = "prefix dictation";
+  h.advance(3500);
+  assert.equal(h.send.clicks, 1, "auto-submit uses the same guarded Send path");
+}
+
+{
+  const h = harness("prefix");
+  h.api.prepareStart();
+  h.api.requestExplicitSend(); // queued explicit Submit, already dispatched in another code path
+  h.api.finishPttSegment(true); // native Finish control submitted to ChatGPT directly
+  h.composer.value = "prefix done";
+  h.advance(16000);
+  assert.equal(h.send.clicks, 0, "native send-on-finish must cancel pending duplicate Send");
+}
+
+console.log("chatgpt_adapter explicit-send and unified PTT tests passed");
