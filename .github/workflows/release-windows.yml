@@ -1,0 +1,87 @@
+name: Release Windows NSIS
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate tag and prepare bundle version
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Expected a release tag in vX.X.X format, got: $env:RELEASE_TAG"
+          }
+          $releaseVersion = $env:RELEASE_TAG.Substring(1)
+          $releaseConfig = Join-Path $env:RUNNER_TEMP 'tauri-release.json'
+          @{
+            version = $releaseVersion
+            bundle = @{ active = $true; targets = @('nsis') }
+          } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $releaseConfig -Encoding utf8
+          "RELEASE_CONFIG=$releaseConfig" >> $env:GITHUB_ENV
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Windows x64 NSIS installer
+        run: npm run tauri -- build --ci --target x86_64-pc-windows-msvc --bundles nsis --config "$env:RELEASE_CONFIG" -- --locked
+
+      - name: Keep installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpt-wrapper-${{ github.ref_name }}-windows-x64-nsis
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $installers = @(Get-ChildItem -Path 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe' -File)
+          if ($installers.Count -eq 0) {
+            throw 'No NSIS installer was generated.'
+          }
+          $assets = @($installers | ForEach-Object { $_.FullName })
+          gh release view "$env:RELEASE_TAG" --json tagName
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:RELEASE_TAG" @assets --clobber
+          } else {
+            gh release create "$env:RELEASE_TAG" @assets --verify-tag --title "GPT Wrapper $env:RELEASE_TAG" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to publish the GitHub Release installer.'
+          }

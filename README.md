@@ -25,6 +25,21 @@ npm run tauri build
 
 The SolidJS tab bar and Settings UIs are built automatically by the Tauri dev/build flow; no separate frontend build step is required.
 
+## Windows releases
+
+Commit the release workflow and app changes, push the commit, then create and push a version tag:
+
+```powershell
+git tag v0.0.1
+git push origin v0.0.1
+```
+
+The `.github/workflows/release-windows.yml` workflow runs when a `vX.X.X` tag is pushed (for example, `v0.0.1`). It builds a Windows x64 NSIS `*-setup.exe` installer and publishes it to the matching GitHub Release with automatically generated release notes. Only three-part numeric versions without leading zeroes are accepted; prerelease tags such as `v0.0.1-beta` are rejected.
+
+The installer and app version come from the tag through a temporary Tauri config override, so you do not need to edit `package.json`, `Cargo.toml`, or `tauri.conf.json` for each release. The workflow explicitly enables NSIS bundling and uses the committed npm and Cargo lockfiles. Tauri builds both frontend UIs automatically.
+
+GitHub Actions must be enabled for the repository. The workflow uses its built-in `GITHUB_TOKEN` with `contents: write`; no extra release token is required. Installers are currently unsigned. Successful builds also retain the installer as an Actions artifact for 14 days, including when release publishing fails. To retry a failed run, use **Actions → Release Windows NSIS → Re-run failed jobs**; an existing release receives replacement assets with the same filenames, while its title and notes are preserved.
+
 ## Usage
 
 1. Log in to ChatGPT manually inside the app.
