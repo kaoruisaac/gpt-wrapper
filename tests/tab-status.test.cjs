@@ -18,6 +18,7 @@ function harness(channel = true) {
   const document = {
     readyState: "complete",
     documentElement: {},
+    addEventListener: () => {},
     querySelector: () => null,
     querySelectorAll: (selector) => selector.startsWith("button") ? labels.map(button) : [],
   };

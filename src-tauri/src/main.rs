@@ -6,6 +6,7 @@ mod general_settings;
 mod microphone_inventory;
 mod project_settings;
 mod shortcut_settings;
+mod tab_completion_notifications;
 
 use ble_central::{BleCentral, ControlEvent};
 use general_settings::GeneralSettingsState;
@@ -41,9 +42,10 @@ use windows::{
     Win32::UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
         WindowsAndMessaging::{
-            AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, ShowWindow,
-            TrackPopupMenuEx, MF_CHECKED, MF_STRING, SW_RESTORE, TPM_LEFTBUTTON, TPM_NONOTIFY,
-            TPM_RETURNCMD, TPM_RIGHTALIGN,
+            AppendMenuW, CreatePopupMenu, DestroyMenu, GetWindowPlacement, IsIconic,
+            SetForegroundWindow, ShowWindow, TrackPopupMenuEx, MF_CHECKED, MF_STRING, SW_RESTORE,
+            SW_SHOWMAXIMIZED, TPM_LEFTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
+            WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
         },
     },
 };
@@ -968,13 +970,38 @@ fn begin_prefix_flow(app: &AppHandle, webview: Webview, tab_id: usize, flow: Pre
 }
 
 fn set_tab_status(app_handle: &AppHandle, tab_id: usize, status: TabStatus) {
-    let should_refresh = {
+    let (should_refresh, previous, title) = {
         let state = app_handle.state::<TabState>();
         let Ok(mut tabs) = state.lock() else {
             return;
         };
-        tabs.update_status(tab_id, status)
+        let previous = tabs.contexts.get(&tab_id).map(|context| context.status);
+        let title = tabs
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.title.clone());
+        let changed = tabs.update_status(tab_id, status);
+        (changed, previous, title)
     };
+    if let Some(previous) = previous {
+        if previous != status {
+            tab_completion_notifications::on_status(app_handle, tab_id, previous, status, title);
+        }
+    }
+    if should_refresh {
+        refresh_tab_host(app_handle);
+    }
+}
+
+// Navigation resets are not DOM-observed completions.
+fn reset_tab_status(app_handle: &AppHandle, tab_id: usize) {
+    tab_completion_notifications::cancel_tab(app_handle, tab_id);
+    let should_refresh = app_handle
+        .state::<TabState>()
+        .lock()
+        .map(|mut tabs| tabs.update_status(tab_id, TabStatus::Fallback))
+        .unwrap_or(false);
     if should_refresh {
         refresh_tab_host(app_handle);
     }
@@ -1117,7 +1144,7 @@ fn create_chatgpt_webview(
             if was_loaded {
                 webview.app_handle().state::<PttState>().0.clear_tab(tab_id);
             }
-            set_tab_status(webview.app_handle(), tab_id, TabStatus::Fallback);
+            reset_tab_status(webview.app_handle(), tab_id);
             return;
         }
         if payload.event() != PageLoadEvent::Finished
@@ -1488,6 +1515,7 @@ fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapsh
             tabs.active_tab_id = replacement;
         }
     }
+    tab_completion_notifications::cancel_tab(app_handle, tab_id);
 
     if was_active {
         if let Some(replacement_id) = replacement {
@@ -1510,6 +1538,27 @@ fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapsh
     }
 
     snapshot(app_handle)
+}
+
+#[tauri::command]
+fn dismiss_tab_completion_notification(
+    app: AppHandle,
+    webview: Webview,
+    tab_id: usize,
+    generation: u64,
+) -> Result<(), String> {
+    if webview.label() != tab_completion_notifications::WINDOW_LABEL {
+        return Err("only the completion notification UI may dismiss cards".into());
+    }
+    let source = webview.url().map_err(|error| error.to_string())?;
+    if !matches!(source.scheme(), "tauri" | "http" | "https")
+        || !matches!(source.host_str(), Some("localhost" | "tauri.localhost"))
+        || source.path() != "/settings/tab-completion-notifications.html"
+    {
+        return Err("completion notification source rejected".into());
+    }
+    tab_completion_notifications::dismiss_card(&app, tab_id, generation);
+    Ok(())
 }
 
 fn ensure_host_webview(webview: &Webview) -> Result<(), String> {
@@ -1888,17 +1937,46 @@ fn dispatch_trusted_click(webview: &ICoreWebView2, rect: Rect) {
     devtools_mouse_event(webview, "mouseReleased", rect.x, rect.y, "left", 0);
 }
 
-fn restore_to_foreground(window: &Window) {
-    let _ = window.show();
+// SW_RESTORE must only run for minimized windows: it unmaximizes visible
+// maximized windows. Windows also records whether a minimized window should
+// return to maximized state in WINDOWPLACEMENT.
+fn minimized_restore_command(
+    restore_maximized: bool,
+) -> windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD {
+    if restore_maximized {
+        SW_SHOWMAXIMIZED
+    } else {
+        SW_RESTORE
+    }
+}
 
+fn restore_to_foreground(window: &Window) {
     match window.hwnd() {
         Ok(hwnd) => unsafe {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let was_minimized = IsIconic(hwnd).as_bool();
+            let restore_maximized = if was_minimized {
+                let mut placement = WINDOWPLACEMENT {
+                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                    ..Default::default()
+                };
+                GetWindowPlacement(hwnd, &mut placement).is_ok()
+                    && placement.flags.contains(WPF_RESTORETOMAXIMIZED)
+            } else {
+                false
+            };
+
+            let _ = window.show();
+            if was_minimized {
+                let _ = ShowWindow(hwnd, minimized_restore_command(restore_maximized));
+            }
             let _ = SetForegroundWindow(hwnd);
         },
         Err(error) => {
             eprintln!("[gpt-wrapper] hwnd unavailable: {error:?}");
-            let _ = window.unminimize();
+            let _ = window.show();
+            if window.is_minimized().unwrap_or(false) {
+                let _ = window.unminimize();
+            }
         }
     }
 
@@ -1956,6 +2034,27 @@ fn restore_main_window_from_tray(app_handle: &AppHandle) {
             focus_active_tab(app_handle);
         }
         None => eprintln!("[gpt-wrapper] main window missing"),
+    }
+}
+
+// A regular second launch should foreground the existing instance instead of
+// initializing another tray icon, BLE client, shortcut registry, or set of tabs.
+fn second_instance_requests_foreground(args: &[String]) -> bool {
+    !args.iter().skip(1).any(|arg| arg == AUTOSTART_ARG)
+}
+
+fn activate_existing_main_window(app_handle: &AppHandle) {
+    if app_handle
+        .state::<TrayVisibilityState>()
+        .tray_hidden
+        .load(Ordering::SeqCst)
+    {
+        restore_main_window_from_tray(app_handle);
+    } else if let Some(window) = app_handle.get_window(MAIN_WINDOW_LABEL) {
+        restore_to_foreground(&window);
+        focus_active_tab(app_handle);
+    } else {
+        eprintln!("[gpt-wrapper] second launch: main window unavailable");
     }
 }
 
@@ -3121,7 +3220,33 @@ fn set_shortcut_settings(
 }
 
 fn main() {
+    // A second launch can arrive before setup has built the main window.
+    // Keep a pending activation until the first instance is ready.
+    let pending_activation = Arc::new(AtomicBool::new(false));
+    let pending_for_plugin = Arc::clone(&pending_activation);
+    let pending_for_setup = Arc::clone(&pending_activation);
+
     tauri::Builder::default()
+        // Must be the first plugin so second instances stop before other setup.
+        .plugin(tauri_plugin_single_instance::init(
+            move |app, args, _cwd| {
+                if !second_instance_requests_foreground(&args) {
+                    return; // --autostart remains silent even if already running.
+                }
+                pending_for_plugin.store(true, Ordering::SeqCst);
+                let pending = Arc::clone(&pending_for_plugin);
+                let app_for_activation = app.clone();
+                if let Err(error) = app.run_on_main_thread(move || {
+                    if app_for_activation.get_window(MAIN_WINDOW_LABEL).is_some()
+                        && pending.swap(false, Ordering::SeqCst)
+                    {
+                        activate_existing_main_window(&app_for_activation);
+                    }
+                }) {
+                    eprintln!("[gpt-wrapper] could not dispatch second launch: {error:?}");
+                }
+            },
+        ))
         .invoke_handler(tauri::generate_handler![
             get_tabs,
             create_tab,
@@ -3130,6 +3255,7 @@ fn main() {
             switch_tab,
             reorder_tabs,
             close_tab,
+            dismiss_tab_completion_notification,
             get_autostart_enabled,
             set_autostart_enabled,
             get_ptt_auto_submit_enabled,
@@ -3156,7 +3282,7 @@ fn main() {
             Some(vec![AUTOSTART_ARG]),
         ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
             let launched_by_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
 
             app.manage(TabState::new());
@@ -3168,6 +3294,7 @@ fn main() {
             app.manage(PttState(Arc::clone(&ptt_tracker)));
             app.manage(TrayVisibilityState::new());
             app.manage(background_project_switcher::BackgroundProjectSwitcherState::new());
+            app.manage(tab_completion_notifications::NotificationState::new());
             app.manage(SettingsWindowState::new());
             let project_settings_path: PathBuf =
                 app.path().app_config_dir()?.join("project-settings.json");
@@ -3247,6 +3374,9 @@ fn main() {
                         }
                     }
                 }
+                WindowEvent::Focused(true) => {
+                    tab_completion_notifications::clear_all(&app_handle_for_events);
+                }
                 WindowEvent::Resized(_) => {
                     if let Err(error) = layout_webviews(&window_for_events) {
                         eprintln!("[gpt-wrapper] failed to lay out webviews: {error}");
@@ -3283,6 +3413,11 @@ fn main() {
                 focus_active_tab(app.handle());
             }
 
+            // Handle an ordinary second launch that arrived before setup finished.
+            if pending_for_setup.swap(false, Ordering::SeqCst) {
+                activate_existing_main_window(app.handle());
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -3292,6 +3427,32 @@ fn main() {
 #[cfg(test)]
 mod ptt_tests {
     use super::*;
+
+    #[test]
+    fn repeat_launch_ignores_autostart_but_foregrounds_manual_launch() {
+        assert!(second_instance_requests_foreground(&[
+            "gpt-wrapper.exe".into()
+        ]));
+        assert!(second_instance_requests_foreground(&[
+            "gpt-wrapper.exe".into(),
+            "--other-flag".into(),
+        ]));
+        assert!(!second_instance_requests_foreground(&[
+            "gpt-wrapper.exe".into(),
+            "--autostart".into(),
+        ]));
+        assert!(!second_instance_requests_foreground(&[
+            "gpt-wrapper.exe".into(),
+            "--other-flag".into(),
+            "--autostart".into(),
+        ]));
+    }
+
+    #[test]
+    fn minimized_window_restores_its_previous_maximized_state() {
+        assert_eq!(minimized_restore_command(false), SW_RESTORE);
+        assert_eq!(minimized_restore_command(true), SW_SHOWMAXIMIZED);
+    }
 
     #[test]
     fn finish_selectors_never_offer_native_send_when_auto_submit_is_off() {

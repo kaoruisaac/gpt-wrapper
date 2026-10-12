@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tab completion notifications</title>
+  <style>
+    :root { font-family: "Segoe UI", system-ui, sans-serif; color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+    #cards { display: flex; flex-direction: column; gap: 10px; height: 100%; overflow-y: auto;
+      scrollbar-width: thin; scrollbar-color: #505968 transparent; }
+    .card { position: relative; flex: 0 0 88px; height: 88px; width: 100%; padding: 14px 48px 14px 17px;
+      border: 1px solid #535d6e; border-radius: 13px; background: #202631; color: #f7f8fb;
+      box-shadow: 0 4px 20px #0005; opacity: 0.8; transition: opacity 300ms ease; }
+    .card.faded { opacity: 0.2; }
+    .heading { font-size: 13px; font-weight: 650; letter-spacing: 0.01em; line-height: 1.35; }
+    .name { font-size: 12px; color: #bdc6d6; margin-top: 9px; white-space: nowrap;
+      text-overflow: ellipsis; overflow: hidden; }
+    .close { position: absolute; top: 10px; right: 10px; width: 30px; height: 30px;
+      border-radius: 8px; border: 0; color: #eef2fa; background: #414b5c; cursor: pointer;
+      font-size: 19px; font-family: "Segoe UI", sans-serif; line-height: 1; }
+    .close:hover, .close:focus-visible { background: #657288; outline: 1px solid #a4b5ce; }
+    @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
+  </style>
+</head>
+<body>
+  <main id="cards" aria-label="Tab 完成通知"></main>
+  <script>
+    "use strict";
+    const container = document.getElementById("cards");
+    window.__GPT_TAB_COMPLETIONS__ = {
+      render(entries) {
+        if (!Array.isArray(entries)) return;
+        const activeIds = new Set(entries.map((entry) => String(entry.tabId) + ":" + String(entry.generation)));
+        for (const node of [...container.children]) {
+          if (!activeIds.has(node.dataset.key)) node.remove();
+        }
+        for (const [index, entry] of entries.entries()) {
+          const key = String(entry.tabId) + ":" + String(entry.generation);
+          let card = [...container.children].find((node) => node.dataset.key === key);
+          if (!card) {
+            card = document.createElement("article");
+            card.className = "card";
+            card.dataset.key = key;
+            const heading = document.createElement("div");
+            heading.className = "heading";
+            heading.textContent = "回覆已完成";
+            const name = document.createElement("div");
+            name.className = "name";
+            name.textContent = String(entry.title || "ChatGPT.com");
+            name.title = String(entry.title || "ChatGPT.com");
+            const close = document.createElement("button");
+            close.type = "button";
+            close.className = "close";
+            close.textContent = "×";
+            close.title = "關閉此通知";
+            close.setAttribute("aria-label", "關閉 " + name.textContent + " 通知");
+            close.addEventListener("click", () => {
+              const invoke = window.__TAURI_INTERNALS__?.invoke;
+              if (typeof invoke === "function") {
+                invoke("dismiss_tab_completion_notification", {
+                  tabId: entry.tabId,
+                  generation: entry.generation
+                }).catch((error) => console.error("notification dismissal failed", error));
+              }
+            });
+            card.append(heading, name, close);
+          }
+          card.classList.toggle("faded", Boolean(entry.faded));
+          // Avoid moving unchanged nodes: fading must not disrupt scroll position.
+          if (container.children[index] !== card) {
+            container.insertBefore(card, container.children[index] ?? null);
+          }
+        }
+      }
+    };
+  </script>
+</body>
+</html>
