@@ -5,11 +5,13 @@ mod ble_central;
 mod general_settings;
 mod microphone_inventory;
 mod project_settings;
+mod shortcut_settings;
 
 use ble_central::{BleCentral, ControlEvent};
 use general_settings::GeneralSettingsState;
 use project_settings::{ProjectSettings, ProjectSettingsState, TabSpec};
 use serde::{Deserialize, Serialize};
+use shortcut_settings::{parse_and_validate, ShortcutSettings, ShortcutSettingsState};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
@@ -28,7 +30,7 @@ use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
 use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
@@ -2949,6 +2951,175 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
     }
 }
 
+struct KeyboardShortcutState {
+    update_lock: Mutex<()>,
+    ptt_keys_down: Arc<Mutex<HashSet<u32>>>,
+    submit_keys_down: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl KeyboardShortcutState {
+    fn new() -> Self {
+        Self {
+            update_lock: Mutex::new(()),
+            ptt_keys_down: Arc::new(Mutex::new(HashSet::new())),
+            submit_keys_down: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    fn reset(&self) {
+        if let Ok(mut held) = self.ptt_keys_down.lock() {
+            held.clear();
+        }
+        if let Ok(mut held) = self.submit_keys_down.lock() {
+            held.clear();
+        }
+    }
+}
+
+// Recording a combination inside Settings must not trigger an existing PTT/Submit binding.
+fn settings_has_focus(app: &AppHandle) -> bool {
+    app.get_webview_window(SETTINGS_WINDOW_LABEL)
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false)
+}
+
+fn register_keyboard_shortcuts(
+    app: &AppHandle,
+    settings: &ShortcutSettings,
+    tracker: &Arc<PttTracker>,
+    keyboard: &KeyboardShortcutState,
+) -> Result<(), String> {
+    let (ptt, submit) = parse_and_validate(settings)?;
+    for (index, shortcut) in ptt.into_iter().enumerate() {
+        let held = Arc::clone(&keyboard.ptt_keys_down);
+        let tracker = Arc::clone(tracker);
+        app.global_shortcut()
+            .on_shortcut(shortcut, move |app, shortcut, event| {
+                if event.state() == ShortcutState::Pressed && settings_has_focus(app) {
+                    return;
+                }
+                let Ok(mut pressed) = held.lock() else {
+                    return;
+                };
+                let should_dispatch = match event.state() {
+                    ShortcutState::Pressed => {
+                        if !pressed.insert(shortcut.id()) {
+                            false
+                        } else {
+                            pressed.len() == 1
+                        }
+                    }
+                    ShortcutState::Released => pressed.remove(&shortcut.id()) && pressed.is_empty(),
+                };
+                drop(pressed);
+                if should_dispatch {
+                    let action = match event.state() {
+                        ShortcutState::Pressed => PttEvent::Down(PttSource::Keyboard),
+                        ShortcutState::Released => PttEvent::Up(PttSource::Keyboard),
+                    };
+                    handle_ptt_event(app, action, &tracker);
+                }
+            })
+            .map_err(|error| {
+                format!(
+                    "無法註冊 PTT 快捷鍵 {}（{}）：{error}",
+                    index + 1,
+                    settings.ptt[index]
+                )
+            })?;
+    }
+
+    for (index, shortcut) in submit.into_iter().enumerate() {
+        let tracker = Arc::clone(tracker);
+        let held = Arc::clone(&keyboard.submit_keys_down);
+        app.global_shortcut()
+            .on_shortcut(shortcut, move |app, shortcut, event| {
+                if event.state() == ShortcutState::Pressed && settings_has_focus(app) {
+                    return;
+                }
+                let Ok(mut pressed) = held.lock() else {
+                    return;
+                };
+                if event.state() == ShortcutState::Released {
+                    pressed.remove(&shortcut.id());
+                    return;
+                }
+                if !pressed.insert(shortcut.id()) {
+                    return; // Ignore auto-repeat for this specific physical shortcut.
+                }
+                drop(pressed);
+                let hidden = app
+                    .state::<TrayVisibilityState>()
+                    .tray_hidden
+                    .load(Ordering::SeqCst);
+                let tab_id = if hidden { None } else { active_tab_id(app) };
+                handle_ptt_event(app, PttEvent::SubmitKeyboard(tab_id), &tracker);
+            })
+            .map_err(|error| {
+                format!(
+                    "無法註冊 Submit 快捷鍵 {}（{}）：{error}",
+                    index + 1,
+                    settings.submit[index]
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_shortcut_settings(app: AppHandle, webview: Webview) -> Result<ShortcutSettings, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<ShortcutSettingsState>().get()
+}
+
+#[tauri::command]
+fn set_shortcut_settings(
+    app: AppHandle,
+    webview: Webview,
+    settings: ShortcutSettings,
+) -> Result<ShortcutSettings, String> {
+    ensure_settings_webview(&webview)?;
+    parse_and_validate(&settings)?;
+    let keyboard = app.state::<KeyboardShortcutState>();
+    let _guard = keyboard
+        .update_lock
+        .lock()
+        .map_err(|_| "shortcut update lock poisoned")?;
+    let tracker = &app.state::<PttState>().0;
+    if tracker.is_held() {
+        return Err("正在使用 PTT 聽寫，請放開快捷鍵後再儲存。".into());
+    }
+
+    let state = app.state::<ShortcutSettingsState>();
+    let previous = state.get()?;
+    if previous == settings {
+        return Ok(previous);
+    }
+    let manager = app.global_shortcut();
+    manager
+        .unregister_all()
+        .map_err(|e| format!("無法更新快捷鍵：{e}"))?;
+    keyboard.reset();
+    if let Err(error) = register_keyboard_shortcuts(&app, &settings, tracker, &keyboard) {
+        let _ = manager.unregister_all();
+        keyboard.reset();
+        if let Err(rollback) = register_keyboard_shortcuts(&app, &previous, tracker, &keyboard) {
+            return Err(format!("{error}；恢復原有快捷鍵也失敗：{rollback}"));
+        }
+        return Err(format!("{error}；已恢復原有快捷鍵。"));
+    }
+
+    if let Err(error) = state.save(settings.clone()) {
+        let _ = manager.unregister_all();
+        keyboard.reset();
+        if let Err(rollback) = register_keyboard_shortcuts(&app, &previous, tracker, &keyboard) {
+            return Err(format!("{error}；恢復原有快捷鍵失敗：{rollback}"));
+        }
+        return Err(error);
+    }
+    Ok(settings)
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -2963,6 +3134,8 @@ fn main() {
             set_autostart_enabled,
             get_ptt_auto_submit_enabled,
             set_ptt_auto_submit_enabled,
+            get_shortcut_settings,
+            set_shortcut_settings,
             microphone_inventory::get_preferred_microphone,
             microphone_inventory::set_preferred_microphone,
             microphone_inventory::list_microphone_inputs,
@@ -3001,6 +3174,10 @@ fn main() {
             app.manage(ProjectSettingsState::load(project_settings_path));
             let general_settings_path = app.path().app_config_dir()?.join("general-settings.json");
             app.manage(GeneralSettingsState::load(general_settings_path));
+            let shortcut_settings_path =
+                app.path().app_config_dir()?.join("shortcut-settings.json");
+            app.manage(ShortcutSettingsState::load(shortcut_settings_path));
+            app.manage(KeyboardShortcutState::new());
             let ble_app = app.handle().clone();
             let ble_tracker = Arc::clone(&ptt_tracker);
             let ble_path = app.path().app_config_dir()?.join("ble-controller.json");
@@ -3091,72 +3268,15 @@ fn main() {
             }
 
             println!("[gpt-wrapper] main window and initial ChatGPT tab created.");
-            println!("[gpt-wrapper] Hold Ctrl+0 or Ctrl+Numpad0 to dictate; Ctrl+. or Ctrl+NumpadDecimal requests Send.");
 
-            let primary_shortcut = Shortcut::new(Some(Modifiers::CONTROL), Code::Digit0);
-            let numpad_shortcut = Shortcut::new(Some(Modifiers::CONTROL), Code::Numpad0);
-            let submit_shortcuts = [
-                Shortcut::new(Some(Modifiers::CONTROL), Code::Period),
-                Shortcut::new(Some(Modifiers::CONTROL), Code::NumpadDecimal),
-            ];
-
-            let tracker_for_primary = Arc::clone(&ptt_tracker);
-            app.global_shortcut().on_shortcut(
-                primary_shortcut,
-                move |app_handle, _shortcut, event| {
-                    handle_ptt_event(
-                        app_handle,
-                        match event.state() {
-                            ShortcutState::Pressed => PttEvent::Down(PttSource::Keyboard),
-                            ShortcutState::Released => PttEvent::Up(PttSource::Keyboard),
-                        },
-                        &tracker_for_primary,
-                    );
-                },
-            )?;
-
-            let tracker_for_numpad = Arc::clone(&ptt_tracker);
-            app.global_shortcut().on_shortcut(
-                numpad_shortcut,
-                move |app_handle, _shortcut, event| {
-                    handle_ptt_event(
-                        app_handle,
-                        match event.state() {
-                            ShortcutState::Pressed => PttEvent::Down(PttSource::Keyboard),
-                            ShortcutState::Released => PttEvent::Up(PttSource::Keyboard),
-                        },
-                        &tracker_for_numpad,
-                    );
-                },
-            )?;
-
-            let submit_keys_down = Arc::new(Mutex::new(HashSet::<usize>::new()));
-            for (index, submit_shortcut) in submit_shortcuts.into_iter().enumerate() {
-                let tracker_for_submit = Arc::clone(&ptt_tracker);
-                let keys_down = Arc::clone(&submit_keys_down);
-                app.global_shortcut().on_shortcut(
-                    submit_shortcut,
-                    move |app_handle, _shortcut, event| {
-                        let Ok(mut held) = keys_down.lock() else { return; };
-                        if event.state() == ShortcutState::Released {
-                            held.remove(&index);
-                            return;
-                        }
-                        if !held.insert(index) {
-                            return; // Ignore keyboard auto-repeat until this shortcut is released.
-                        }
-                        drop(held);
-                        let hidden = app_handle.state::<TrayVisibilityState>()
-                            .tray_hidden.load(Ordering::SeqCst);
-                        let tab_id = if hidden { None } else { active_tab_id(app_handle) };
-                        handle_ptt_event(
-                            app_handle,
-                            PttEvent::SubmitKeyboard(tab_id),
-                            &tracker_for_submit,
-                        );
-                    },
-                )?;
-            }
+            let settings = app
+                .state::<ShortcutSettingsState>()
+                .get()
+                .map_err(tauri::Error::AssetNotFound)?;
+            let keyboard = app.state::<KeyboardShortcutState>();
+            register_keyboard_shortcuts(app.handle(), &settings, &ptt_tracker, &keyboard)
+                .map_err(tauri::Error::AssetNotFound)?;
+            println!("[gpt-wrapper] registered configured keyboard shortcuts.");
 
             if !launched_by_autostart {
                 window.set_focus()?;

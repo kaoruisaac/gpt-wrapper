@@ -4,8 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
 import ProjectBookmarks from "./ProjectBookmarks";
 import MicrophoneSettings from "./MicrophoneSettings";
+import ShortcutsSettings from "./ShortcutsSettings";
 
-type SettingsTab = "general" | "bookmarks";
+type SettingsTab = "general" | "bookmarks" | "shortcuts";
 type StatusKind = "" | "success" | "error";
 type BleDevice = { id: string; name: string; label: string };
 type BleSnapshot = { enabled: boolean; approvedDevice: BleDevice | null; candidates: BleDevice[]; state: string; detail: string; lastRx: string | null };
@@ -244,6 +245,14 @@ function SettingsApp() {
         >
           專案書籤
         </button>
+        <button
+          class="tab-button"
+          type="button"
+          aria-selected={activeTab() === "shortcuts"}
+          onClick={() => setActiveTab("shortcuts")}
+        >
+          Shortcuts
+        </button>
       </nav>
 
       <main class="content">
@@ -261,6 +270,14 @@ function SettingsApp() {
           aria-hidden={activeTab() !== "bookmarks"}
         >
           <ProjectBookmarks />
+        </section>
+
+        <section
+          class="panel"
+          classList={{ "is-active": activeTab() === "shortcuts" }}
+          aria-hidden={activeTab() !== "shortcuts"}
+        >
+          <ShortcutsSettings />
         </section>
       </main>
     </div>
