@@ -28,6 +28,9 @@ try {
     updateJson("package.json", (data) => {
       data.version = version;
     }),
+    updateJson("src-tauri/tauri.conf.json", (data) => {
+      data.version = version;
+    }),
     updateJson("package-lock.json", (data) => {
       data.version = version;
       if (data.packages) {
@@ -57,7 +60,7 @@ try {
   for (const { file, content } of updates) {
     fs.writeFileSync(path.join(root, file), content, "utf8");
   }
-  console.log(`Updated package.json, package-lock.json and src-tauri/Cargo.toml to ${version}`);
+  console.log(`Updated ${updates.map(({ file }) => file).join(", ")} to ${version}`);
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

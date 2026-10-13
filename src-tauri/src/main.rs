@@ -206,6 +206,8 @@ struct TabManager {
 #[derive(Debug)]
 struct TabContext {
     spec: TabSpec,
+    // WebView document.title, including for standby tabs not yet shown in the Tab Bar.
+    page_title: String,
     status: TabStatus,
     prefix_applied: bool,
     prefix_in_progress: bool,
@@ -217,6 +219,7 @@ impl TabContext {
     fn new(spec: TabSpec) -> Self {
         Self {
             spec,
+            page_title: project_settings::CHATGPT_TITLE.to_string(),
             status: TabStatus::Fallback,
             prefix_applied: false,
             prefix_in_progress: false,
@@ -232,6 +235,10 @@ impl TabContext {
             .ok_or("standby navigation is missing")?;
         let navigate = navigation.prepare(spec.url.clone());
         let ready = navigation.ready();
+        if navigate {
+            // A new destination must not inherit the previous document's title.
+            self.page_title = project_settings::CHATGPT_TITLE.to_string();
+        }
         if self.spec != spec || navigate {
             self.prefix_applied = false;
             self.prefix_in_progress = false;
@@ -270,6 +277,28 @@ impl TabManager {
             true
         } else {
             // Standby PTT tabs are not shown until promoted.
+            false
+        }
+    }
+
+    fn update_title(&mut self, tab_id: usize, page_title: &str) -> bool {
+        let Some(context) = self.contexts.get_mut(&tab_id) else {
+            return false;
+        };
+        let title = if page_title.trim().is_empty() {
+            project_settings::CHATGPT_TITLE
+        } else {
+            page_title.trim()
+        };
+        if context.page_title == title {
+            return false;
+        }
+        context.page_title = title.to_string();
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.title = context.page_title.clone();
+            true
+        } else {
+            // Preserve the title until this standby WebView is promoted.
             false
         }
     }
@@ -993,6 +1022,17 @@ fn begin_prefix_flow(app: &AppHandle, webview: Webview, tab_id: usize, flow: Pre
     }
 }
 
+fn set_tab_title(app_handle: &AppHandle, tab_id: usize, title: &str) {
+    let should_refresh = app_handle
+        .state::<TabState>()
+        .lock()
+        .map(|mut tabs| tabs.update_title(tab_id, title))
+        .unwrap_or(false);
+    if should_refresh {
+        refresh_tab_host(app_handle);
+    }
+}
+
 fn set_tab_status(app_handle: &AppHandle, tab_id: usize, status: TabStatus) {
     let (should_refresh, previous, title) = {
         let state = app_handle.state::<TabState>();
@@ -1369,6 +1409,9 @@ fn create_chatgpt_webview(
     })
     .background_color(LOADING_BACKGROUND)
     .focused(false)
+    .on_document_title_changed(move |webview, title| {
+        set_tab_title(webview.app_handle(), tab_id, &title);
+    })
     .on_page_load(move |webview, payload| {
         let managed = webview
             .app_handle()
@@ -1436,7 +1479,7 @@ fn create_tab_with_spec(
         let previous_active = tabs.active_tab_id;
         tabs.tabs.push(TabInfo {
             id: tab_id,
-            title: spec.title.clone(),
+            title: project_settings::CHATGPT_TITLE.to_string(),
             status: TabStatus::Fallback,
         });
         let mut context = TabContext::new(spec.clone());
@@ -1785,7 +1828,7 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
         if ready {
             context.navigation = None;
         }
-        let title = context.spec.title.clone();
+        let title = context.page_title.clone();
         let status = context.status;
         tabs.tabs.push(TabInfo {
             id: standby_id,
@@ -4271,6 +4314,84 @@ mod tab_status_tests {
         assert!(!tabs.update_status(3, TabStatus::Voice));
         assert_eq!(tabs.contexts[&3].status, TabStatus::Voice);
         assert!(!tabs.update_status(4, TabStatus::Send));
+    }
+
+    #[test]
+    fn document_titles_update_matching_visible_tabs_only() {
+        let mut tabs = TabManager::new();
+        let spec = ProjectSettings::default().default_tab_spec();
+        for id in [1, 2] {
+            tabs.contexts.insert(id, TabContext::new(spec.clone()));
+            tabs.tabs.push(TabInfo {
+                id,
+                title: project_settings::CHATGPT_TITLE.to_string(),
+                status: TabStatus::Fallback,
+            });
+        }
+
+        assert!(tabs.update_title(2, "Conversation A — ChatGPT"));
+        assert_eq!(tabs.tabs[0].title, "ChatGPT");
+        assert_eq!(tabs.tabs[1].title, "Conversation A — ChatGPT");
+        assert!(!tabs.update_title(2, "Conversation A — ChatGPT"));
+        assert!(tabs.update_title(2, "Conversation B — ChatGPT"));
+        assert_eq!(tabs.tabs[1].title, "Conversation B — ChatGPT");
+
+        assert!(tabs.update_title(2, "   "));
+        assert_eq!(tabs.tabs[1].title, "ChatGPT");
+        assert!(!tabs.update_title(2, ""));
+        assert!(!tabs.update_title(99, "Missing tab"));
+    }
+
+    #[test]
+    fn standby_title_is_retained_on_promotion() {
+        let mut tabs = TabManager::new();
+        let spec = ProjectSettings::default().default_tab_spec();
+        let id = 3;
+        let mut standby = TabContext::new(spec.clone());
+        standby.navigation = Some(standby_navigation::Navigation::new(spec.url.clone()));
+        tabs.contexts.insert(id, standby);
+
+        assert!(!tabs.update_title(id, "Background conversation — ChatGPT"));
+        assert!(tabs.tabs.is_empty());
+        assert_eq!(
+            tabs.contexts[&id].page_title,
+            "Background conversation — ChatGPT"
+        );
+
+        // Promotion must use the stored document title rather than the Project name.
+        let context = &tabs.contexts[&id];
+        tabs.tabs.push(TabInfo {
+            id,
+            title: context.page_title.clone(),
+            status: context.status,
+        });
+        assert_eq!(
+            tabs.snapshot().tabs[0].title,
+            "Background conversation — ChatGPT"
+        );
+        assert!(tabs.update_title(id, "Renamed conversation — ChatGPT"));
+        assert_eq!(tabs.tabs[0].title, "Renamed conversation — ChatGPT");
+    }
+
+    #[test]
+    fn standby_navigation_clears_previous_document_title() {
+        let spec = ProjectSettings::default().default_tab_spec();
+        let mut standby = TabContext::new(spec.clone());
+        standby.navigation = Some(standby_navigation::Navigation::new(spec.url.clone()));
+        standby.page_title = "Old project conversation — ChatGPT".to_string();
+
+        // Reusing the same target keeps the current document title.
+        let (navigate, _) = standby.adopt_standby_spec(spec.clone()).unwrap();
+        assert!(!navigate);
+        assert_eq!(standby.page_title, "Old project conversation — ChatGPT");
+
+        // Switching the standby WebView to a new URL resets the title until loaded.
+        let mut replacement = spec;
+        replacement.url = url::Url::parse("https://chatgpt.com/g/another-project").unwrap();
+        let (navigate, ready) = standby.adopt_standby_spec(replacement).unwrap();
+        assert!(navigate);
+        assert!(!ready);
+        assert_eq!(standby.page_title, "ChatGPT");
     }
 
     #[test]
