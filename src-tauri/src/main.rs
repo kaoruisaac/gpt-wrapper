@@ -35,19 +35,25 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
 use webview2_com::{
-    CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
-    Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, WebMessageReceivedEventHandler,
+    CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, ContextMenuRequestedEventHandler,
+    CustomItemSelectedEventHandler, ExecuteScriptCompletedHandler,
+    Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2, ICoreWebView2Environment9, ICoreWebView2_11, ICoreWebView2_2,
+        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+    },
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler, WebMessageReceivedEventHandler,
 };
 use windows::{
-    core::{HSTRING, PCWSTR, PWSTR},
+    core::{Interface, HSTRING, PCWSTR, PWSTR},
     Win32::UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
+        Shell::ShellExecuteW,
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, DestroyMenu, GetWindowPlacement, IsIconic,
             SetForegroundWindow, ShowWindow, TrackPopupMenuEx, MF_CHECKED, MF_STRING, SW_RESTORE,
-            SW_SHOWMAXIMIZED, TPM_LEFTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
-            WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+            SW_SHOWMAXIMIZED, SW_SHOWNORMAL, TPM_LEFTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD,
+            TPM_RIGHTALIGN, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
         },
     },
 };
@@ -1385,6 +1391,274 @@ fn handle_tab_page_load(
     }
 }
 
+// Links opened into a GPT Wrapper tab do not inherit the default Project prefix.
+fn link_tab_spec(link_uri: &str) -> Result<TabSpec, String> {
+    Ok(TabSpec {
+        url: project_settings::valid_url(link_uri)?,
+        title: project_settings::CHATGPT_TITLE.to_string(),
+        project_id: None,
+        message_prefix: String::new(),
+    })
+}
+
+// Only web links are sent outside the app. Never pass arbitrary URL schemes to the OS.
+fn external_link_url(link_uri: &str) -> Result<url::Url, String> {
+    project_settings::valid_url(link_uri)
+}
+
+// ShellExecuteW uses the user's Windows default browser. Run it off the WebView
+// event thread so link activation cannot stall WebView2 or Tauri's UI loop.
+fn open_in_system_browser(url: url::Url, tab_id: usize) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let wide_url: Vec<u16> = url
+            .as_str()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("open"),
+                PCWSTR(wide_url.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (result.0 as usize) <= 32 {
+            eprintln!("[gpt-wrapper] failed to open external link from tab {tab_id}: {url} (ShellExecuteW code {})", result.0 as usize);
+        }
+    });
+}
+
+#[cfg(test)]
+mod external_link_tests {
+    use super::*;
+
+    #[test]
+    fn new_tabs_use_clicked_urls_without_project_prefix() {
+        let spec = link_tab_spec("https://chatgpt.com/c/test?view=full#latest").unwrap();
+        assert_eq!(
+            spec.url.as_str(),
+            "https://chatgpt.com/c/test?view=full#latest"
+        );
+        assert_eq!(spec.project_id, None);
+        assert_eq!(spec.message_prefix, "");
+        assert_eq!(spec.title, project_settings::CHATGPT_TITLE);
+    }
+
+    #[test]
+    fn new_tabs_reject_non_web_urls() {
+        for url in [
+            "javascript:alert(1)",
+            "file:///C:/secret",
+            "mailto:user@example.com",
+        ] {
+            assert!(link_tab_spec(url).is_err(), "unexpected allowed URL: {url}");
+        }
+    }
+
+    #[test]
+    fn external_links_preserve_web_urls() {
+        assert_eq!(
+            external_link_url("https://chatgpt.com/c/test?view=full#latest")
+                .unwrap()
+                .as_str(),
+            "https://chatgpt.com/c/test?view=full#latest"
+        );
+        assert_eq!(
+            external_link_url("http://example.com/path")
+                .unwrap()
+                .as_str(),
+            "http://example.com/path"
+        );
+    }
+
+    #[test]
+    fn external_links_reject_non_web_urls() {
+        for url in [
+            "javascript:alert(1)",
+            "file:///C:/secret",
+            "mailto:user@example.com",
+            "https://",
+            "/relative",
+        ] {
+            assert!(
+                external_link_url(url).is_err(),
+                "unexpected allowed URL: {url}"
+            );
+        }
+    }
+}
+
+fn install_link_context_menu(
+    app: &AppHandle,
+    webview: &Webview,
+    tab_id: usize,
+) -> Result<(), String> {
+    let app = app.clone();
+    let setup_error = Arc::new(Mutex::new(None));
+    let setup_error_for_callback = Arc::clone(&setup_error);
+    webview
+        .with_webview(move |platform| {
+            let setup = (|| -> windows::core::Result<()> {
+                let core = unsafe { platform.controller().CoreWebView2()? };
+                let core11: ICoreWebView2_11 = core.cast()?;
+                let core2: ICoreWebView2_2 = core.cast()?;
+                let environment: ICoreWebView2Environment9 =
+                    unsafe { core2.Environment()? }.cast()?;
+
+                let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+                    // Leave the native menu unchanged unless a valid web link was clicked.
+                    let Some(args) = args else {
+                        return Ok(());
+                    };
+                    let result = (|| -> windows::core::Result<()> {
+                        let target = unsafe { args.ContextMenuTarget()? };
+                        let mut has_link = windows::core::BOOL::default();
+                        unsafe { target.HasLinkUri(&mut has_link)? };
+                        if !has_link.as_bool() {
+                            return Ok(());
+                        }
+
+                        let mut raw_link = PWSTR::null();
+                        unsafe { target.LinkUri(&mut raw_link)? };
+                        let link_uri = CoTaskMemPWSTR::from(raw_link).to_string();
+                        let Ok(spec) = link_tab_spec(&link_uri) else {
+                            return Ok(());
+                        };
+                        let url = spec.url.clone();
+                        let items = unsafe { args.MenuItems()? };
+
+                        // Remove the native "open in new window" action. WebView2 uses
+                        // this unlocalized Name regardless of the UI language.
+                        // A native new-tab action would also hit NewWindowRequested,
+                        // so replace it with our in-app tab action if it exists.
+                        let mut count = 0;
+                        unsafe { items.Count(&mut count)? };
+                        for index in (0..count).rev() {
+                            let existing = unsafe { items.GetValueAtIndex(index)? };
+                            let mut raw_name = PWSTR::null();
+                            unsafe { existing.Name(&mut raw_name)? };
+                            let name = CoTaskMemPWSTR::from(raw_name).to_string();
+                            if matches!(name.as_str(), "openLinkInNewWindow" | "openLinkInNewTab") {
+                                unsafe { items.RemoveValueAtIndex(index)? };
+                            }
+                        }
+
+                        let tab_label: Vec<u16> = "在新分頁中開啟連結\0".encode_utf16().collect();
+                        let tab_item = unsafe {
+                            environment.CreateContextMenuItem(
+                                PCWSTR(tab_label.as_ptr()),
+                                None,
+                                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+                            )?
+                        };
+                        let tab_app = app.clone();
+                        let tab_selected =
+                            CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+                                // add_child waits on the UI loop. Never create tabs inside
+                                // the WebView2 context-menu callback itself.
+                                let worker_app = tab_app.clone();
+                                let worker_spec = spec.clone();
+                                tauri::async_runtime::spawn_blocking(move || {
+                                    match create_tab_with_spec(&worker_app, worker_spec, false) {
+                                        Ok(_) => refresh_tab_host(&worker_app),
+                                        Err(error) => eprintln!(
+                                            "[gpt-wrapper] failed to open link in new tab: {error}"
+                                        ),
+                                    }
+                                });
+                                Ok(())
+                            }));
+                        let mut tab_selected_token = 0;
+                        unsafe {
+                            tab_item
+                                .add_CustomItemSelected(&tab_selected, &mut tab_selected_token)?
+                        };
+                        unsafe { items.InsertValueAtIndex(0, &tab_item)? };
+
+                        let label: Vec<u16> = "在預設瀏覽器開啟連結\0".encode_utf16().collect();
+                        let item = unsafe {
+                            environment.CreateContextMenuItem(
+                                PCWSTR(label.as_ptr()),
+                                None,
+                                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+                            )?
+                        };
+
+                        let selected =
+                            CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+                                open_in_system_browser(url.clone(), tab_id);
+                                Ok(())
+                            }));
+                        let mut selected_token = 0;
+                        unsafe { item.add_CustomItemSelected(&selected, &mut selected_token)? };
+
+                        unsafe { items.InsertValueAtIndex(1, &item)? };
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        eprintln!(
+                            "[gpt-wrapper] failed to extend context menu on tab {tab_id}: {error:?}"
+                        );
+                    }
+                    Ok(())
+                }));
+                let mut token = 0;
+                unsafe { core11.add_ContextMenuRequested(&handler, &mut token)? };
+                Ok(())
+            })();
+            if let Err(error) = setup {
+                *setup_error_for_callback.lock().unwrap() = Some(format!(
+                    "failed to install link context menu on tab {tab_id}: {error:?}"
+                ));
+            }
+        })
+        .map_err(|error| format!("failed to access WebView2 on tab {tab_id}: {error}"))?;
+    let result = setup_error.lock().unwrap().take();
+    result.map_or(Ok(()), Err)
+}
+
+fn install_external_new_window_handler(webview: &Webview, tab_id: usize) -> Result<(), String> {
+    let setup_error = Arc::new(Mutex::new(None));
+    let callback_error = Arc::clone(&setup_error);
+    webview
+        .with_webview(move |platform| {
+            let setup = (|| -> windows::core::Result<()> {
+                let core = unsafe { platform.controller().CoreWebView2()? };
+                let handler = NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
+                    let Some(args) = args else {
+                        return Ok(());
+                    };
+                    // Suppress WebView2's default popup even for unsupported schemes.
+                    unsafe { args.SetHandled(true)? };
+                    let mut raw_uri = PWSTR::null();
+                    unsafe { args.Uri(&mut raw_uri)? };
+                    let uri = CoTaskMemPWSTR::from(raw_uri).to_string();
+                    match external_link_url(&uri) {
+                        Ok(url) => open_in_system_browser(url, tab_id),
+                        Err(_) => eprintln!(
+                            "[gpt-wrapper] ignored non-web popup URL on tab {tab_id}: {uri}"
+                        ),
+                    }
+                    Ok(())
+                }));
+                let mut token = 0;
+                unsafe { core.add_NewWindowRequested(&handler, &mut token)? };
+                Ok(())
+            })();
+            if let Err(error) = setup {
+                *callback_error.lock().unwrap() = Some(format!(
+                    "failed to intercept new windows on tab {tab_id}: {error:?}"
+                ));
+            }
+        })
+        .map_err(|error| format!("failed to access WebView2 on tab {tab_id}: {error}"))?;
+    let result = setup_error.lock().unwrap().take();
+    result.map_or(Ok(()), Err)
+}
+
 fn create_chatgpt_webview(
     app_handle: &AppHandle,
     tab_id: usize,
@@ -1448,6 +1722,16 @@ fn create_chatgpt_webview(
     if let Err(error) = install_navigation_listener(app_handle, &webview, tab_id) {
         let _ = webview.close();
         return Err(error);
+    }
+
+    if let Err(error) = install_external_new_window_handler(&webview, tab_id) {
+        let _ = webview.close();
+        return Err(error);
+    }
+
+    // Keep the main browser usable even if an old WebView2 runtime lacks this API.
+    if let Err(error) = install_link_context_menu(app_handle, &webview, tab_id) {
+        eprintln!("[gpt-wrapper] link context menu unavailable on tab {tab_id}: {error}");
     }
 
     if let Err(error) = webview.navigate(chatgpt_url) {
