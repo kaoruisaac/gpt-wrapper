@@ -1,9 +1,10 @@
 {
   "name": "gpt-wrapper",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Windows Tauri app that keeps ChatGPT Web available as a push-to-talk dictation window.",
   "main": "index.js",
   "scripts": {
+    "version": "node scripts/update-version.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "tab-bar:build": "vite build --config vite.tab-bar.config.mts",
     "settings:build": "vite build --config vite.settings.config.mts",

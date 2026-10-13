@@ -6,6 +6,7 @@ mod general_settings;
 mod microphone_inventory;
 mod project_settings;
 mod shortcut_settings;
+mod standby_navigation;
 mod tab_completion_notifications;
 
 use ble_central::{BleCentral, ControlEvent};
@@ -21,7 +22,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -35,7 +36,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
 use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
-    Microsoft::Web::WebView2::Win32::ICoreWebView2, WebMessageReceivedEventHandler,
+    Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler, WebMessageReceivedEventHandler,
 };
 use windows::{
     core::{HSTRING, PCWSTR, PWSTR},
@@ -197,6 +199,8 @@ struct TabManager {
     next_tab_id: usize,
     standby_ptt_tab_id: Option<usize>,
     standby_ptt_ready: bool,
+    standby_debounce: standby_navigation::Debounce,
+    standby_target: Option<TabSpec>,
 }
 
 #[derive(Debug)]
@@ -206,6 +210,7 @@ struct TabContext {
     prefix_applied: bool,
     prefix_in_progress: bool,
     background_ptt_pending: bool,
+    navigation: Option<standby_navigation::Navigation>,
 }
 
 impl TabContext {
@@ -216,7 +221,24 @@ impl TabContext {
             prefix_applied: false,
             prefix_in_progress: false,
             background_ptt_pending: false,
+            navigation: None,
         }
+    }
+
+    fn adopt_standby_spec(&mut self, spec: TabSpec) -> Result<(bool, bool), String> {
+        let navigation = self
+            .navigation
+            .as_mut()
+            .ok_or("standby navigation is missing")?;
+        let navigate = navigation.prepare(spec.url.clone());
+        let ready = navigation.ready();
+        if self.spec != spec || navigate {
+            self.prefix_applied = false;
+            self.prefix_in_progress = false;
+            self.status = TabStatus::Fallback;
+        }
+        self.spec = spec;
+        Ok((navigate, ready))
     }
 }
 
@@ -230,6 +252,8 @@ impl TabManager {
             next_tab_id: 1,
             standby_ptt_tab_id: None,
             standby_ptt_ready: false,
+            standby_debounce: standby_navigation::Debounce::default(),
+            standby_target: None,
         }
     }
 
@@ -1069,6 +1093,11 @@ fn install_tab_status_listener(
                     }
                     return Ok(());
                 }
+                let page_ready = app_handle.state::<TabState>().lock().ok()
+                    .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c|
+                        c.navigation.as_ref().is_none_or(|n| n.ready())))
+                    .unwrap_or(false);
+                if !page_ready { return Ok(()); }
                 match decode_tab_status(&source, &raw) {
                     Ok(status) => {
                         #[cfg(debug_assertions)]
@@ -1105,6 +1134,217 @@ fn install_tab_status_listener(
     result.map_or(Ok(()), Err)
 }
 
+// WebView2 navigation IDs distinguish even A -> B -> A and duplicate completions.
+// Tauri's URL-only PageLoad callback cannot provide that guarantee.
+fn install_navigation_listener(
+    app: &AppHandle,
+    webview: &Webview,
+    tab_id: usize,
+) -> Result<(), String> {
+    let app = app.clone();
+    let setup_error = Arc::new(Mutex::new(None));
+    let callback_error = Arc::clone(&setup_error);
+    webview.with_webview(move |platform| {
+        let result = (|| -> windows::core::Result<()> {
+            let core = unsafe { platform.controller().CoreWebView2()? };
+            let starting_app = app.clone();
+            let starting = NavigationStartingEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()); };
+                let mut id = 0;
+                let mut uri = PWSTR::null();
+                unsafe { args.NavigationId(&mut id)?; args.Uri(&mut uri)?; }
+                let Ok(url) = url::Url::parse(&CoTaskMemPWSTR::from(uri).to_string()) else { return Ok(()); };
+                let accepted = {
+                    let state = starting_app.state::<TabState>();
+                    let Ok(mut tabs) = state.lock() else { return Ok(()); };
+                    let accepted = tabs.contexts.get_mut(&tab_id)
+                        .and_then(|c| c.navigation.as_mut())
+                        .is_some_and(|n| n.started(id, &url));
+                    let ready = tabs.contexts.get(&tab_id).and_then(|c| c.navigation.as_ref())
+                        .is_some_and(|n| n.ready());
+                    if !ready && tabs.standby_ptt_tab_id == Some(tab_id) {
+                        tabs.standby_ptt_ready = false;
+                    }
+                    accepted
+                };
+                if accepted {
+                    if let Some(webview) = get_tab_webview(&starting_app, tab_id) {
+                        handle_tab_page_load(&webview, tab_id, PageLoadEvent::Started, &url);
+                    }
+                }
+                Ok(())
+            }));
+            let completed = NavigationCompletedEventHandler::create(Box::new(move |sender, args| {
+                let (Some(sender), Some(args)) = (sender, args) else { return Ok(()); };
+                let mut id = 0;
+                let mut success = windows::core::BOOL::default();
+                let mut source = PWSTR::null();
+                unsafe { args.NavigationId(&mut id)?; args.IsSuccess(&mut success)?; sender.Source(&mut source)?; }
+                let Ok(url) = url::Url::parse(&CoTaskMemPWSTR::from(source).to_string()) else { return Ok(()); };
+                let accepted = app.state::<TabState>().lock().ok()
+                    .and_then(|mut tabs| tabs.contexts.get_mut(&tab_id)
+                        .and_then(|c| c.navigation.as_mut()).map(|n| n.finished(id, &url, success.as_bool())))
+                    .unwrap_or(false);
+                if accepted {
+                    eprintln!("[gpt-wrapper] standby navigation finished: tab={tab_id}, navigation={id}");
+                    if let Some(webview) = get_tab_webview(&app, tab_id) {
+                        handle_tab_page_load(&webview, tab_id, PageLoadEvent::Finished, &url);
+                    }
+                } else if !success.as_bool() {
+                    eprintln!("[gpt-wrapper] navigation failed/obsolete: tab={tab_id}, navigation={id}");
+                }
+                Ok(())
+            }));
+            let mut token = 0;
+            unsafe {
+                core.add_NavigationStarting(&starting, &mut token)?;
+                core.add_NavigationCompleted(&completed, &mut token)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result { *callback_error.lock().unwrap() = Some(error.to_string()); }
+    }).map_err(|error| error.to_string())?;
+    let error = setup_error.lock().unwrap().take();
+    error.map_or(Ok(()), Err)
+}
+
+fn handle_tab_page_load(
+    webview: &Webview,
+    tab_id: usize,
+    event: PageLoadEvent,
+    page_url: &url::Url,
+) {
+    if event == PageLoadEvent::Finished {
+        let current_spec = webview
+            .app_handle()
+            .state::<ProjectSettingsState>()
+            .snapshot()
+            .ok()
+            .map(|settings| settings.default_tab_spec());
+        let allowed = webview
+            .app_handle()
+            .state::<TabState>()
+            .lock()
+            .ok()
+            .is_some_and(|tabs| {
+                let Some(context) = tabs.contexts.get(&tab_id) else {
+                    return false;
+                };
+                let Some(navigation) = &context.navigation else {
+                    return true;
+                };
+                navigation.ready()
+                    && (tabs.standby_ptt_tab_id != Some(tab_id)
+                        || (tabs.standby_debounce.pending.is_none()
+                            && tabs
+                                .standby_target
+                                .as_ref()
+                                .is_none_or(|target| target == &context.spec)
+                            && current_spec.as_ref() == Some(&context.spec)))
+            });
+        if !allowed {
+            return;
+        }
+    }
+    if event == PageLoadEvent::Started {
+        webview
+            .app_handle()
+            .state::<microphone_inventory::MicrophoneRouting>()
+            .forget_tab(tab_id);
+        let was_loaded = webview
+            .app_handle()
+            .state::<TabState>()
+            .lock()
+            .map(|mut tabs| tabs.loaded_tabs.remove(&tab_id))
+            .unwrap_or(false);
+        if was_loaded {
+            webview.app_handle().state::<PttState>().0.clear_tab(tab_id);
+        }
+        reset_tab_status(webview.app_handle(), tab_id);
+        return;
+    }
+    if event != PageLoadEvent::Finished || page_url.path().ends_with(TAB_BOOTSTRAP_PATH) {
+        return;
+    }
+
+    if let Err(error) = microphone_inventory::sync_tab(webview.app_handle(), tab_id, &webview) {
+        eprintln!("[gpt-wrapper] failed to sync microphone selection on tab {tab_id}: {error}");
+    }
+    // Re-report the current DOM state after navigation even if the first event was missed.
+    if let Err(error) = webview.eval("window.__GPT_WRAPPER__?.reportStatus?.();") {
+        #[cfg(debug_assertions)]
+        eprintln!("[gpt-wrapper] status tab {tab_id}: snapshot request failed: {error:?}");
+    }
+    let app_handle = webview.app_handle();
+    let state = app_handle.state::<TabState>();
+    let (should_show, became_normal_loaded) = {
+        let Ok(mut tabs) = state.lock() else {
+            return;
+        };
+
+        if tabs.standby_ptt_tab_id == Some(tab_id) {
+            if tabs.standby_ptt_ready {
+                return;
+            }
+            tabs.standby_ptt_ready = true;
+            (false, false)
+        } else if tabs.tabs.iter().any(|tab| tab.id == tab_id) {
+            if !tabs.loaded_tabs.insert(tab_id) {
+                return;
+            }
+            (tabs.active_tab_id == Some(tab_id), true)
+        } else {
+            return;
+        }
+    };
+
+    let window = webview.window();
+    let Ok((width, content_height)) = content_size(&window) else {
+        return;
+    };
+
+    if !should_show {
+        let _ = webview.hide();
+    }
+
+    let _ = webview.set_position(LogicalPosition::new(0.0, TAB_BAR_HEIGHT));
+    let _ = webview.set_size(LogicalSize::new(width, content_height));
+
+    if should_show {
+        let _ = webview.show();
+        let _ = webview.set_focus();
+    }
+
+    if became_normal_loaded {
+        // The promoted page is now confirmed. Subsequent user navigation has
+        // the ordinary visible-tab semantics rather than a standby target gate.
+        if let Ok(mut tabs) = app_handle.state::<TabState>().lock() {
+            if let Some(context) = tabs.contexts.get_mut(&tab_id) {
+                context.navigation = None;
+            }
+        }
+        let tracker = Arc::clone(&app_handle.state::<PttState>().0);
+        let background_pending = app_handle
+            .state::<TabState>()
+            .lock()
+            .ok()
+            .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c| c.background_ptt_pending))
+            .unwrap_or(false);
+        if background_pending {
+            if let Some(generation) = tracker.current_generation(tab_id) {
+                begin_prefix_flow(
+                    app_handle,
+                    webview.clone(),
+                    tab_id,
+                    PrefixFlow::BackgroundPtt(generation),
+                );
+            }
+        } else {
+            begin_prefix_flow(app_handle, webview.clone(), tab_id, PrefixFlow::Normal);
+        }
+    }
+}
+
 fn create_chatgpt_webview(
     app_handle: &AppHandle,
     tab_id: usize,
@@ -1130,97 +1370,15 @@ fn create_chatgpt_webview(
     .background_color(LOADING_BACKGROUND)
     .focused(false)
     .on_page_load(move |webview, payload| {
-        if payload.event() == PageLoadEvent::Started {
-            webview
-                .app_handle()
-                .state::<microphone_inventory::MicrophoneRouting>()
-                .forget_tab(tab_id);
-            let was_loaded = webview
-                .app_handle()
-                .state::<TabState>()
-                .lock()
-                .map(|mut tabs| tabs.loaded_tabs.remove(&tab_id))
-                .unwrap_or(false);
-            if was_loaded {
-                webview.app_handle().state::<PttState>().0.clear_tab(tab_id);
-            }
-            reset_tab_status(webview.app_handle(), tab_id);
-            return;
-        }
-        if payload.event() != PageLoadEvent::Finished
-            || payload.url().path().ends_with(TAB_BOOTSTRAP_PATH)
-        {
-            return;
-        }
-
-        if let Err(error) = microphone_inventory::sync_tab(webview.app_handle(), tab_id, &webview) {
-            eprintln!("[gpt-wrapper] failed to sync microphone selection on tab {tab_id}: {error}");
-        }
-        // Re-report the current DOM state after navigation even if the first event was missed.
-        if let Err(error) = webview.eval("window.__GPT_WRAPPER__?.reportStatus?.();") {
-            #[cfg(debug_assertions)]
-            eprintln!("[gpt-wrapper] status tab {tab_id}: snapshot request failed: {error:?}");
-        }
-        let app_handle = webview.app_handle();
-        let state = app_handle.state::<TabState>();
-        let (should_show, became_normal_loaded) = {
-            let Ok(mut tabs) = state.lock() else {
-                return;
-            };
-
-            if tabs.standby_ptt_tab_id == Some(tab_id) {
-                if tabs.standby_ptt_ready {
-                    return;
-                }
-                tabs.standby_ptt_ready = true;
-                (false, false)
-            } else if tabs.tabs.iter().any(|tab| tab.id == tab_id) {
-                if !tabs.loaded_tabs.insert(tab_id) {
-                    return;
-                }
-                (tabs.active_tab_id == Some(tab_id), true)
-            } else {
-                return;
-            }
-        };
-
-        let window = webview.window();
-        let Ok((width, content_height)) = content_size(&window) else {
-            return;
-        };
-
-        if !should_show {
-            let _ = webview.hide();
-        }
-
-        let _ = webview.set_position(LogicalPosition::new(0.0, TAB_BAR_HEIGHT));
-        let _ = webview.set_size(LogicalSize::new(width, content_height));
-
-        if should_show {
-            let _ = webview.show();
-            let _ = webview.set_focus();
-        }
-
-        if became_normal_loaded {
-            let tracker = Arc::clone(&app_handle.state::<PttState>().0);
-            let background_pending = app_handle
-                .state::<TabState>()
-                .lock()
-                .ok()
-                .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c| c.background_ptt_pending))
-                .unwrap_or(false);
-            if background_pending {
-                if let Some(generation) = tracker.current_generation(tab_id) {
-                    begin_prefix_flow(
-                        app_handle,
-                        webview.clone(),
-                        tab_id,
-                        PrefixFlow::BackgroundPtt(generation),
-                    );
-                }
-            } else {
-                begin_prefix_flow(app_handle, webview.clone(), tab_id, PrefixFlow::Normal);
-            }
+        let managed = webview
+            .app_handle()
+            .state::<TabState>()
+            .lock()
+            .ok()
+            .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c| c.navigation.is_some()))
+            .unwrap_or(false);
+        if !managed {
+            handle_tab_page_load(&webview, tab_id, payload.event(), payload.url());
         }
     });
 
@@ -1240,6 +1398,11 @@ fn create_chatgpt_webview(
     }
 
     if let Err(error) = install_tab_status_listener(app_handle, &webview, tab_id) {
+        let _ = webview.close();
+        return Err(error);
+    }
+
+    if let Err(error) = install_navigation_listener(app_handle, &webview, tab_id) {
         let _ = webview.close();
         return Err(error);
     }
@@ -1303,6 +1466,205 @@ fn create_tab_with_spec(
     snapshot(app_handle)
 }
 
+fn schedule_standby_target(app: &AppHandle) -> Result<(), String> {
+    let spec = app
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .default_tab_spec();
+    let start_worker = {
+        let state = app.state::<TabState>();
+        let mut tabs = state.lock()?;
+        let id = tabs.standby_ptt_tab_id;
+        if id.is_none()
+            && !app
+                .state::<TrayVisibilityState>()
+                .tray_hidden
+                .load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        if let Some(id) = id {
+            if let Some(navigation) = tabs
+                .contexts
+                .get_mut(&id)
+                .and_then(|c| c.navigation.as_mut())
+            {
+                navigation.desired = spec.url.clone();
+            }
+            // Includes same-URL metadata changes: readiness is reconciled with
+            // the full spec when the debounce expires or PTT takes over.
+            tabs.standby_ptt_ready = false;
+        }
+        tabs.standby_target = Some(spec);
+        // Zero means create only if still tray-hidden with no standby at execution.
+        let start = tabs
+            .standby_debounce
+            .schedule(id.unwrap_or(0), Instant::now());
+        eprintln!(
+            "[gpt-wrapper] standby navigation scheduled: tab={id:?}, generation={}",
+            tabs.standby_debounce.generation
+        );
+        start
+    };
+    if start_worker {
+        spawn_standby_worker(app.clone());
+    }
+    Ok(())
+}
+
+// At most one sleeping worker or queued UI callback per app, irrespective of
+// key count. The deadline and generation are checked again on the UI thread.
+fn spawn_standby_worker(app: AppHandle) {
+    thread::spawn(move || loop {
+        let work = app.state::<TabState>().lock().ok().and_then(|mut tabs| {
+            match tabs.standby_debounce.pending {
+                Some((id, deadline)) => Some((id, deadline, tabs.standby_debounce.generation)),
+                None => {
+                    tabs.standby_debounce.worker_running = false;
+                    None
+                }
+            }
+        });
+        let Some((id, deadline, generation)) = work else {
+            return;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            thread::sleep(remaining.min(standby_navigation::DEBOUNCE));
+            continue;
+        }
+        let callback_app = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            let (execute, restart) = {
+                let state = callback_app.state::<TabState>();
+                let Ok(mut tabs) = state.lock() else {
+                    return;
+                };
+                let due = tabs.standby_debounce.due(generation, id, Instant::now());
+                let identity_matches = tabs.standby_ptt_tab_id.unwrap_or(0) == id;
+                let execute = due && identity_matches;
+                if due {
+                    tabs.standby_debounce.pending = None;
+                }
+                let restart = tabs.standby_debounce.pending.is_some();
+                tabs.standby_debounce.worker_running = restart;
+                (execute, restart)
+            };
+            if execute {
+                let result = if id == 0 {
+                    if callback_app
+                        .state::<TrayVisibilityState>()
+                        .tray_hidden
+                        .load(Ordering::SeqCst)
+                    {
+                        ensure_standby_ptt_tab(&callback_app)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    apply_standby_target(&callback_app).map(|_| ())
+                };
+                if let Err(error) = result {
+                    eprintln!("[gpt-wrapper] standby target update failed: {error}");
+                }
+            }
+            if restart {
+                spawn_standby_worker(callback_app);
+            }
+        }) {
+            eprintln!("[gpt-wrapper] standby UI dispatch failed: {error}");
+            if let Ok(mut tabs) = app.state::<TabState>().lock() {
+                tabs.standby_debounce.worker_running = false;
+            }
+        }
+        return;
+    });
+}
+
+// All callers run on the UI thread. Never hold TabState across WebView operations.
+fn apply_standby_target(app: &AppHandle) -> Result<usize, String> {
+    let spec = app
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .default_tab_spec();
+    let (id, navigate) = {
+        let state = app.state::<TabState>();
+        let mut tabs = state.lock()?;
+        let id = tabs
+            .standby_ptt_tab_id
+            .ok_or("standby PTT tab is missing")?;
+        let context = tabs
+            .contexts
+            .get_mut(&id)
+            .ok_or("standby context is missing")?;
+        let (navigate, ready) = context.adopt_standby_spec(spec.clone())?;
+        tabs.standby_target = Some(spec.clone());
+        tabs.standby_ptt_ready = ready;
+        if !ready {
+            tabs.loaded_tabs.remove(&id);
+        }
+        (id, navigate)
+    };
+    let webview = get_tab_webview(app, id).ok_or("standby WebView is missing")?;
+    if navigate {
+        eprintln!("[gpt-wrapper] standby navigation started: tab={id}");
+        // Ready/load flags were reset before navigate can invoke callbacks.
+        app.state::<microphone_inventory::MicrophoneRouting>()
+            .forget_tab(id);
+        // Cancel the old document/request before issuing another URL, including
+        // an old request whose NavigationStarting has not arrived yet.
+        let stop_error = Arc::new(Mutex::new(None));
+        let callback_error = Arc::clone(&stop_error);
+        webview
+            .with_webview(move |platform| {
+                let result = unsafe {
+                    platform
+                        .controller()
+                        .CoreWebView2()
+                        .and_then(|core| core.Stop())
+                };
+                if let Err(error) = result {
+                    *callback_error.lock().unwrap() = Some(error.to_string());
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        if let Some(error) = stop_error.lock().unwrap().take() {
+            if let Ok(mut tabs) = app.state::<TabState>().lock() {
+                if let Some(n) = tabs
+                    .contexts
+                    .get_mut(&id)
+                    .and_then(|c| c.navigation.as_mut())
+                {
+                    n.fail();
+                }
+            }
+            return Err(format!(
+                "failed to stop obsolete standby navigation: {error}"
+            ));
+        }
+        if let Err(error) = webview.navigate(spec.url) {
+            if let Ok(mut tabs) = app.state::<TabState>().lock() {
+                tabs.standby_ptt_ready = false;
+                if let Some(n) = tabs
+                    .contexts
+                    .get_mut(&id)
+                    .and_then(|c| c.navigation.as_mut())
+                {
+                    n.fail();
+                }
+            }
+            return Err(format!("standby navigation failed on tab {id}: {error}"));
+        }
+    } else {
+        eprintln!("[gpt-wrapper] standby navigation reused: tab={id}");
+        let ready = app.state::<TabState>().lock()?.standby_ptt_ready;
+        if ready {
+            handle_tab_page_load(&webview, id, PageLoadEvent::Finished, &spec.url);
+        }
+    }
+    Ok(id)
+}
+
 fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
     let spec = app_handle
         .state::<ProjectSettingsState>()
@@ -1319,11 +1681,13 @@ fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
         tabs.next_tab_id += 1;
         tabs.standby_ptt_tab_id = Some(tab_id);
         tabs.standby_ptt_ready = false;
-        tabs.contexts.insert(tab_id, TabContext::new(spec.clone()));
+        let mut context = TabContext::new(spec.clone());
+        context.navigation = Some(standby_navigation::Navigation::new(spec.url.clone()));
+        tabs.contexts.insert(tab_id, context);
         tab_id
     };
 
-    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url) {
+    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url.clone()) {
         let mut tabs = state.lock()?;
         if tabs.standby_ptt_tab_id == Some(tab_id) {
             tabs.standby_ptt_tab_id = None;
@@ -1334,6 +1698,16 @@ fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
         return Err(error);
     }
 
+    // A settings write may have overlapped the first WebView creation. Convert
+    // any newer target into a normal debounce against this newly assigned ID.
+    if app_handle
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .default_tab_spec()
+        != spec
+    {
+        schedule_standby_target(app_handle)?;
+    }
     println!("[gpt-wrapper] standby PTT tab {tab_id} warming in background");
     Ok(())
 }
@@ -1345,6 +1719,8 @@ fn discard_standby_ptt_tab(app_handle: &AppHandle) {
             return;
         };
 
+        tabs.standby_debounce.cancel();
+        tabs.standby_target = None;
         let standby_id = tabs.standby_ptt_tab_id.take();
         tabs.standby_ptt_ready = false;
         if let Some(tab_id) = standby_id {
@@ -1364,6 +1740,14 @@ fn discard_standby_ptt_tab(app_handle: &AppHandle) {
 }
 
 fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), String> {
+    {
+        app_handle
+            .state::<TabState>()
+            .lock()?
+            .standby_debounce
+            .cancel();
+    }
+    apply_standby_target(app_handle)?;
     let current_spec = app_handle
         .state::<ProjectSettingsState>()
         .snapshot()?
@@ -1389,6 +1773,8 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
 
         let previous_active = tabs.active_tab_id;
         let ready = tabs.standby_ptt_ready;
+        tabs.standby_debounce.cancel();
+        tabs.standby_target = None;
         tabs.standby_ptt_tab_id = None;
         tabs.standby_ptt_ready = false;
         let context = tabs
@@ -1396,6 +1782,9 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
             .get_mut(&standby_id)
             .ok_or("standby context missing")?;
         context.background_ptt_pending = true;
+        if ready {
+            context.navigation = None;
+        }
         let title = context.spec.title.clone();
         let status = context.status;
         tabs.tabs.push(TabInfo {
@@ -1735,18 +2124,8 @@ fn update_project_settings(
 ) -> Result<ProjectSettings, String> {
     let (settings, default_changed) = app.state::<ProjectSettingsState>().update(change)?;
     if default_changed {
-        let has_standby = app.state::<TabState>().lock()?.standby_ptt_tab_id.is_some();
-        if has_standby {
-            discard_standby_ptt_tab(app);
-        }
-        if app
-            .state::<TrayVisibilityState>()
-            .tray_hidden
-            .load(Ordering::SeqCst)
-        {
-            if let Err(error) = ensure_standby_ptt_tab(app) {
-                eprintln!("[gpt-wrapper] failed to refresh standby PTT tab: {error}");
-            }
+        if let Err(error) = schedule_standby_target(app) {
+            eprintln!("[gpt-wrapper] failed to schedule persisted standby target: {error}");
         }
     }
     Ok(settings)
@@ -3427,6 +3806,50 @@ fn main() {
 #[cfg(test)]
 mod ptt_tests {
     use super::*;
+
+    #[test]
+    fn standby_same_url_adopts_full_spec_and_resets_prefix_without_navigation() {
+        let mut spec = ProjectSettings::default().default_tab_spec();
+        spec.project_id = Some(Uuid::new_v4());
+        spec.message_prefix = "old".into();
+        let mut context = TabContext::new(spec.clone());
+        let mut navigation = standby_navigation::Navigation::new(spec.url.clone());
+        assert!(navigation.started(1, &spec.url));
+        assert!(navigation.finished(1, &spec.url, true));
+        context.navigation = Some(navigation);
+        context.prefix_applied = true;
+        context.prefix_in_progress = true;
+        spec.project_id = Some(Uuid::new_v4());
+        spec.title = "Updated".into();
+        spec.message_prefix = "new".into();
+        assert_eq!(context.adopt_standby_spec(spec.clone()), Ok((false, true)));
+        assert_eq!(context.spec, spec);
+        assert!(!context.prefix_applied);
+        assert!(!context.prefix_in_progress);
+        assert!(!context.background_ptt_pending);
+    }
+
+    #[test]
+    fn standby_spec_change_during_loading_never_reuses_old_prefix_or_ready() {
+        let spec = ProjectSettings::default().default_tab_spec();
+        let mut context = TabContext::new(spec.clone());
+        let mut navigation = standby_navigation::Navigation::new(spec.url.clone());
+        assert!(navigation.started(1, &spec.url));
+        context.navigation = Some(navigation);
+        context.prefix_applied = true;
+        let mut target = spec.clone();
+        target.url = url::Url::parse("https://chatgpt.com/g/new/project").unwrap();
+        target.message_prefix = "new".into();
+        assert_eq!(
+            context.adopt_standby_spec(target.clone()),
+            Ok((true, false))
+        );
+        let navigation = context.navigation.as_mut().unwrap();
+        assert!(!navigation.finished(1, &spec.url, true));
+        assert!(!navigation.ready());
+        assert_eq!(context.spec, target);
+        assert!(!context.prefix_applied);
+    }
 
     #[test]
     fn repeat_launch_ignores_autostart_but_foregrounds_manual_launch() {

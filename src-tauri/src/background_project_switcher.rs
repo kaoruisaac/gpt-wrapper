@@ -1,4 +1,4 @@
-//! Tray-only Explicit Submit switcher. No ChatGPT tab or PTT target is touched here.
+//! Tray-only Explicit Submit switcher; standby navigation is scheduled separately.
 use std::{
     sync::Mutex,
     thread,
@@ -104,12 +104,14 @@ fn attempt_hide(
 
 pub struct BackgroundProjectSwitcherState {
     session: Mutex<Session>,
+    press_gate: Mutex<()>,
 }
 
 impl BackgroundProjectSwitcherState {
     pub fn new() -> Self {
         Self {
             session: Mutex::new(Session::default()),
+            press_gate: Mutex::new(()),
         }
     }
 }
@@ -386,30 +388,27 @@ pub fn dismiss(app: &AppHandle) {
 pub fn press(app: &AppHandle) {
     let state = app.state::<BackgroundProjectSwitcherState>();
     let (generation, label) = {
-        let Ok(mut session) = state.session.lock() else {
-            eprintln!("[gpt-wrapper] Project switch session unavailable");
+        // Serialize key/BLE selection transactions without holding the Toast
+        // session lock during disk I/O. This gate is released before any UI work.
+        let Ok(_press) = state.press_gate.lock() else {
             return;
         };
-        let settings = match app.state::<ProjectSettingsState>().snapshot() {
-            Ok(settings) => settings,
-            Err(error) => {
-                eprintln!("[gpt-wrapper] failed to read Project settings: {error}");
-                return;
-            }
-        };
         let now = Instant::now();
-        let continuing_session = session.active(now);
+        let (continuing_session, previous_generation) = {
+            let Ok(session) = state.session.lock() else {
+                return;
+            };
+            (session.active(now), session.generation)
+        };
         let result = if continuing_session {
-            let next = next_id(&settings);
-            if next != settings.default_project_id {
-                update_project_settings(app, |settings| {
-                    crate::project_settings::set_default(settings, next)
-                })
-            } else {
-                Ok(settings)
-            }
+            update_project_settings(app, |settings| {
+                // Compute the next selection inside the settings transaction,
+                // so concurrent Settings edits cannot supply a stale next ID.
+                let next = next_id(settings);
+                crate::project_settings::set_default(settings, next)
+            })
         } else {
-            Ok(settings)
+            app.state::<ProjectSettingsState>().snapshot()
         };
         let label = match result {
             Ok(settings) => label_for(&settings),
@@ -419,7 +418,14 @@ pub fn press(app: &AppHandle) {
                 "Unable to switch project".to_string()
             }
         };
-        let generation = session.update(Instant::now(), label.clone());
+        let Ok(mut session) = state.session.lock() else {
+            return;
+        };
+        // Tray Open/PTT may have dismissed the session during persistence.
+        if session.generation != previous_generation {
+            return;
+        }
+        let generation = session.update(now, label.clone());
         #[cfg(debug_assertions)]
         eprintln!(
             "[gpt-wrapper] toast press: generation={generation}, continuing_session={continuing_session}, deadline_reset_ms=3000"
