@@ -209,7 +209,7 @@
         state.sendClicked = false;
         state.lastClickedText = null;
       }
-      // A queued BLE Submit belongs to the whole draft, including later segments.
+      // A queued device Submit belongs to the whole draft, including later segments.
       if (!state.sendRequested) cancelTimer();
       state.before = composerText();
       state.activeSegment = true;
@@ -217,7 +217,7 @@
       if (!state.sendRequested) state.lastClickedText = null;
     },
 
-    // Both keyboard and BLE PTT use the same completion tracking. The native
+    // Both keyboard and device PTT use the same completion tracking. The native
     // send-on-finish fallback must not also enqueue a second Send click.
     finishPttSegment(nativeSent = false) {
       state.activeSegment = false;
@@ -255,7 +255,7 @@
 
     requestExplicitSend() {
       // A completed Send must not block later manually typed drafts, while
-      // a still-identical composer is guarded against duplicate BLE/key taps.
+      // a still-identical composer is guarded against duplicate device/key taps.
       clearSubmittedDraftGuardIfChanged();
       if (state.sendRequested || state.timer !== null) {
         console.info("[gpt-wrapper] duplicate Submit request ignored");

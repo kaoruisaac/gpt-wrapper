@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod background_project_switcher;
-mod ble_central;
+mod devices;
 mod general_settings;
 mod microphone_inventory;
 mod project_settings;
@@ -9,7 +9,6 @@ mod shortcut_settings;
 mod standby_navigation;
 mod tab_completion_notifications;
 
-use ble_central::{BleCentral, ControlEvent};
 use general_settings::GeneralSettingsState;
 use project_settings::{ProjectSettings, ProjectSettingsState, TabSpec};
 use serde::{Deserialize, Serialize};
@@ -357,9 +356,11 @@ struct PttTracker {
     held: AtomicBool,
     owner: Mutex<Option<PttSource>>,
     target_tab_id: Mutex<Option<usize>>,
-    ble_target_tab_id: Mutex<Option<usize>>,
-    ble_send_tab_id: Mutex<Option<usize>>,
-    ble_submit_pending: AtomicBool,
+    device_target_tab_id: Mutex<Option<usize>>,
+    device_send_tab_id: Mutex<Option<usize>>,
+    device_submit_pending: AtomicBool,
+    device_suppress_send: AtomicBool,
+    device_finish_generation: AtomicUsize,
     generation: AtomicUsize,
     scheduled_generation: AtomicUsize,
     clicked_generation: AtomicUsize,
@@ -393,23 +394,29 @@ enum ClickGuard {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Session semantics are independent of a transport. Device is reserved for the
+// authenticated Wi-Fi adapter, never the retired Android GATT protocol.
+// Before dispatch, that adapter must validate selected device, authenticated
+// session, sequence, press epoch and Submit intent (Phase 0 integration contract).
+#[allow(dead_code)]
 enum PttSource {
     Keyboard,
-    Ble,
+    Device,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // BLE transport connects these control events in Phase 2.
+#[allow(dead_code)] // Legacy queued event remains supported alongside captured X1 intent.
 enum PttEvent {
     Down(PttSource),
     Up(PttSource),
-    SubmitBle,
+    SubmitDevice,
+    SubmitDeviceAt(Option<usize>),
     SubmitKeyboard(Option<usize>),
-    CancelBle,
+    CancelDevice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BleSubmitTarget {
+enum DeviceSubmitTarget {
     Queued,
     Busy,
     Tab(usize),
@@ -422,9 +429,11 @@ impl PttTracker {
             held: AtomicBool::new(false),
             owner: Mutex::new(None),
             target_tab_id: Mutex::new(None),
-            ble_target_tab_id: Mutex::new(None),
-            ble_send_tab_id: Mutex::new(None),
-            ble_submit_pending: AtomicBool::new(false),
+            device_target_tab_id: Mutex::new(None),
+            device_send_tab_id: Mutex::new(None),
+            device_submit_pending: AtomicBool::new(false),
+            device_suppress_send: AtomicBool::new(false),
+            device_finish_generation: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
             scheduled_generation: AtomicUsize::new(0),
             clicked_generation: AtomicUsize::new(0),
@@ -446,7 +455,7 @@ impl PttTracker {
             && self.start_in_flight.load(Ordering::SeqCst) == 0
             && self.finish_in_flight.load(Ordering::SeqCst) == 0
             && self.recovery_in_flight.load(Ordering::SeqCst) == 0
-            && !self.ble_submit_pending.load(Ordering::SeqCst)
+            && !self.device_submit_pending.load(Ordering::SeqCst)
             && self
                 .deferred_events
                 .lock()
@@ -507,10 +516,10 @@ impl PttTracker {
             return false;
         }
         self.clear_recovery_needed(tab_id);
-        self.ble_submit_pending.store(false, Ordering::SeqCst);
+        self.device_submit_pending.store(false, Ordering::SeqCst);
         let was_released = events
             .iter()
-            .any(|event| matches!(event, PttEvent::Up(_) | PttEvent::CancelBle));
+            .any(|event| matches!(event, PttEvent::Up(_) | PttEvent::CancelDevice));
         if !can_start || was_released {
             self.clear_tab(tab_id);
             return false;
@@ -530,15 +539,20 @@ impl PttTracker {
     fn clear_deferred_submits(&self) {
         if let Ok(mut events) = self.deferred_events.lock() {
             events.retain(|event| {
-                !matches!(event, PttEvent::SubmitBle | PttEvent::SubmitKeyboard(_))
+                !matches!(
+                    event,
+                    PttEvent::SubmitDevice
+                        | PttEvent::SubmitDeviceAt(_)
+                        | PttEvent::SubmitKeyboard(_)
+                )
             });
         }
     }
 
     fn defer_during_finish(&self, event: PttEvent) -> bool {
-        // A BLE disconnect must cancel an earlier BLE draft even while a
+        // A device disconnect must cancel an earlier device draft even while a
         // keyboard-owned Start is waiting for its DOM callback.
-        if event == PttEvent::CancelBle
+        if event == PttEvent::CancelDevice
             && self
                 .owner
                 .lock()
@@ -551,19 +565,22 @@ impl PttTracker {
             return true;
         };
         if self.finish_in_flight.load(Ordering::SeqCst) == 0
-            && !(matches!(event, PttEvent::Up(_) | PttEvent::CancelBle)
-                && self.start_in_flight.load(Ordering::SeqCst) != 0)
+            && !(matches!(
+                event,
+                PttEvent::Up(_) | PttEvent::CancelDevice | PttEvent::SubmitDeviceAt(_)
+            ) && self.start_in_flight.load(Ordering::SeqCst) != 0)
         {
             return false;
         }
-        // A disconnect invalidates any queued BLE button edges and Submit.
-        if event == PttEvent::CancelBle {
+        // A disconnect invalidates any queued device button edges and Submit.
+        if event == PttEvent::CancelDevice {
             events.retain(|queued| {
                 !matches!(
                     queued,
-                    PttEvent::Down(PttSource::Ble)
-                        | PttEvent::Up(PttSource::Ble)
-                        | PttEvent::SubmitBle
+                    PttEvent::Down(PttSource::Device)
+                        | PttEvent::Up(PttSource::Device)
+                        | PttEvent::SubmitDevice
+                        | PttEvent::SubmitDeviceAt(_)
                 )
             });
         }
@@ -606,12 +623,13 @@ impl PttTracker {
         if let Ok(mut target) = self.target_tab_id.lock() {
             *target = Some(tab_id);
         }
-        if source == PttSource::Ble {
-            if let Ok(mut target) = self.ble_target_tab_id.lock() {
+        if source == PttSource::Device {
+            if let Ok(mut target) = self.device_target_tab_id.lock() {
                 *target = Some(tab_id);
             }
-            self.ble_submit_pending.store(false, Ordering::SeqCst);
-            if let Ok(mut send_target) = self.ble_send_tab_id.lock() {
+            self.device_submit_pending.store(false, Ordering::SeqCst);
+            self.device_suppress_send.store(false, Ordering::SeqCst);
+            if let Ok(mut send_target) = self.device_send_tab_id.lock() {
                 *send_target = None;
             }
         }
@@ -632,40 +650,73 @@ impl PttTracker {
             tab_id,
             generation,
             start_clicked: self.clicked_generation.load(Ordering::SeqCst) == generation,
-            submit_pending: source == PttSource::Ble
-                && self.ble_submit_pending.swap(false, Ordering::SeqCst),
+            submit_pending: source == PttSource::Device
+                && self.device_submit_pending.swap(false, Ordering::SeqCst),
         })
     }
 
-    fn request_ble_submit(&self) -> BleSubmitTarget {
+    fn request_device_submit(&self) -> DeviceSubmitTarget {
         let Ok(owner) = self.owner.lock() else {
-            return BleSubmitTarget::None;
+            return DeviceSubmitTarget::None;
         };
-        if *owner == Some(PttSource::Ble) {
-            self.ble_submit_pending.store(true, Ordering::SeqCst);
-            return BleSubmitTarget::Queued;
+        if *owner == Some(PttSource::Device) {
+            self.device_submit_pending.store(true, Ordering::SeqCst);
+            return DeviceSubmitTarget::Queued;
         }
         if owner.is_some() {
-            return BleSubmitTarget::Busy;
+            return DeviceSubmitTarget::Busy;
         }
-        if let Some(tab_id) = self.ble_send_tab_id.lock().ok().and_then(|target| *target) {
-            return BleSubmitTarget::Tab(tab_id);
+        if let Some(tab_id) = self
+            .device_send_tab_id
+            .lock()
+            .ok()
+            .and_then(|target| *target)
+        {
+            return DeviceSubmitTarget::Tab(tab_id);
         }
         let tab_id = self
-            .ble_target_tab_id
+            .device_target_tab_id
             .lock()
             .ok()
             .and_then(|mut target| target.take());
         if let Some(tab_id) = tab_id {
-            self.note_ble_send(tab_id);
+            self.note_device_send(tab_id);
         }
         tab_id
-            .map(BleSubmitTarget::Tab)
-            .unwrap_or(BleSubmitTarget::None)
+            .map(DeviceSubmitTarget::Tab)
+            .unwrap_or(DeviceSubmitTarget::None)
     }
 
-    fn note_ble_send(&self, tab_id: usize) {
-        if let Ok(mut target) = self.ble_send_tab_id.lock() {
+    fn capture_independent_device_submit(&self, active: Option<usize>) -> DeviceSubmitTarget {
+        let Ok(owner) = self.owner.lock() else {
+            return DeviceSubmitTarget::Busy;
+        };
+        if *owner == Some(PttSource::Keyboard) {
+            return DeviceSubmitTarget::Busy;
+        }
+        if *owner == Some(PttSource::Device) {
+            return self
+                .target_tab_id
+                .lock()
+                .ok()
+                .and_then(|t| *t)
+                .map(DeviceSubmitTarget::Tab)
+                .unwrap_or(DeviceSubmitTarget::Busy);
+        }
+        let finishing = self.finish_in_flight.load(Ordering::SeqCst);
+        if finishing != 0 {
+            if self.device_finish_generation.load(Ordering::SeqCst) != finishing {
+                return DeviceSubmitTarget::Busy;
+            }
+            return DeviceSubmitTarget::Tab(self.finish_tab_id.load(Ordering::SeqCst));
+        }
+        active
+            .map(DeviceSubmitTarget::Tab)
+            .unwrap_or(DeviceSubmitTarget::None)
+    }
+
+    fn note_device_send(&self, tab_id: usize) {
+        if let Ok(mut target) = self.device_send_tab_id.lock() {
             *target = Some(tab_id);
         }
     }
@@ -674,12 +725,12 @@ impl PttTracker {
         let Ok(mut owner) = self.owner.lock() else {
             return;
         };
-        if let Ok(mut target) = self.ble_target_tab_id.lock() {
+        if let Ok(mut target) = self.device_target_tab_id.lock() {
             if *target == Some(tab_id) {
                 *target = None;
             }
         }
-        if let Ok(mut target) = self.ble_send_tab_id.lock() {
+        if let Ok(mut target) = self.device_send_tab_id.lock() {
             if *target == Some(tab_id) {
                 *target = None;
             }
@@ -697,7 +748,7 @@ impl PttTracker {
             if let Ok(mut target) = self.target_tab_id.lock() {
                 *target = None;
             }
-            self.ble_submit_pending.store(false, Ordering::SeqCst);
+            self.device_submit_pending.store(false, Ordering::SeqCst);
             self.start_in_flight.store(0, Ordering::SeqCst);
             self.recovery_in_flight.store(0, Ordering::SeqCst);
             if let Ok(mut events) = self.deferred_events.lock() {
@@ -715,9 +766,9 @@ impl PttTracker {
         self.clear_recovery_needed(tab_id);
     }
 
-    fn cancel_ble(&self) -> Option<PttCancel> {
+    fn cancel_device(&self) -> Option<PttCancel> {
         let mut owner = self.owner.lock().ok()?;
-        let was_held = *owner == Some(PttSource::Ble);
+        let was_held = *owner == Some(PttSource::Device);
         let start_clicked = was_held
             && self.clicked_generation.load(Ordering::SeqCst)
                 == self.generation.load(Ordering::SeqCst);
@@ -730,14 +781,14 @@ impl PttTracker {
                 events.clear();
             }
         }
-        self.ble_submit_pending.store(false, Ordering::SeqCst);
+        self.device_submit_pending.store(false, Ordering::SeqCst);
         let held_tab = if was_held {
             self.target_tab_id.lock().ok()?.take()
         } else {
             None
         };
-        let target_tab = self.ble_target_tab_id.lock().ok()?.take();
-        let send_tab = self.ble_send_tab_id.lock().ok()?.take();
+        let target_tab = self.device_target_tab_id.lock().ok()?.take();
+        let send_tab = self.device_send_tab_id.lock().ok()?.take();
         held_tab
             .or(send_tab)
             .or(target_tab)
@@ -1293,6 +1344,7 @@ fn handle_tab_page_load(
         }
     }
     if event == PageLoadEvent::Started {
+        devices::runtime::tab_invalidated(webview.app_handle(), tab_id);
         webview
             .app_handle()
             .state::<microphone_inventory::MicrophoneRouting>()
@@ -2190,6 +2242,7 @@ fn switch_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnaps
 }
 
 fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapshot, String> {
+    devices::runtime::tab_invalidated(app_handle, tab_id);
     app_handle.state::<PttState>().0.clear_tab(tab_id);
     let state = app_handle.state::<TabState>();
     let (was_active, replacement) = {
@@ -2538,42 +2591,6 @@ fn set_ptt_auto_submit_enabled(
 }
 
 #[tauri::command]
-fn ble_status(app: AppHandle, webview: Webview) -> Result<ble_central::Snapshot, String> {
-    ensure_settings_webview(&webview)?;
-    app.state::<BleCentral>().snapshot()
-}
-
-#[tauri::command]
-fn ble_enable(app: AppHandle, webview: Webview, enabled: bool) -> Result<(), String> {
-    ensure_settings_webview(&webview)?;
-    app.state::<BleCentral>().enable(enabled)
-}
-
-#[tauri::command]
-fn ble_scan(app: AppHandle, webview: Webview) -> Result<(), String> {
-    ensure_settings_webview(&webview)?;
-    app.state::<BleCentral>().scan()
-}
-
-#[tauri::command]
-fn ble_approve(app: AppHandle, webview: Webview, id: String) -> Result<(), String> {
-    ensure_settings_webview(&webview)?;
-    app.state::<BleCentral>().approve(id)
-}
-
-#[tauri::command]
-fn ble_disconnect(app: AppHandle, webview: Webview) -> Result<(), String> {
-    ensure_settings_webview(&webview)?;
-    app.state::<BleCentral>().disconnect()
-}
-
-#[tauri::command]
-fn ble_forget(app: AppHandle, webview: Webview) -> Result<(), String> {
-    ensure_settings_webview(&webview)?;
-    app.state::<BleCentral>().forget()
-}
-
-#[tauri::command]
 fn set_autostart_enabled(app: AppHandle, webview: Webview, enabled: bool) -> Result<bool, String> {
     ensure_settings_webview(&webview)?;
 
@@ -2744,7 +2761,7 @@ fn restore_main_window_from_tray(app_handle: &AppHandle) {
 }
 
 // A regular second launch should foreground the existing instance instead of
-// initializing another tray icon, BLE client, shortcut registry, or set of tabs.
+// initializing another tray icon, shortcut registry, or set of tabs.
 fn second_instance_requests_foreground(args: &[String]) -> bool {
     !args.iter().skip(1).any(|arg| arg == AUTOSTART_ARG)
 }
@@ -2837,9 +2854,9 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
             TRAY_OPEN_ID => restore_main_window_from_tray(app_handle),
             TRAY_SETTINGS_ID => open_settings_window(app_handle),
             TRAY_QUIT_ID => {
+                app_handle.state::<devices::Devices>().stop();
                 background_project_switcher::dismiss(app_handle);
                 quitting_for_menu.store(true, Ordering::SeqCst);
-                app_handle.state::<BleCentral>().quit();
                 discard_standby_ptt_tab(app_handle);
                 app_handle.exit(0);
             }
@@ -2914,6 +2931,11 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                             }
                             _ => {}
                         }
+                        if rect.native_send {
+                            if let Some(ClickGuard::Finish(tracker,app,tab,generation,_,_))=&guard {
+                                if tracker.device_finish_generation.load(Ordering::SeqCst)==*generation && !devices::runtime::send_allowed(app,*tab,*generation) {return Ok(());}
+                            }
+                        }
                         println!(
                             "[gpt-wrapper] trusted click dispatch requested {:?} at ({:.1}, {:.1}); recording/delivery unverified",
                             target, rect.x, rect.y
@@ -2983,12 +3005,16 @@ fn complete_finish(
     stopped: bool,
     native_sent: bool,
 ) {
+    let device_finish = tracker.device_finish_generation.load(Ordering::SeqCst) == generation;
+    let device_send_allowed =
+        !device_finish || devices::runtime::send_allowed(&app, tab_id, generation);
+    devices::runtime::revoke_route(&app, Some((tab_id, generation)));
     let Some(events) = tracker.finish_completed(generation) else {
         return;
     };
     if !stopped {
-        if events.contains(&PttEvent::CancelBle) {
-            let _ = tracker.cancel_ble();
+        if events.contains(&PttEvent::CancelDevice) {
+            let _ = tracker.cancel_device();
         }
         tracker.clear_tab(tab_id);
         tracker.mark_recovery_needed(tab_id);
@@ -3003,7 +3029,7 @@ fn complete_finish(
         );
         return;
     }
-    let disconnected = events.contains(&PttEvent::CancelBle);
+    let disconnected = events.contains(&PttEvent::CancelDevice) || !device_send_allowed;
     tracker.clear_recovery_needed(tab_id);
     if let Some(tab) = get_tab_webview(&app, tab_id) {
         if disconnected {
@@ -3012,7 +3038,7 @@ fn complete_finish(
             let script = format!("window.__GPT_WRAPPER__?.finishPttSegment?.({native_sent});");
             let _ = tab.eval(&script);
             if submit_pending {
-                tracker.note_ble_send(tab_id);
+                tracker.note_device_send(tab_id);
             }
             if should_send_after_finish(auto_submit, submit_pending, native_sent, disconnected) {
                 request_explicit_send(&app, tab_id);
@@ -3020,9 +3046,20 @@ fn complete_finish(
         }
     }
     for event in events {
+        if disconnected
+            && device_finish
+            && matches!(event, PttEvent::SubmitDevice | PttEvent::SubmitDeviceAt(_))
+        {
+            continue;
+        }
         // A second Submit pressed while native Finish was still resolving
         // belongs to the same already-sent dictation, not a second message.
-        if native_sent && matches!(event, PttEvent::SubmitBle | PttEvent::SubmitKeyboard(_)) {
+        if native_sent
+            && matches!(
+                event,
+                PttEvent::SubmitDevice | PttEvent::SubmitDeviceAt(_) | PttEvent::SubmitKeyboard(_)
+            )
+        {
             continue;
         }
         handle_ptt_event(&app, event, &tracker);
@@ -3033,6 +3070,7 @@ fn fail_start(app: AppHandle, tracker: Arc<PttTracker>, tab_id: usize, generatio
     if tracker.start_completed(generation).is_none() {
         return;
     }
+    devices::runtime::revoke_route(&app, Some((tab_id, generation)));
     tracker.clear_tab(tab_id);
     tracker.mark_recovery_needed(tab_id);
     if let Some(tab) = get_tab_webview(&app, tab_id) {
@@ -3077,6 +3115,7 @@ fn verify_start_visible(
         let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
             if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(Some(_))) {
                 if let Some(events) = tracker.start_completed(generation) {
+                    devices::runtime::started(&app, tab_id, generation);
                     for event in events {
                         handle_ptt_event(&app, event, &tracker);
                     }
@@ -3221,9 +3260,10 @@ fn watch_finish_callback(
         let app = app_handle.clone();
         let _ = app_handle.run_on_main_thread(move || {
             if let Some(events) = tracker.finish_completed(generation) {
-                if events.contains(&PttEvent::CancelBle) {
-                    let _ = tracker.cancel_ble();
+                if events.contains(&PttEvent::CancelDevice) {
+                    let _ = tracker.cancel_device();
                 }
+                devices::runtime::revoke_route(&app, Some((tab_id, generation)));
                 tracker.clear_tab(tab_id);
                 tracker.mark_recovery_needed(tab_id);
                 if let Some(tab) = get_tab_webview(&app, tab_id) {
@@ -3247,6 +3287,14 @@ fn schedule_ptt_start(
     generation: usize,
     _consider_started_immediately: bool,
 ) {
+    if tracker
+        .owner
+        .lock()
+        .is_ok_and(|o| *o == Some(PttSource::Device))
+        && !devices::runtime::prepare_route(webview.app_handle(), tab_id, generation)
+    {
+        return;
+    }
     if !tracker.claim_start(tab_id, generation) {
         return;
     }
@@ -3444,7 +3492,7 @@ fn probe_ptt_recovery(
     }
 }
 
-// Both the BLE Submit signal and the Ctrl+. shortcut invoke this same WebView action.
+// Both the device Submit signal and the Ctrl+. shortcut invoke this same WebView action.
 // The DOM adapter checks the draft, dictation state, Send button and duplicate requests.
 fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
     if !is_tab_loaded(app_handle, tab_id) {
@@ -3461,7 +3509,8 @@ fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
     }
 }
 
-// BLE transport dispatches control events, never synthetic keyboard shortcuts.
+// Keyboard dispatch and authenticated X1 device input converge here. Device input
+// crosses the session/selection/sequence boundary in devices::runtime first.
 fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTracker>) {
     // Tray-only Submit must never borrow a pending PTT target or a deferred Send.
     // Run before the foreground defer/target routing; this path needs no active tab.
@@ -3469,7 +3518,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
         .state::<TrayVisibilityState>()
         .tray_hidden
         .load(Ordering::SeqCst)
-        && matches!(event, PttEvent::SubmitKeyboard(_) | PttEvent::SubmitBle)
+        && matches!(event, PttEvent::SubmitKeyboard(_) | PttEvent::SubmitDevice)
     {
         if tracker.safe_for_background_switch() {
             background_project_switcher::press(app_handle);
@@ -3596,9 +3645,11 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 });
                 return;
             }
-            if let Err(reason) = microphone_inventory::ptt_start_guard(app_handle, tab_id) {
-                microphone_inventory::show_ptt_error(app_handle, Some(tab_id), &reason);
-                return;
+            if source == PttSource::Keyboard {
+                if let Err(reason) = microphone_inventory::ptt_start_guard(app_handle, tab_id) {
+                    microphone_inventory::show_ptt_error(app_handle, Some(tab_id), &reason);
+                    return;
+                }
             }
             let Some(generation) = tracker.begin(source, tab_id) else {
                 return;
@@ -3617,12 +3668,21 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 return;
             };
 
+            if source == PttSource::Device {
+                tracker
+                    .device_finish_generation
+                    .store(finish.generation, Ordering::SeqCst);
+            }
             if !finish.start_clicked {
+                devices::runtime::revoke_route(
+                    app_handle,
+                    Some((finish.tab_id, finish.generation)),
+                );
                 println!(
                     "[gpt-wrapper] PTT released before dictation Start click on tab {}",
                     finish.tab_id
                 );
-                if source == PttSource::Ble {
+                if source == PttSource::Device {
                     tracker.clear_tab(finish.tab_id);
                 }
                 return;
@@ -3636,13 +3696,16 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 return;
             };
 
-            // Read the setting for both keyboard and BLE releases, using the
-            // state at release time. A queued BLE Submit is an explicit intent.
-            let auto_submit = app_handle
-                .state::<GeneralSettingsState>()
-                .ptt_auto_submit()
-                .unwrap_or(false);
-            let allow_native_send = auto_submit || finish.submit_pending;
+            // Read the setting for both keyboard and device releases, using the
+            // state at release time. A queued device Submit is an explicit intent.
+            let suppressed =
+                source == PttSource::Device && tracker.device_suppress_send.load(Ordering::SeqCst);
+            let auto_submit = !suppressed
+                && app_handle
+                    .state::<GeneralSettingsState>()
+                    .ptt_auto_submit()
+                    .unwrap_or(false);
+            let allow_native_send = !suppressed && (auto_submit || finish.submit_pending);
             println!(
                 "[gpt-wrapper] hotkey released on tab {}; auto submit: {auto_submit}",
                 finish.tab_id
@@ -3660,7 +3723,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                     finish.tab_id,
                     finish.generation,
                     auto_submit,
-                    finish.submit_pending,
+                    !suppressed && finish.submit_pending,
                 )),
             );
             watch_finish_callback(
@@ -3670,41 +3733,50 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 finish.generation,
             );
         }
-        PttEvent::SubmitBle => {
-            match tracker.request_ble_submit() {
-                BleSubmitTarget::Queued => println!("[gpt-wrapper] BLE Submit queued for held PTT"),
-                BleSubmitTarget::Busy => {
-                    eprintln!("[gpt-wrapper] BLE Submit refused while keyboard PTT is held")
-                }
-                BleSubmitTarget::Tab(tab_id) => {
-                    if tracker.recovery_needed(tab_id) {
-                        eprintln!("[gpt-wrapper] BLE Submit blocked on uncertain tab {tab_id}; retry PTT recovery");
-                    } else {
+        PttEvent::SubmitDeviceAt(tab_id) => {
+            if !tracker.is_held() {
+                if let Some(tab_id) = tab_id {
+                    if !tracker.recovery_needed(tab_id) {
                         request_explicit_send(app_handle, tab_id);
-                    }
-                }
-                BleSubmitTarget::None => {
-                    if app_handle
-                        .state::<TrayVisibilityState>()
-                        .tray_hidden
-                        .load(Ordering::SeqCst)
-                    {
-                        eprintln!("[gpt-wrapper] BLE Submit refused: no target while tray-hidden");
-                    } else if let Some(tab_id) = active_tab_id(app_handle) {
-                        if is_tab_loaded(app_handle, tab_id)
-                            && get_tab_webview(app_handle, tab_id).is_some()
-                        {
-                            if tracker.recovery_needed(tab_id) {
-                                eprintln!("[gpt-wrapper] BLE Submit blocked on uncertain active tab {tab_id}");
-                            } else {
-                                tracker.note_ble_send(tab_id);
-                                request_explicit_send(app_handle, tab_id);
-                            }
-                        }
                     }
                 }
             }
         }
+        PttEvent::SubmitDevice => match tracker.request_device_submit() {
+            DeviceSubmitTarget::Queued => {
+                println!("[gpt-wrapper] device Submit queued for held PTT")
+            }
+            DeviceSubmitTarget::Busy => {
+                eprintln!("[gpt-wrapper] device Submit refused while keyboard PTT is held")
+            }
+            DeviceSubmitTarget::Tab(tab_id) => {
+                if tracker.recovery_needed(tab_id) {
+                    eprintln!("[gpt-wrapper] device Submit blocked on uncertain tab {tab_id}; retry PTT recovery");
+                } else {
+                    request_explicit_send(app_handle, tab_id);
+                }
+            }
+            DeviceSubmitTarget::None => {
+                if app_handle
+                    .state::<TrayVisibilityState>()
+                    .tray_hidden
+                    .load(Ordering::SeqCst)
+                {
+                    eprintln!("[gpt-wrapper] device Submit refused: no target while tray-hidden");
+                } else if let Some(tab_id) = active_tab_id(app_handle) {
+                    if is_tab_loaded(app_handle, tab_id)
+                        && get_tab_webview(app_handle, tab_id).is_some()
+                    {
+                        if tracker.recovery_needed(tab_id) {
+                            eprintln!("[gpt-wrapper] device Submit blocked on uncertain active tab {tab_id}");
+                        } else {
+                            tracker.note_device_send(tab_id);
+                            request_explicit_send(app_handle, tab_id);
+                        }
+                    }
+                }
+            }
+        },
         PttEvent::SubmitKeyboard(tab_id) => {
             if tracker.is_held() {
                 eprintln!(
@@ -3720,8 +3792,8 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 eprintln!("[gpt-wrapper] foreground Submit refused: no active tab");
             }
         }
-        PttEvent::CancelBle => {
-            if let Some(cancel) = tracker.cancel_ble() {
+        PttEvent::CancelDevice => {
+            if let Some(cancel) = tracker.cancel_device() {
                 if let Some(webview) = get_tab_webview(app_handle, cancel.tab_id) {
                     let _ = webview.eval("window.__GPT_WRAPPER__?.cancelExplicitSend?.();");
                     if cancel.start_clicked {
@@ -3954,6 +4026,9 @@ fn main() {
             },
         ))
         .invoke_handler(tauri::generate_handler![
+            devices::devices_snapshot,
+            devices::devices_action,
+            devices::devices_wifi,
             get_tabs,
             create_tab,
             create_project_tab,
@@ -3971,12 +4046,6 @@ fn main() {
             microphone_inventory::get_preferred_microphone,
             microphone_inventory::set_preferred_microphone,
             microphone_inventory::list_microphone_inputs,
-            ble_status,
-            ble_enable,
-            ble_scan,
-            ble_approve,
-            ble_disconnect,
-            ble_forget,
             get_project_settings,
             create_project,
             edit_project,
@@ -4002,6 +4071,10 @@ fn main() {
             app.manage(background_project_switcher::BackgroundProjectSwitcherState::new());
             app.manage(tab_completion_notifications::NotificationState::new());
             app.manage(SettingsWindowState::new());
+            app.manage(devices::Devices::start(
+                app.path().app_config_dir()?.join("esp32-pairs.dpapi"),
+                app.handle().clone(),
+            )?);
             let project_settings_path: PathBuf =
                 app.path().app_config_dir()?.join("project-settings.json");
             app.manage(ProjectSettingsState::load(project_settings_path));
@@ -4011,23 +4084,6 @@ fn main() {
                 app.path().app_config_dir()?.join("shortcut-settings.json");
             app.manage(ShortcutSettingsState::load(shortcut_settings_path));
             app.manage(KeyboardShortcutState::new());
-            let ble_app = app.handle().clone();
-            let ble_tracker = Arc::clone(&ptt_tracker);
-            let ble_path = app.path().app_config_dir()?.join("ble-controller.json");
-            app.manage(BleCentral::start(ble_path, move |control| {
-                let app = ble_app.clone();
-                let tracker = Arc::clone(&ble_tracker);
-                let _ = ble_app.run_on_main_thread(move || {
-                    let event = match control {
-                        ControlEvent::Down => PttEvent::Down(PttSource::Ble),
-                        ControlEvent::Up => PttEvent::Up(PttSource::Ble),
-                        ControlEvent::Submit => PttEvent::SubmitBle,
-                        ControlEvent::Cancel => PttEvent::CancelBle,
-                    };
-                    handle_ptt_event(&app, event, &tracker);
-                });
-            }));
-
             let window = WindowBuilder::new(app, MAIN_WINDOW_LABEL)
                 .title("GPT Wrapper")
                 .background_color(LOADING_BACKGROUND)
@@ -4126,8 +4182,22 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running GPT Wrapper");
+        .build(tauri::generate_context!())
+        .expect("error while building GPT Wrapper")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Some(devices) = app.try_state::<devices::Devices>() {
+                    devices.stop();
+                    devices::runtime::revoke_route(app, None);
+                    if let Some(ptt) = app.try_state::<PttState>() {
+                        handle_ptt_event(app, PttEvent::CancelDevice, &ptt.0);
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -4225,7 +4295,7 @@ mod ptt_tests {
     }
 
     #[test]
-    fn keyboard_and_ble_share_ptt_send_policy() {
+    fn keyboard_and_device_share_ptt_send_policy() {
         // Both sources must use this same policy; the explicit Submit button
         // remains independent of Settings, including when pressed during PTT.
         assert!(!should_send_after_finish(false, false, false, false));
@@ -4239,12 +4309,12 @@ mod ptt_tests {
     fn background_switch_only_runs_when_ptt_and_finish_are_idle() {
         let ptt = PttTracker::new();
         assert!(ptt.safe_for_background_switch());
-        let generation = ptt.begin(PttSource::Ble, 7).unwrap();
+        let generation = ptt.begin(PttSource::Device, 7).unwrap();
         assert!(!ptt.safe_for_background_switch());
-        ptt.ble_submit_pending.store(true, Ordering::SeqCst);
+        ptt.device_submit_pending.store(true, Ordering::SeqCst);
         assert!(!ptt.safe_for_background_switch());
-        ptt.ble_submit_pending.store(false, Ordering::SeqCst);
-        ptt.finish(PttSource::Ble);
+        ptt.device_submit_pending.store(false, Ordering::SeqCst);
+        ptt.finish(PttSource::Device);
         ptt.finish_in_flight.store(generation, Ordering::SeqCst);
         assert!(!ptt.safe_for_background_switch());
         ptt.finish_in_flight.store(0, Ordering::SeqCst);
@@ -4265,7 +4335,7 @@ mod ptt_tests {
         assert!(ptt.recovery_needed(9));
         assert!(!ptt.recovery_needed(11));
         assert!(ptt.safe_for_background_switch());
-        assert!(ptt.begin(PttSource::Ble, 11).is_some());
+        assert!(ptt.begin(PttSource::Device, 11).is_some());
         assert!(ptt.is_held());
         ptt.clear_tab(11);
         assert!(ptt.safe_for_background_switch());
@@ -4302,12 +4372,12 @@ mod ptt_tests {
     fn safe_recovery_stop_never_restarts_or_replays_submit() {
         let ptt = PttTracker::new();
         ptt.mark_recovery_needed(4);
-        let generation = ptt.begin_recovery(PttSource::Ble, 4).unwrap();
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Queued);
+        let generation = ptt.begin_recovery(PttSource::Device, 4).unwrap();
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Queued);
         assert!(!ptt.complete_recovery(4, generation, false));
         assert!(!ptt.is_held());
         assert!(!ptt.recovery_needed(4));
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::None);
         assert!(ptt.safe_for_background_switch());
         assert!(!ptt.abort_recovery(4, generation), "late watchdog ignored");
     }
@@ -4316,8 +4386,8 @@ mod ptt_tests {
     fn recovery_abort_is_bounded_and_old_generation_cannot_clear_new_attempt() {
         let ptt = PttTracker::new();
         ptt.mark_recovery_needed(3);
-        let generation = ptt.begin_recovery(PttSource::Ble, 3).unwrap();
-        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        let generation = ptt.begin_recovery(PttSource::Device, 3).unwrap();
+        assert!(ptt.defer_during_finish(PttEvent::CancelDevice));
         assert!(ptt.abort_recovery(3, generation));
         assert!(ptt.recovery_needed(3));
         assert!(!ptt.is_held());
@@ -4349,15 +4419,15 @@ mod ptt_tests {
         ptt.finish(PttSource::Keyboard);
         ptt.finish_in_flight.store(generation, Ordering::SeqCst);
         assert!(ptt.defer_during_finish(PttEvent::SubmitKeyboard(Some(4))));
-        assert!(ptt.defer_during_finish(PttEvent::SubmitBle));
-        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Ble)));
+        assert!(ptt.defer_during_finish(PttEvent::SubmitDevice));
+        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Device)));
         ptt.clear_deferred_submits();
         assert_eq!(
             ptt.finish_completed(generation)
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![PttEvent::Down(PttSource::Ble)]
+            vec![PttEvent::Down(PttSource::Device)]
         );
     }
 
@@ -4366,9 +4436,9 @@ mod ptt_tests {
         let ptt = PttTracker::new();
         let generation = ptt.begin(PttSource::Keyboard, 4).unwrap();
         assert!(ptt.begin(PttSource::Keyboard, 4).is_none());
-        assert!(ptt.begin(PttSource::Ble, 5).is_none());
-        assert!(ptt.finish(PttSource::Ble).is_none());
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Busy);
+        assert!(ptt.begin(PttSource::Device, 5).is_none());
+        assert!(ptt.finish(PttSource::Device).is_none());
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Busy);
         assert!(ptt.mark_start_clicked(4, generation));
         let finish = ptt.finish(PttSource::Keyboard).unwrap();
         assert_eq!(finish.tab_id, 4);
@@ -4378,93 +4448,112 @@ mod ptt_tests {
     }
 
     #[test]
-    fn ble_segments_keep_target_until_submit_and_queue_only_once() {
+    fn legacy_queued_submit_keeps_its_session_target_and_new_submit_captures_active_tab() {
         let ptt = PttTracker::new();
-        let first = ptt.begin(PttSource::Ble, 7).unwrap();
+        let first = ptt.begin(PttSource::Device, 7).unwrap();
         assert!(ptt.mark_start_clicked(7, first));
-        assert!(!ptt.finish(PttSource::Ble).unwrap().submit_pending);
-        let second = ptt.begin(PttSource::Ble, 7).unwrap();
+        assert!(!ptt.finish(PttSource::Device).unwrap().submit_pending);
+        let second = ptt.begin(PttSource::Device, 7).unwrap();
         assert!(ptt.mark_start_clicked(7, second));
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Queued);
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Queued);
-        assert!(ptt.finish(PttSource::Ble).unwrap().submit_pending);
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Tab(7));
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Tab(7));
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Queued);
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Queued);
+        assert!(ptt.finish(PttSource::Device).unwrap().submit_pending);
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Tab(7));
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Tab(7));
+        assert_eq!(
+            ptt.capture_independent_device_submit(Some(9)),
+            DeviceSubmitTarget::Tab(9)
+        );
+        ptt.finish_in_flight.store(second, Ordering::SeqCst);
+        ptt.finish_tab_id.store(7, Ordering::SeqCst);
+        ptt.device_finish_generation.store(second, Ordering::SeqCst);
+        assert_eq!(
+            ptt.capture_independent_device_submit(Some(9)),
+            DeviceSubmitTarget::Tab(7)
+        );
+        ptt.device_finish_generation.store(0, Ordering::SeqCst);
+        assert_eq!(
+            ptt.capture_independent_device_submit(Some(9)),
+            DeviceSubmitTarget::Busy
+        );
     }
 
     #[test]
     fn disconnect_and_tab_close_invalidate_only_owned_work() {
         let ptt = PttTracker::new();
         ptt.begin(PttSource::Keyboard, 2).unwrap();
-        assert!(ptt.cancel_ble().is_none());
+        assert!(ptt.cancel_device().is_none());
         assert!(ptt.is_held());
         ptt.finish(PttSource::Keyboard);
 
-        ptt.note_ble_send(11);
+        ptt.note_device_send(11);
         let keyboard_generation = ptt.begin(PttSource::Keyboard, 2).unwrap();
         ptt.start_in_flight
             .store(keyboard_generation, Ordering::SeqCst);
-        assert!(!ptt.defer_during_finish(PttEvent::CancelBle));
-        assert_eq!(ptt.cancel_ble().unwrap().tab_id, 11);
+        assert!(!ptt.defer_during_finish(PttEvent::CancelDevice));
+        assert_eq!(ptt.cancel_device().unwrap().tab_id, 11);
         assert!(
             ptt.is_held(),
-            "BLE disconnect must not release keyboard PTT"
+            "device disconnect must not release keyboard PTT"
         );
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::Busy);
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::Busy);
         assert!(ptt.start_completed(keyboard_generation).unwrap().is_empty());
         ptt.finish(PttSource::Keyboard);
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::None);
 
-        let generation = ptt.begin(PttSource::Ble, 3).unwrap();
-        let cancel = ptt.cancel_ble().unwrap();
+        let generation = ptt.begin(PttSource::Device, 3).unwrap();
+        let cancel = ptt.cancel_device().unwrap();
         assert_eq!(cancel.tab_id, 3);
         assert!(!cancel.start_clicked);
         assert!(!ptt.is_current(3, generation));
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
-        ptt.begin(PttSource::Ble, 5).unwrap();
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::None);
+        ptt.begin(PttSource::Device, 5).unwrap();
         ptt.clear_tab(5);
         assert!(!ptt.is_held());
-        assert_eq!(ptt.request_ble_submit(), BleSubmitTarget::None);
+        assert_eq!(ptt.request_device_submit(), DeviceSubmitTarget::None);
 
-        let generation = ptt.begin(PttSource::Ble, 6).unwrap();
+        let generation = ptt.begin(PttSource::Device, 6).unwrap();
         assert!(ptt.mark_start_clicked(6, generation));
-        let cancel = ptt.cancel_ble().unwrap();
+        let cancel = ptt.cancel_device().unwrap();
         assert_eq!(cancel.tab_id, 6);
         assert!(cancel.start_clicked);
     }
 
     #[test]
-    fn delayed_finish_orders_next_session_and_disconnect_drops_ble_edges() {
+    fn delayed_finish_orders_next_session_and_disconnect_drops_device_edges() {
         let ptt = PttTracker::new();
-        let first = ptt.begin(PttSource::Ble, 7).unwrap();
+        let first = ptt.begin(PttSource::Device, 7).unwrap();
         assert!(ptt.mark_start_clicked(7, first));
-        ptt.finish(PttSource::Ble).unwrap();
+        ptt.finish(PttSource::Device).unwrap();
         ptt.finish_tab_id.store(7, Ordering::SeqCst);
         ptt.finish_in_flight.store(first, Ordering::SeqCst);
-        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Ble)));
-        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Ble)));
+        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Device)));
+        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Device)));
         assert_eq!(
             ptt.finish_completed(first)
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![PttEvent::Down(PttSource::Ble), PttEvent::Up(PttSource::Ble)]
+            vec![
+                PttEvent::Down(PttSource::Device),
+                PttEvent::Up(PttSource::Device)
+            ]
         );
 
-        let second = ptt.begin(PttSource::Ble, 7).unwrap();
+        let second = ptt.begin(PttSource::Device, 7).unwrap();
         assert!(second > first);
         assert!(ptt.mark_start_clicked(7, second));
-        ptt.finish(PttSource::Ble).unwrap();
+        ptt.finish(PttSource::Device).unwrap();
         ptt.finish_in_flight.store(second, Ordering::SeqCst);
-        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Ble)));
-        assert!(ptt.defer_during_finish(PttEvent::SubmitBle));
-        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert!(ptt.defer_during_finish(PttEvent::Down(PttSource::Device)));
+        assert!(ptt.defer_during_finish(PttEvent::SubmitDevice));
+        assert!(ptt.defer_during_finish(PttEvent::CancelDevice));
         assert_eq!(
             ptt.finish_completed(second)
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![PttEvent::CancelBle]
+            vec![PttEvent::CancelDevice]
         );
     }
 
@@ -4476,23 +4565,55 @@ mod ptt_tests {
         ptt.finish(PttSource::Keyboard).unwrap();
         ptt.finish_in_flight.store(generation, Ordering::SeqCst);
         assert!(ptt.defer_during_finish(PttEvent::SubmitKeyboard(Some(4))));
-        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert!(ptt.defer_during_finish(PttEvent::CancelDevice));
         assert_eq!(
             ptt.finish_completed(generation)
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![PttEvent::SubmitKeyboard(Some(4)), PttEvent::CancelBle],
-            "Ctrl+. retains the pressed tab and BLE cleanup cannot discard it",
+            vec![PttEvent::SubmitKeyboard(Some(4)), PttEvent::CancelDevice],
+            "Ctrl+. retains the pressed tab and device cleanup cannot discard it",
+        );
+    }
+
+    #[test]
+    fn captured_hardware_submit_keeps_target_and_is_removed_by_cancel_barrier() {
+        let ptt = PttTracker::new();
+        let generation = ptt.begin(PttSource::Device, 7).unwrap();
+        ptt.finish(PttSource::Device).unwrap();
+        ptt.finish_tab_id.store(7, Ordering::SeqCst);
+        ptt.finish_in_flight.store(generation, Ordering::SeqCst);
+        ptt.device_finish_generation
+            .store(generation, Ordering::SeqCst);
+        let DeviceSubmitTarget::Tab(tab) = ptt.capture_independent_device_submit(Some(9)) else {
+            panic!("expected captured session tab");
+        };
+        assert!(ptt.defer_during_finish(PttEvent::SubmitDeviceAt(Some(tab))));
+        assert_eq!(
+            ptt.finish_completed(generation)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::SubmitDeviceAt(Some(7))]
+        );
+        ptt.finish_in_flight.store(generation, Ordering::SeqCst);
+        assert!(ptt.defer_during_finish(PttEvent::SubmitDeviceAt(Some(7))));
+        assert!(ptt.defer_during_finish(PttEvent::CancelDevice));
+        assert_eq!(
+            ptt.finish_completed(generation)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![PttEvent::CancelDevice]
         );
     }
 
     #[test]
     fn closing_finish_tab_invalidates_its_pending_callback() {
         let ptt = PttTracker::new();
-        let generation = ptt.begin(PttSource::Ble, 8).unwrap();
+        let generation = ptt.begin(PttSource::Device, 8).unwrap();
         assert!(ptt.mark_start_clicked(8, generation));
-        ptt.finish(PttSource::Ble).unwrap();
+        ptt.finish(PttSource::Device).unwrap();
         ptt.finish_tab_id.store(8, Ordering::SeqCst);
         ptt.finish_in_flight.store(generation, Ordering::SeqCst);
         ptt.clear_tab(8);
@@ -4502,16 +4623,16 @@ mod ptt_tests {
     #[test]
     fn release_and_disconnect_wait_for_delayed_start_observation() {
         let ptt = PttTracker::new();
-        let generation = ptt.begin(PttSource::Ble, 9).unwrap();
+        let generation = ptt.begin(PttSource::Device, 9).unwrap();
         ptt.start_in_flight.store(generation, Ordering::SeqCst);
-        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Ble)));
-        assert!(ptt.defer_during_finish(PttEvent::CancelBle));
+        assert!(ptt.defer_during_finish(PttEvent::Up(PttSource::Device)));
+        assert!(ptt.defer_during_finish(PttEvent::CancelDevice));
         assert_eq!(
             ptt.start_completed(generation)
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![PttEvent::CancelBle]
+            vec![PttEvent::CancelDevice]
         );
     }
 }

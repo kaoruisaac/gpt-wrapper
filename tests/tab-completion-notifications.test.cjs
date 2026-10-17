@@ -89,4 +89,7 @@ render([{ ...a, faded: true }]);
 assert.deepEqual(container.children.map((card) => card.dataset.key), ["1:17"]);
 render([]);
 assert.equal(container.children.length, 0);
+render([{ tabId: 0, generation: 20, device: true, title: "ESP32 已離線", faded: false }]);
+assert.equal(container.children[0].children[0].textContent, "裝置連線中斷");
+assert.equal(container.children[0].children[1].textContent, "ESP32 已離線");
 console.log("tab completion notification UI tests passed");

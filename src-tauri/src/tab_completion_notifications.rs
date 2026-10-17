@@ -44,6 +44,7 @@ fn transition(old: TabStatus, new: TabStatus, visible: bool) -> Transition {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Card {
+    device: bool,
     tab_id: usize,
     generation: u64,
     title: String,
@@ -76,7 +77,7 @@ impl Store {
     fn clear(&mut self) -> bool {
         let changed = !self.pending.is_empty() || !self.cards.is_empty();
         self.pending.clear();
-        self.cards.clear();
+        self.cards.retain(|card| card.device);
         changed
     }
 
@@ -98,6 +99,7 @@ impl Store {
         self.cards.insert(
             0,
             Card {
+                device: false,
                 tab_id,
                 generation,
                 title,
@@ -243,6 +245,24 @@ pub fn clear_all(app: &AppHandle) {
     if changed {
         schedule_render(app);
     }
+}
+
+// Slot zero is reserved: actual Tab IDs start at one. Device notices remain
+// visible in the foreground, but share the existing non-activating card HWND.
+pub fn device_notice(app: &AppHandle, interrupted: bool) {
+    if let Ok(mut store) = app.state::<NotificationState>().0.lock() {
+        let generation = store.prepare(0);
+        let title = if interrupted {
+            "ESP32 聽寫已中斷；未送出。請檢查 Devices，放開 PTT 後重試。"
+        } else {
+            "ESP32 已離線。請檢查電源與 Wi-Fi；恢復後會重新驗證。"
+        };
+        store.finish(0, generation, title.into(), true);
+        if let Some(card) = store.cards.first_mut() {
+            card.device = true;
+        }
+    }
+    schedule_render(app);
 }
 
 pub fn dismiss_card(app: &AppHandle, tab_id: usize, generation: u64) {
@@ -445,7 +465,7 @@ fn render_on_ui_thread(app: &AppHandle) {
         .and_then(|_| place(&window, store.cards.len()))
         .and_then(|_| {
             // The window could gain focus elsewhere while its WebView was initializing.
-            if !can_notify(app) {
+            if !can_notify(app) && !store.cards.iter().any(|card| card.device) {
                 Err("main window regained focus".into())
             } else {
                 show_without_activation(&window)
@@ -475,6 +495,21 @@ fn render_on_ui_thread(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_clear_keeps_device_notice_and_discards_tab_completion() {
+        let mut s = Store::default();
+        let g = s.prepare(0);
+        s.finish(0, g, "device".into(), true);
+        s.cards[0].device = true;
+        let g = s.prepare(1);
+        s.finish(1, g, "tab".into(), true);
+        s.clear();
+        assert_eq!(s.cards.len(), 1);
+        assert!(s.cards[0].device);
+        assert!(s.dismiss(0, s.cards[0].generation));
+        assert!(s.cards.is_empty());
+    }
 
     #[test]
     fn only_visible_dom_working_exit_is_candidate() {
@@ -566,6 +601,7 @@ mod tests {
     #[test]
     fn title_is_json_encoded_and_never_injected_as_markup() {
         let card = Card {
+            device: false,
             tab_id: 1,
             generation: 42,
             title: "</script>\";alert(1);//".into(),

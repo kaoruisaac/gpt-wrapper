@@ -45,7 +45,7 @@
             card.dataset.key = key;
             const heading = document.createElement("div");
             heading.className = "heading";
-            heading.textContent = "回覆已完成";
+            heading.textContent = entry.device ? "裝置連線中斷" : "回覆已完成";
             const name = document.createElement("div");
             name.className = "name";
             name.textContent = String(entry.title || "ChatGPT.com");

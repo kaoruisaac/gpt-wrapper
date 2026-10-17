@@ -6,6 +6,7 @@ const source = fs.readFileSync(path.join(__dirname, "../src/microphone_route.js"
 
 function harness(hostname = "chatgpt.com") {
   const messages = [], listeners = {}, calls = [], tracks = [];
+  let inputs = [];
   let enumerations = 0, trackId = null, reject = null, delayed = null, now = 10000;
   const document = {
     body: null,
@@ -35,7 +36,7 @@ function harness(hostname = "chatgpt.com") {
       });
       return Promise.resolve(stream);
     },
-    enumerateDevices: async () => { enumerations++; return []; },
+    enumerateDevices: async () => { enumerations++; return inputs; },
     addEventListener(type, fn) { listeners[type] = fn; },
   };
   const original = mediaDevices.getUserMedia;
@@ -60,6 +61,7 @@ function harness(hostname = "chatgpt.com") {
   };
   return {
     window, mediaDevices, messages, calls, tracks, click,
+    setInputs(next) { inputs = next; },
     original,
     enumerations: () => enumerations,
     deviceChangeInstalled: () => !!listeners.devicechange,
@@ -305,6 +307,49 @@ const audio = () => ({ audio: { noiseSuppression: true, echoCancellation: false,
   await assert.rejects(oldDictation, { name: "NotFoundError" });
   assert.equal(racing.messages.filter(msg => msg.event === "error").length, 0,
     "old Dictation failure cannot cancel a newer Voice gesture");
+
+
+  const leaseId = "11111111-1111-4111-8111-111111111111";
+  const leaseTab = harness();
+  leaseTab.window.__GPT_WRAPPER_MIC_ROUTE__.configure(B, 1);
+  leaseTab.setInputs([{ kind: "audioinput", deviceId: "origin-cable", label: "CABLE Output (VB-Audio Virtual Cable)" }]);
+  leaseTab.click("Start Voice");
+  await leaseTab.mediaDevices.getUserMedia({ audio: true });
+  const ongoingVoice = leaseTab.tracks.at(-1);
+  await leaseTab.window.__GPT_WRAPPER_MIC_ROUTE__.installDictationLease(leaseId);
+  assert.equal(ongoingVoice.stopped, false, "installing a lease leaves Voice tracks alone");
+  assert.equal(leaseTab.calls.length, 1, "install only enumerates; no capture before PTT Start");
+  assert.equal(leaseTab.messages.at(-1).event, "applied");
+  leaseTab.click("聽寫");
+  await leaseTab.mediaDevices.getUserMedia({ audio: true });
+  const deviceTrack = leaseTab.tracks.at(-1);
+  assert.equal(leaseTab.calls.at(-1).audio.deviceId.exact, "origin-cable");
+  assert(leaseTab.messages.some(m => m.kind === "gpt-wrapper-device-route" && m.event === "captureVerified" && m.lease === leaseId));
+  leaseTab.window.__GPT_WRAPPER_MIC_ROUTE__.revokeDictationLease(leaseId);
+  assert.equal(deviceTrack.stopped, true);
+  assert.equal(ongoingVoice.stopped, false, "revoke only stops this lease's Dictation tracks");
+  leaseTab.click("聽寫");
+  await leaseTab.mediaDevices.getUserMedia({ audio: true });
+  assert.equal(leaseTab.calls.at(-1).audio.deviceId.exact, "B", "preference restored without a global policy change");
+
+  const lateLease = harness();
+  lateLease.window.__GPT_WRAPPER_MIC_ROUTE__.configure(B, 1);
+  lateLease.setInputs([{ kind: "audioinput", deviceId: "origin-cable", label: "CABLE Output (VB-Audio Virtual Cable)" }]);
+  await lateLease.window.__GPT_WRAPPER_MIC_ROUTE__.installDictationLease(leaseId);
+  lateLease.click("聽寫");
+  const delayedLeaseCaptures = lateLease.delayCaptures();
+  const leasedInFlight = lateLease.mediaDevices.getUserMedia({ audio: true });
+  lateLease.window.__GPT_WRAPPER_MIC_ROUTE__.revokeDictationLease(leaseId);
+  delayedLeaseCaptures[0]();
+  await assert.rejects(leasedInFlight, { name: "NotReadableError" });
+  assert.equal(lateLease.tracks.at(-1).stopped, true);
+  assert(!lateLease.messages.some(m => m.kind === "gpt-wrapper-device-route" && m.event === "captureVerified"));
+
+  const absentCable = harness();
+  absentCable.window.__GPT_WRAPPER_MIC_ROUTE__.configure(B, 1);
+  await absentCable.window.__GPT_WRAPPER_MIC_ROUTE__.installDictationLease(leaseId);
+  assert.equal(absentCable.calls.length, 0);
+  assert(absentCable.messages.some(m => m.kind === "gpt-wrapper-device-route" && m.event === "failed"));
 
   console.log("Microphone routing tests passed: multiple tabs, native Default, dual-stream Voice, retries, mismatch, bounded tickets, preference changes and stale requests.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

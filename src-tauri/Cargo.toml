@@ -19,3 +19,17 @@ tauri-plugin-autostart = "2.7.0"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 sha2 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+ctr = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+roxmltree = "0.21"
+aes-gcm = "0.10.3"
+hkdf = "0.12"
+cpal = "0.15.3"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = ["Win32_NetworkManagement_WiFi", "Win32_Foundation", "Win32_Security", "Win32_System_StationsAndDesktops", "Win32_System_RemoteDesktop", "Win32_Graphics_Gdi"]

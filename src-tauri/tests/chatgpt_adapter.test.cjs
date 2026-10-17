@@ -178,7 +178,7 @@ function harness(initialText = "", sendLabel = "Send") {
   h.advance(1900);
   assert.equal(h.send.clicks, 0, "without an explicit completion signal, Submit must wait beyond the Finish settle window");
   h.advance(1100);
-  assert.equal(h.send.clicks, 1, "missing unverified test ID must not disable BLE Submit forever");
+  assert.equal(h.send.clicks, 1, "missing unverified test ID must not disable device Submit forever");
 }
 
 {
@@ -247,7 +247,7 @@ function harness(initialText = "", sendLabel = "Send") {
   const h = harness("original draft");
   h.api.prepareStart();
   h.removeIndicator();
-  h.api.finishPttSegment(); // keyboard and BLE share this callback
+  h.api.finishPttSegment(); // keyboard and device share this callback
   h.composer.value = "original draft spoken text";
   h.advance(16000);
   assert.equal(h.send.clicks, 0, "PTT completion alone never submits when auto-submit is off");

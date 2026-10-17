@@ -388,7 +388,7 @@ pub fn dismiss(app: &AppHandle) {
 pub fn press(app: &AppHandle) {
     let state = app.state::<BackgroundProjectSwitcherState>();
     let (generation, label) = {
-        // Serialize key/BLE selection transactions without holding the Toast
+        // Serialize input selection transactions without holding the Toast
         // session lock during disk I/O. This gate is released before any UI work.
         let Ok(_press) = state.press_gate.lock() else {
             return;

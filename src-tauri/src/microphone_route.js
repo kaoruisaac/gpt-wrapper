@@ -9,6 +9,19 @@
   const nativeCapture = media.getUserMedia;
   // A new page must receive its preference before starting either mode.
   let policy = null, epoch = -1, intent = null, lastTicket = null, sequence = 0;
+  let deviceLease = null;
+  const devicePost = (event, lease, attempt = "") => {
+    try { window.chrome?.webview?.postMessage(JSON.stringify({
+      kind: "gpt-wrapper-device-route", event, lease: lease.id, attempt,
+    })); } catch { /* Host watchdog remains closed without evidence. */ }
+  };
+  const revokeDevice = (id) => {
+    if (!deviceLease || deviceLease.id !== id) return;
+    const old = deviceLease; deviceLease = null;
+    old.revoked = true;
+    for (const track of old.tracks) { try { track.stop(); } catch {} managedTracks.delete(track); }
+    devicePost("revoked", old);
+  };
   // Only streams acquired from a recognized ChatGPT interaction are managed.
   const managedTracks = new Map();
   let toast = null;
@@ -66,6 +79,7 @@
     if (!ticket || ticket !== lastTicket || ticket.epoch !== epoch || ticket.failed) return;
     if (ticket.purpose === "voice" && ticket !== intent) return;
     ticket.failed = true;
+    if (ticket.lease) devicePost("failed", ticket.lease, ticket.id);
     notify("error", reason, ticket);
     showError(reason);
   };
@@ -105,6 +119,11 @@
     }
     hideError();
     intent = newTicket(purpose);
+    if (purpose === "dictation" && deviceLease?.deviceId && !deviceLease.revoked) {
+      intent.lease = deviceLease;
+      devicePost("attempt", deviceLease, intent.id);
+    }
+    if (purpose === "voice" && deviceLease) revokeDevice(deviceLease.id);
     lastTicket = intent;
     if (purpose === "voice" || policy.mode === "device") notify("attempt", "", intent);
   }, true);
@@ -140,7 +159,11 @@
     if (!audio || !ticket || !policy)
       return Reflect.apply(nativeCapture, this, args);
 
-    if (policy.mode === "default") {
+    const lease = ticket.lease;
+    if (lease && (lease !== deviceLease || lease.revoked)) {
+      return Promise.reject(new DOMException("Dictation lease revoked", "NotReadableError"));
+    }
+    if (!lease && policy.mode === "default") {
       // Return the original Promise and constraints unchanged. Observe only
       // classified tracks to stop them if Settings changes mid-session.
       const captureEpoch = epoch;
@@ -167,7 +190,7 @@
       // Allow a short follow-on interval, never a permanent voice ticket.
       ticket.expires = Math.min(ticket.voiceDeadline, Date.now() + 12000);
     }
-    const selected = policy.deviceId;
+    const selected = lease ? lease.deviceId : policy.deviceId;
     const original = typeof audio === "object" ? audio : {};
     const constraints = { ...args[0], audio: { ...original, deviceId: { exact: selected } } };
     let captured;
@@ -179,12 +202,23 @@
     return Promise.resolve(captured).then(stream => {
       const tracks = stream?.getAudioTracks?.() || [];
       if (ticket !== intent || ticket.epoch !== epoch || ticket.failed ||
+          (lease && (lease !== deviceLease || lease.revoked)) ||
           !tracks.length || tracks.some(track => track.getSettings?.()?.deviceId !== selected)) {
         stopStream(stream);
         if (ticket === intent && ticket.epoch === epoch) fail("mismatch", ticket);
         throw new DOMException("Selected microphone does not match", "NotReadableError");
       }
       registerTracks(stream, ticket.purpose);
+      if (lease) {
+        for (const track of tracks) {
+          lease.tracks.add(track);
+          track.addEventListener?.("ended", () => {
+            lease.tracks.delete(track);
+            if (deviceLease === lease && !lease.revoked && !lease.tracks.size) devicePost("failed", lease, ticket.id);
+          }, { once: true });
+        }
+        devicePost("captureVerified", lease, ticket.id);
+      }
       notify("captureVerified", "", ticket);
       return stream;
     }, error => {
@@ -194,6 +228,24 @@
   };
 
   window.__GPT_WRAPPER_MIC_ROUTE__ = {
+    async installDictationLease(id) {
+      if (typeof id !== "string" || id.length !== 36 || deviceLease) return;
+      const lease = { id, deviceId: null, revoked: false, tracks: new Set() };
+      deviceLease = lease;
+      try {
+        const devices = await media.enumerateDevices();
+        const cables = devices.filter(d => d.kind === "audioinput" && d.deviceId &&
+          !["default", "communications"].includes(d.deviceId) &&
+          /^CABLE Output \(/.test(d.label) && d.label.includes("VB-Audio"));
+        if (deviceLease !== lease || lease.revoked) return;
+        if (cables.length !== 1) throw new Error("cable_missing_or_ambiguous");
+        lease.deviceId = cables[0].deviceId;
+        devicePost("applied", lease);
+      } catch {
+        if (deviceLease === lease) { devicePost("failed", lease); showError("unavailable"); }
+      }
+    },
+    revokeDictationLease: revokeDevice,
     configure(next, nextEpoch) {
       if (!Number.isSafeInteger(nextEpoch) || nextEpoch < epoch ||
           !next || !["default", "device"].includes(next.mode) ||
@@ -203,6 +255,7 @@
             (next.mode === "default" || policy.deviceId === next.deviceId)) notify("ready");
         return;
       }
+      if (deviceLease) revokeDevice(deviceLease.id);
       const oldId = policy?.mode === "device" ? policy.deviceId : null;
       const newId = next.mode === "device" ? next.deviceId : null;
       const changed = !!policy && oldId !== newId;

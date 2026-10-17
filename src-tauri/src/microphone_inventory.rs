@@ -130,6 +130,10 @@ pub fn handle_route_message(app: &AppHandle, tab_id: usize, source: &str, raw: &
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
+    if trusted_chatgpt_source(source) && crate::devices::runtime::route_message(app, tab_id, &value)
+    {
+        return true;
+    }
     if value.get("kind").and_then(|kind| kind.as_str()) != Some("gpt-wrapper-microphone-route") {
         return false;
     }
@@ -253,6 +257,13 @@ fn sync_all_tabs(app: &AppHandle) {
 }
 
 pub fn ptt_start_guard(app: &AppHandle, tab_id: usize) -> Result<(), String> {
+    if let Some(ready) = crate::devices::runtime::route_ready(app, tab_id) {
+        return if ready {
+            Ok(())
+        } else {
+            Err("ESP32 route is not ready".into())
+        };
+    }
     let state = app.state::<MicrophoneRouting>();
     let epoch = state.epoch.load(Ordering::SeqCst);
     // Even Default must have received its policy before PTT clicks Start;
