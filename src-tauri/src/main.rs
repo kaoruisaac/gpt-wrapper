@@ -2580,6 +2580,24 @@ fn get_ptt_auto_submit_enabled(app: AppHandle, webview: Webview) -> Result<bool,
 }
 
 #[tauri::command]
+fn get_notification_sound_enabled(app: AppHandle, webview: Webview) -> Result<bool, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<GeneralSettingsState>()
+        .notification_sound_enabled()
+}
+
+#[tauri::command]
+fn set_notification_sound_enabled(
+    app: AppHandle,
+    webview: Webview,
+    enabled: bool,
+) -> Result<bool, String> {
+    ensure_settings_webview(&webview)?;
+    app.state::<GeneralSettingsState>()
+        .set_notification_sound_enabled(enabled)
+}
+
+#[tauri::command]
 fn set_ptt_auto_submit_enabled(
     app: AppHandle,
     webview: Webview,
@@ -4041,6 +4059,8 @@ fn main() {
             set_autostart_enabled,
             get_ptt_auto_submit_enabled,
             set_ptt_auto_submit_enabled,
+            get_notification_sound_enabled,
+            set_notification_sound_enabled,
             get_shortcut_settings,
             set_shortcut_settings,
             microphone_inventory::get_preferred_microphone,

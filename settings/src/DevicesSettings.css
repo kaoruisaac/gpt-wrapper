@@ -1,0 +1,107 @@
+/* Devices UI based on the reviewed HTML preview. Scoped to Devices only. */
+.devices-page { max-width: 965px; padding-bottom: 48px; font-size: 14px; color: #202123; }
+.devices-page button, .devices-page input, .devices-page select { font: inherit; }
+.devices-page button { cursor: pointer; }
+.devices-page button:disabled { opacity: .45; cursor: not-allowed; }
+.devices-page button:focus-visible, .devices-page input:focus-visible, .devices-page select:focus-visible, .devices-page a:focus-visible { outline: 3px solid #8bd7c1; outline-offset: 2px; }
+.devices-eyebrow { font-size: 11px; letter-spacing: .12em; font-weight: 750; color: #84908e; }
+.devices-header { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 23px; }
+.devices-header h1 { font-size: 26px; letter-spacing: -.025em; margin: 5px 0 6px; font-weight: 680; }
+.devices-page h2 { font-size: 16px; margin: 0; font-weight: 680; }
+.devices-page h3 { font-size: 14px; margin: 0 0 6px; font-weight: 700; }
+.devices-page p { line-height: 1.6; }
+.devices-sub { font-size: 13px; color: #737784; margin: 3px 0 0; }
+.devices-btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid #d5d9d9; background: white; color: #35373b; padding: 9px 13px; border-radius: 8px; font-weight: 600 !important; min-height: 36px; white-space: nowrap; text-decoration: none; }
+.devices-btn:hover:not(:disabled) { background: #f6f7f7; border-color: #b8bebd; }
+.devices-btn.primary { background: #119c79; border-color: #119c79; color: white; }
+.devices-btn.primary:hover:not(:disabled) { background: #0d8165; }
+.devices-btn.danger { color: #bd443e; border-color: #ecd4d1; }
+.devices-btn.danger:hover:not(:disabled) { background: #fff4f2; }
+.devices-btn.sm { font-size: 12px; min-height: 30px; padding: 5px 10px; }
+.devices-btn.soft { background: #eef8f5; border-color: #cae8df; color: #08775b; }
+.devices-section-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 30px 0 13px; }
+.devices-section-title small { font-size: 12px; color: #767986; }
+.devices-card { background: white; border: 1px solid #e3e5e7; border-radius: 12px; box-shadow: 0 2px 10px #20212305; }
+.devices-info { background: #f5faf8; border: 1px solid #daece6; border-radius: 10px; padding: 13px 16px; color: #4d6960; font-size: 13px; line-height: 1.65; }
+.devices-info strong { color: #176b54; }
+.devices-device { padding: 18px 20px; margin: 0 0 12px; transition: border .15s, background .15s; }
+.devices-device.selected { border-color: #a5d8c7; background: linear-gradient(100deg,#fafffd,#fff); }
+.devices-device-top { display: flex; gap: 13px; align-items: flex-start; }
+.devices-device-icon { width: 42px; height: 42px; flex: none; background: #ebf6f2; color: #168c6c; display: grid; place-items: center; border-radius: 11px; font-size: 21px; }
+.devices-device-name { min-width: 0; }
+.devices-device-title { font-size: 15px; font-weight: 700; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.devices-device-meta { margin-top: 5px; font-size: 12px; color: #898d95; overflow-wrap: anywhere; }
+.devices-device-actions { margin-left: auto; display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+.devices-badge { display: inline-flex; align-items: center; border: 1px solid #e3e4e6; background: #f5f5f6; color: #666b72; border-radius: 99px; font-size: 11px; padding: 3px 8px; white-space: nowrap; font-weight: 400; }
+.devices-badge.ok { background: #eaf8f2; border-color: #cceadc; color: #168065; }
+.devices-badge.warn { background: #fff6e8; border-color: #f4dfba; color: #ad761f; }
+.devices-badge.off { background: #f3f4f6; color: #7a7f87; }
+.devices-details { display: flex; flex-wrap: wrap; gap: 9px 22px; margin: 17px 0 0 55px; padding-top: 13px; border-top: 1px solid #edf0ef; color: #626974; font-size: 12px; }
+.devices-details b { color: #373b42; font-weight: 650; }
+.devices-section-foot { font-size: 12px; color: #81868c; margin-top: 12px; }
+.devices-empty { padding: 35px; text-align: center; color: #6d747b; }
+.devices-empty-icon { font-size: 36px; margin-bottom: 12px; }
+.devices-empty .devices-btn { margin-top: 16px; }
+.devices-bridge { padding: 18px 20px; }
+.devices-bridge-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.devices-bridge-content { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 13px; border-top: 1px solid #eef0f0; padding-top: 14px; }
+.devices-inline-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.devices-note { font-size: 11px; color: #9296a0; line-height: 1.65; margin-top: 22px; }
+.devices-callout { background: #f8faf9; border: 1px solid #e1ebe7; padding: 14px; border-radius: 9px; margin: 15px 0; line-height: 1.6; font-size: 13px; }
+.devices-callout.error { border-color: #f0c9c4; background: #fff5f3; color: #9a4439; }
+.devices-callout.warning { background: #fff8ea; border-color: #ebddbc; color: #8e682c; }
+.devices-callout .devices-btn { margin-left: 10px; }
+.devices-overlay { position: fixed; inset: 0; background: #171b20a3; display: flex; align-items: center; justify-content: center; padding: 18px; z-index: 100; backdrop-filter: blur(2px); }
+.devices-modal { background: white; border-radius: 15px; box-shadow: 0 22px 90px #0003; width: min(775px,100%); max-height: calc(100vh - 34px); overflow: auto; }
+.devices-modal-head { padding: 24px 28px 18px; border-bottom: 1px solid #e9eaea; display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; }
+.devices-modal-head h2 { font-size: 21px; margin: 5px 0 0; }
+.devices-steps { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 5px; padding: 18px 28px; border-bottom: 1px solid #ecedee; }
+.devices-step { font-size: 11px; color: #969ba0; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.devices-step i { font-style: normal; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: #f0f2f2; color: #82888d; flex: none; font-weight: 650; }
+.devices-step.current { color: #137e63; font-weight: 700; }
+.devices-step.current i, .devices-step.done i { background: #dff4e9; color: #0e8766; }
+.devices-modal-body { padding: 24px 28px; min-height: 265px; }
+.devices-modal-footer { padding: 17px 28px; border-top: 1px solid #ecedee; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.devices-options { display: grid; gap: 9px; margin: 15px 0; }
+.devices-option { border: 1px solid #dce0e1; border-radius: 10px; padding: 12px 15px; display: flex; align-items: center; gap: 11px; cursor: pointer; }
+.devices-option:hover, .devices-option.chosen { background: #f3fbf8; border-color: #8ed3bb; }
+.devices-option-sub { font-size: 12px; color: #8b9096; margin-top: 3px; }
+.devices-option input, .devices-check input { accent-color: #10a37f; }
+.devices-field { margin-top: 17px; }
+.devices-field label { font-weight: 600; display: block; margin-bottom: 7px; }
+.devices-field input, .devices-field select { width: 100%; border: 1px solid #d6dadb; border-radius: 8px; padding: 10px 12px; background: white; color: #2e3237; min-height: 39px; }
+.devices-hint { color: #898f96; font-size: 12px; margin-top: 5px; }
+.devices-check { display: flex; align-items: flex-start; gap: 9px; margin: 16px 0 10px; font-size: 13px; line-height: 1.5; }
+.devices-check input { margin: 3px 0 0; flex: none; }
+.devices-wifi-tools { margin: 15px 0 5px; }
+.devices-holdbox { text-align: center; background: #f6f9f8; border: 1px solid #e0eae7; border-radius: 12px; padding: 25px; margin: 16px 0; }
+.devices-hold-symbol { font-size: 32px; color: #168c6c; margin-bottom: 8px; }
+.devices-progress { margin-top: 14px; }
+.devices-progress-item { display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #eff0f1; padding: 12px 0; font-size: 13px; }
+.devices-progress-item:last-child { border: 0; }
+.devices-progress-number { display: grid; place-items: center; height: 26px; width: 26px; border-radius: 50%; background: #eff1f1; color: #9298a0; font-size: 12px; flex: none; }
+.devices-progress-item.done .devices-progress-number { background: #dff4e9; color: #0a8562; }
+.devices-progress-item.running .devices-progress-number { background: #e7f2ff; color: #2b79b5; }
+.devices-progress-item.failed .devices-progress-number { background: #ffedea; color: #c94e41; }
+.devices-progress-state { margin-left: auto; color: #959ba1; font-size: 12px; }
+.devices-progress-item.done .devices-progress-state { color: #168365; }
+.devices-success { text-align: center; padding: 20px 15px; }
+.devices-success-symbol { font-size: 40px; color: #168c6c; }
+.devices-success h3 { font-size: 20px; margin: 12px 0; }
+.confirm-overlay { z-index: 110; }
+.devices-confirm-modal { max-width: 500px; }
+.devices-confirm-modal .devices-modal-body { min-height: 0; }
+@media(max-width: 740px) {
+  .devices-header, .devices-device-top { flex-wrap: wrap; }
+  .devices-device-actions { margin: 4px 0 0; width: 100%; justify-content: flex-start; }
+  .devices-details { margin-left: 0; }
+  .devices-steps { padding: 14px; gap: 2px; }
+  .devices-step { font-size: 0; justify-content: center; }
+  .devices-step i { font-size: 11px; }
+  .devices-modal-head, .devices-modal-body, .devices-modal-footer { padding-left: 18px; padding-right: 18px; }
+  .devices-bridge-content { align-items: flex-start; flex-direction: column; }
+}
+
+/* The Devices layout is intentionally wider than other Settings panels. */
+.panel.devices-panel { max-width: 965px; }
+.devices-loading-modal { width: min(430px, 100%); padding: 30px; text-align: center; font-weight: 600; color: #4d6960; line-height: 1.7; }

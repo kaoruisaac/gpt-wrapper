@@ -1,0 +1,16 @@
+UI Success Chime
+Author: SoundShelfStudio
+Source: https://pixabay.com/sound-effects/technology-ui-success-chime-513565/
+License: Pixabay Content License
+Terms: https://pixabay.com/service/terms/ (section 5)
+Reviewed: 2026-10-19
+
+The user supplied soundshelfstudio-ui-success-chime-513565.mp3 from the
+specified source. Converted with FFmpeg to 16-bit PCM WAV, 44100 Hz stereo.
+
+This third-party sound is integrated into GPT Wrapper as the audible component
+of its ChatGPT completion notification UI. It is bundled for offline application
+use, not offered as an independent sound download or stock audio product.
+Pixabay permits commercial and non-commercial use and adaptation subject to
+its Content License, including its prohibition on standalone distribution.
+The audio remains subject to that license, not the application's code license.

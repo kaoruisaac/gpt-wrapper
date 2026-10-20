@@ -199,7 +199,13 @@ impl Devices {
                     notices.update(selected, online, audio, interrupted, Instant::now())
                 });
                 if let Some(interrupted) = event {
-                    crate::tab_completion_notifications::device_notice(&app, interrupted);
+                    if interrupted {
+                        crate::tab_completion_notifications::device_notice(&app, interrupted);
+                    }
+                    // Temporarily disable the ESP32 offline notification (non-interrupted).
+                    // if !interrupted {
+                    //     crate::tab_completion_notifications::device_notice(&app, interrupted);
+                    // }
                 }
                 thread::sleep(Duration::from_millis(50));
             }

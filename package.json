@@ -1,6 +1,6 @@
 {
   "name": "gpt-wrapper",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Windows Tauri app that keeps ChatGPT Web available as a push-to-talk dictation window.",
   "main": "index.js",
   "scripts": {

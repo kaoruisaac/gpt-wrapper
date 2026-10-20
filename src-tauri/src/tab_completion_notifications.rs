@@ -1,20 +1,29 @@
 //! Non-activating completion cards for ChatGPT tabs. Separate from the tray project switcher.
 use std::{
     collections::HashMap,
+    os::windows::ffi::OsStrExt,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 use tauri::{
+    path::BaseDirectory,
     webview::{PageLoadEvent, WebviewWindowBuilder},
     AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewUrl,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, IsWindow, IsWindowVisible, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE,
-    SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetWindowLongPtrW, IsWindow, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
-use crate::{TabState, TabStatus, MAIN_WINDOW_LABEL};
+use windows::{
+    core::PCWSTR,
+    Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT},
+};
+
+use crate::{general_settings::GeneralSettingsState, TabState, TabStatus, MAIN_WINDOW_LABEL};
 
 pub const WINDOW_LABEL: &str = "tab-completion-notifications";
 const WIDTH: f64 = 342.0;
@@ -23,6 +32,7 @@ const GAP: f64 = 10.0;
 const MARGIN: f64 = 18.0;
 const FADE_AFTER: Duration = Duration::from_secs(3);
 const SETTLE_AFTER: Duration = Duration::from_millis(220);
+const SOUND_COOLDOWN: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Transition {
@@ -59,9 +69,47 @@ struct Store {
     pending: HashMap<usize, u64>,
     generation: u64,
     page_ready: bool,
+    last_sound_at: Option<Instant>,
 }
 
 impl Store {
+    // Called with the result of eval, placement, and native show.
+    // Consume first-display eligibility even when muted or inside the cooldown.
+    fn after_render(
+        &mut self,
+        now: Instant,
+        succeeded: bool,
+        allowed: bool,
+        enabled: bool,
+        play: impl FnOnce() -> Result<(), String>,
+    ) -> Vec<(usize, u64)> {
+        if !succeeded || !self.page_ready {
+            return Vec::new();
+        }
+        let mut fresh = Vec::new();
+        let mut new_completion = false;
+        for card in &mut self.cards {
+            if card.shown_at.is_none() {
+                new_completion |= !card.device;
+                card.shown_at = Some(now);
+                fresh.push((card.tab_id, card.generation));
+            }
+        }
+        if new_completion
+            && allowed
+            && enabled
+            && self
+                .last_sound_at
+                .is_none_or(|last| now.duration_since(last) >= SOUND_COOLDOWN)
+        {
+            match play() {
+                Ok(()) => self.last_sound_at = Some(now),
+                Err(error) => eprintln!("[gpt-wrapper] completion sound failed: {error}"),
+            }
+        }
+        fresh
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.generation
@@ -337,11 +385,31 @@ fn schedule_hide_retry(app: AppHandle, remaining: u8) {
 fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        // Windows can restore a native caption when this hidden WebView window is
+        // shown through ShowWindow, even though the builder has decorations(false).
+        // Strip its non-client frame explicitly, leaving the HTML card unchanged.
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let borderless = style
+            & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0
+                | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0) as isize;
+        if borderless != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, borderless);
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .map_err(|error| format!("cannot remove completion notification frame: {error}"))?;
+        }
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(
             hwnd,
             GWL_EXSTYLE,
-            style | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize,
+            exstyle | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize,
         );
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
@@ -424,6 +492,31 @@ fn schedule_fade(app: AppHandle, tab_id: usize, generation: u64) {
     });
 }
 
+fn play_sound(app: &AppHandle) -> Result<(), String> {
+    let path = app
+        .path()
+        .resolve("resources/ui-success-chime.wav", BaseDirectory::Resource)
+        .map_err(|error| format!("cannot resolve sound resource: {error}"))?;
+    if !path.is_file() {
+        return Err(format!("sound resource missing: {}", path.display()));
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // No SND_SYSTEM: use this process's audio session and application volume.
+    if unsafe {
+        PlaySoundW(
+            PCWSTR(wide.as_ptr()),
+            None,
+            SND_FILENAME | SND_ASYNC | SND_NODEFAULT,
+        )
+    }
+    .as_bool()
+    {
+        Ok(())
+    } else {
+        Err("PlaySoundW rejected completion sound".into())
+    }
+}
+
 // All HWND operations and window creation are serialized on the Tauri UI thread.
 fn render_on_ui_thread(app: &AppHandle) {
     let state = app.state::<NotificationState>();
@@ -471,6 +564,23 @@ fn render_on_ui_thread(app: &AppHandle) {
                 show_without_activation(&window)
             }
         });
+    let enabled = if render_result.is_ok() {
+        app.state::<GeneralSettingsState>()
+            .notification_sound_enabled()
+            .unwrap_or_else(|error| {
+                eprintln!("[gpt-wrapper] cannot read completion sound setting: {error}");
+                false
+            })
+    } else {
+        false
+    };
+    let fresh = store.after_render(
+        Instant::now(),
+        render_result.is_ok(),
+        can_notify(app),
+        enabled,
+        || play_sound(app),
+    );
     if let Err(error) = render_result {
         eprintln!("[gpt-wrapper] completion card rendering failed: {error}");
         if !can_notify(app) {
@@ -484,17 +594,143 @@ fn render_on_ui_thread(app: &AppHandle) {
         }
         return;
     }
-    for card in &mut store.cards {
-        if card.shown_at.is_none() {
-            card.shown_at = Some(Instant::now());
-            schedule_fade(app.clone(), card.tab_id, card.generation);
-        }
+    for (tab_id, generation) in fresh {
+        schedule_fade(app.clone(), tab_id, generation);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn add_card(store: &mut Store, id: usize, device: bool) {
+        let generation = store.prepare(id);
+        assert!(store.finish(id, generation, "test".into(), true));
+        store.cards[0].device = device;
+    }
+
+    #[test]
+    fn sound_only_on_first_successful_display_of_completions() {
+        let mut store = Store::default();
+        let now = Instant::now();
+        add_card(&mut store, 1, false);
+        // Page load, failed eval/place/show, and pending candidates are silent.
+        assert!(store
+            .after_render(now, true, true, true, || panic!("page not ready"))
+            .is_empty());
+        store.page_ready = true;
+        assert!(store
+            .after_render(now, false, true, true, || panic!("display failed"))
+            .is_empty());
+        assert!(store.cards[0].shown_at.is_none());
+        let mut calls = 0;
+        assert_eq!(
+            store
+                .after_render(now, true, true, true, || {
+                    calls += 1;
+                    Ok(())
+                })
+                .len(),
+            1
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(store.cards[0].shown_at, Some(now));
+        assert!(store.fade(1, store.cards[0].generation, now + FADE_AFTER));
+        store.after_render(now + FADE_AFTER, true, true, true, || panic!("fade replay"));
+        store.page_ready = false;
+        store.after_render(now + FADE_AFTER, true, true, true, || {
+            panic!("window recreation")
+        });
+        store.page_ready = true;
+        store.after_render(now + FADE_AFTER, true, true, true, || {
+            panic!("window recreation replay")
+        });
+        add_card(&mut store, 0, true);
+        store.after_render(now + FADE_AFTER, true, true, true, || {
+            panic!("device sound")
+        });
+    }
+
+    #[test]
+    fn batch_and_global_cooldown_drop_sounds_without_queueing() {
+        let mut store = Store {
+            page_ready: true,
+            ..Store::default()
+        };
+        let now = Instant::now();
+        add_card(&mut store, 1, false);
+        add_card(&mut store, 2, false);
+        add_card(&mut store, 0, true);
+        let mut calls = 0;
+        assert_eq!(
+            store
+                .after_render(now, true, true, true, || {
+                    calls += 1;
+                    Ok(())
+                })
+                .len(),
+            3
+        );
+        assert_eq!(calls, 1);
+        add_card(&mut store, 3, false);
+        store.after_render(now + Duration::from_millis(999), true, true, true, || {
+            panic!("cooldown")
+        });
+        store.after_render(now + SOUND_COOLDOWN, true, true, true, || {
+            panic!("no delayed replay")
+        });
+        add_card(&mut store, 4, false);
+        store.after_render(now + SOUND_COOLDOWN, true, true, true, || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn focus_muting_and_playback_failure_preserve_cards_without_replay() {
+        let mut store = Store {
+            page_ready: true,
+            ..Store::default()
+        };
+        let now = Instant::now();
+        add_card(&mut store, 1, false);
+        store.after_render(now, true, false, true, || panic!("foreground"));
+        add_card(&mut store, 2, false);
+        store.after_render(now, true, true, false, || panic!("muted"));
+        assert_eq!(store.cards.len(), 2);
+        assert!(store.cards.iter().all(|card| card.shown_at.is_some()));
+        store.after_render(now, true, true, true, || panic!("unmute replay"));
+        add_card(&mut store, 3, false);
+        store.after_render(now, true, true, true, || Err("native failure".into()));
+        assert!(store.last_sound_at.is_none());
+        assert!(store.cards[0].shown_at.is_some());
+        store.after_render(now, true, true, true, || panic!("failed sound replay"));
+        add_card(&mut store, 4, false);
+        store.after_render(now, true, true, true, || Ok(()));
+        assert_eq!(store.last_sound_at, Some(now));
+    }
+
+    #[test]
+    fn settle_focus_and_cancellation_gates_cannot_create_a_sound() {
+        assert_eq!(SETTLE_AFTER, Duration::from_millis(220));
+        let now = Instant::now();
+        let mut store = Store {
+            page_ready: true,
+            ..Store::default()
+        };
+        let generation = store.prepare(1);
+        store.after_render(now, true, true, true, || panic!("still settling"));
+        assert!(!store.finish(1, generation, "focused or working again".into(), false));
+        store.after_render(now, true, true, true, || panic!("rejected candidate"));
+        let generation = store.prepare(1);
+        store.cancel_tab(1);
+        assert!(!store.finish(1, generation, "cancelled".into(), true));
+        store.after_render(now, true, true, true, || panic!("cancelled candidate"));
+        add_card(&mut store, 1, false);
+        store.clear();
+        store.after_render(now, true, true, true, || panic!("focus cleared"));
+    }
 
     #[test]
     fn foreground_clear_keeps_device_notice_and_discards_tab_completion() {

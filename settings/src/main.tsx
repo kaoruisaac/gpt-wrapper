@@ -14,6 +14,8 @@ function GeneralSettings() {
   const [autostartBusy, setAutostartBusy] = createSignal(true);
   const [pttAutoSubmitEnabled, setPttAutoSubmitEnabled] = createSignal(true);
   const [pttBusy, setPttBusy] = createSignal(true);
+  const [notificationSoundEnabled, setNotificationSoundEnabled] = createSignal(true);
+  const [notificationSoundBusy, setNotificationSoundBusy] = createSignal(true);
   const [statusMessage, setStatusMessage] = createSignal("");
   const [statusKind, setStatusKind] = createSignal<StatusKind>("");
   const setStatus = (message = "", kind: StatusKind = "") => {
@@ -119,9 +121,52 @@ function GeneralSettings() {
     }
   };
 
+  const readNotificationSoundState = async () => {
+    setNotificationSoundBusy(true);
+    try {
+      setNotificationSoundEnabled(await invoke<boolean>("get_notification_sound_enabled"));
+    } catch (error) {
+      console.error("[gpt-wrapper] failed to read notification sound state:", error);
+      setStatus("無法讀取通知音效設定。", "error");
+    } finally {
+      setNotificationSoundBusy(false);
+    }
+  };
+
+  const handleNotificationSoundChange = async (event: Event & { currentTarget: HTMLInputElement }) => {
+    if (notificationSoundBusy()) return;
+    const previous = notificationSoundEnabled();
+    const desired = event.currentTarget.checked;
+    setNotificationSoundEnabled(desired);
+    setNotificationSoundBusy(true);
+    setStatus();
+    try {
+      const actual = await invoke<boolean>("set_notification_sound_enabled", { enabled: desired });
+      setNotificationSoundEnabled(actual);
+      setStatus(
+        actual === desired
+          ? desired ? "已啟用通知音效。" : "已停用通知音效。"
+          : "系統回報的設定狀態與要求不同，已重新同步。",
+        actual === desired ? "success" : "error",
+      );
+    } catch (error) {
+      console.error("[gpt-wrapper] failed to update notification sound:", error);
+      try {
+        setNotificationSoundEnabled(await invoke<boolean>("get_notification_sound_enabled"));
+      } catch (syncError) {
+        console.error("[gpt-wrapper] failed to resync notification sound:", syncError);
+        setNotificationSoundEnabled(previous);
+      }
+      setStatus("更新通知音效失敗，已恢復實際設定狀態。", "error");
+    } finally {
+      setNotificationSoundBusy(false);
+    }
+  };
+
   onMount(() => {
     void readAutostartState().catch(() => {});
     void readPttAutoSubmitState();
+    void readNotificationSoundState();
   });
 
   return (
@@ -161,6 +206,20 @@ function GeneralSettings() {
           <p class="setting-description">
             關閉後，放開 PTT 仍會完成轉錄，但文字會保留在輸入框中，需手動送出。
           </p>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <input
+          id="notification-sound"
+          type="checkbox"
+          checked={notificationSoundEnabled()}
+          disabled={notificationSoundBusy()}
+          onChange={handleNotificationSoundChange}
+        />
+        <div class="setting-copy">
+          <label class="setting-label" for="notification-sound">通知音效</label>
+          <p class="setting-description">ChatGPT 回覆完成且顯示背景通知時播放提示音</p>
         </div>
       </div>
 
@@ -232,7 +291,7 @@ function SettingsApp() {
         </section>
 
         <section
-          class="panel"
+          class="panel devices-panel"
           classList={{ "is-active": activeTab() === "devices" }}
           aria-hidden={activeTab() !== "devices"}
         >

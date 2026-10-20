@@ -27,10 +27,16 @@ impl Default for PreferredMicrophone {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeneralSettings {
+    #[serde(default = "default_notification_sound_enabled")]
+    notification_sound_enabled: bool,
     #[serde(default = "default_ptt_auto_submit")]
     ptt_auto_submit: bool,
     #[serde(default)]
     preferred_microphone: PreferredMicrophone,
+}
+
+const fn default_notification_sound_enabled() -> bool {
+    true
 }
 
 const fn default_ptt_auto_submit() -> bool {
@@ -40,6 +46,7 @@ const fn default_ptt_auto_submit() -> bool {
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
+            notification_sound_enabled: default_notification_sound_enabled(),
             ptt_auto_submit: default_ptt_auto_submit(),
             preferred_microphone: PreferredMicrophone::default(),
         }
@@ -52,6 +59,25 @@ pub struct GeneralSettingsState {
 }
 
 impl GeneralSettingsState {
+    pub fn notification_sound_enabled(&self) -> Result<bool, String> {
+        Ok(self
+            .data
+            .lock()
+            .map_err(|_| "general settings lock was poisoned".to_string())?
+            .notification_sound_enabled)
+    }
+
+    pub fn set_notification_sound_enabled(&self, enabled: bool) -> Result<bool, String> {
+        let mut current = self
+            .data
+            .lock()
+            .map_err(|_| "general settings lock was poisoned".to_string())?;
+        let mut next = current.clone();
+        next.notification_sound_enabled = enabled;
+        self.persist(&mut current, next)?;
+        Ok(current.notification_sound_enabled)
+    }
+
     pub fn load(path: PathBuf) -> Self {
         let data = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
@@ -158,6 +184,42 @@ impl GeneralSettingsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_sound_defaults_persists_and_preserves_other_preferences() {
+        let directory = std::env::temp_dir().join(format!("gpt-wrapper-sound-{}", Uuid::new_v4()));
+        let path = directory.join("general-settings.json");
+        assert!(GeneralSettingsState::load(path.clone())
+            .notification_sound_enabled()
+            .unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, r#"{"pttAutoSubmit":false,"preferredMicrophone":{"mode":"device","deviceId":"mic","label":"External","groupId":"group"}}"#).unwrap();
+        let state = GeneralSettingsState::load(path.clone());
+        assert!(state.notification_sound_enabled().unwrap());
+        let microphone = state.preferred_microphone().unwrap();
+        assert!(!state.set_notification_sound_enabled(false).unwrap());
+        let loaded = GeneralSettingsState::load(path.clone());
+        assert!(!loaded.notification_sound_enabled().unwrap());
+        assert!(!loaded.ptt_auto_submit().unwrap());
+        assert_eq!(loaded.preferred_microphone().unwrap(), microphone);
+        loaded.set_ptt_auto_submit(true).unwrap();
+        loaded
+            .set_preferred_microphone(PreferredMicrophone::Default)
+            .unwrap();
+        assert!(!GeneralSettingsState::load(path.clone())
+            .notification_sound_enabled()
+            .unwrap());
+        assert!(loaded.set_notification_sound_enabled(true).unwrap());
+        assert!(GeneralSettingsState::load(path)
+            .notification_sound_enabled()
+            .unwrap());
+        let blocked = directory.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        let state = GeneralSettingsState::load(blocked);
+        assert!(state.set_notification_sound_enabled(false).is_err());
+        assert!(state.notification_sound_enabled().unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn defaults_and_missing_field_are_enabled() {
