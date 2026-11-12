@@ -58,7 +58,12 @@ pub fn dispatch(app: &AppHandle, input: Input) {
     let _ = app.run_on_main_thread(move || {
         let state = target.state::<super::Devices>();
         let valid = state.host.lock().is_ok_and(|h| {
-            if input.kind == Kind::Cancel {
+            if matches!(
+                input.kind,
+                Kind::SwitchDown | Kind::SwitchUp | Kind::SwitchCancel | Kind::SwitchLegacy
+            ) {
+                false // Tab switching is dispatched directly by the control receiver.
+            } else if input.kind == Kind::Cancel {
                 h.runtime
                     .lease
                     .as_ref()
@@ -88,6 +93,9 @@ pub fn dispatch(app: &AppHandle, input: Input) {
             tracker.clear_deferred_submits();
         }
         match input.kind {
+            Kind::SwitchDown | Kind::SwitchUp | Kind::SwitchCancel | Kind::SwitchLegacy => {
+                unreachable!()
+            }
             Kind::Down => crate::handle_ptt_event(
                 &target,
                 crate::PttEvent::Down(crate::PttSource::Device),

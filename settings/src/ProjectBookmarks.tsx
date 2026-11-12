@@ -1,31 +1,37 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { FiPlus } from "solid-icons/fi";
+import {
+  PROVIDER_CHOICES,
+  type ProviderId,
+  bookmarkUrlError,
+  emptyProjectSettings,
+  providerChoice,
+  type ProjectSettings,
+} from "./providers";
 
-type ProjectBookmark = { id: string; name: string; url: string; messagePrefix: string };
-type ProjectSettings = { defaultProjectId: string | null; projects: ProjectBookmark[] };
 type Draft = { id: string | null; name: string; url: string; messagePrefix: string };
 
 const emptyDraft = (): Draft => ({ id: null, name: "", url: "", messagePrefix: "" });
 
-function validationError(draft: Draft): string {
+function validationError(provider: ProviderId, draft: Draft): string {
   if (!draft.name.trim()) return "請輸入 Project 名稱。";
   if (!draft.url.trim()) return "請輸入 Project URL。";
-  try {
-    const url = new URL(draft.url.trim());
-    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("scheme");
-  } catch {
-    return "請輸入有效的 http:// 或 https:// URL。";
-  }
-  return "";
+  return bookmarkUrlError(provider, draft.url);
 }
 
+// Each provider has its own bookmarks, Default Project and Message Prefixes.
+// The G/C selector only chooses which list is edited here; it never changes
+// the provider shown in the main window.
 export default function ProjectBookmarks() {
-  const [settings, setSettings] = createSignal<ProjectSettings>({ defaultProjectId: null, projects: [] });
+  const [settings, setSettings] = createSignal<ProjectSettings>(emptyProjectSettings());
+  const [provider, setProvider] = createSignal<ProviderId>("chatgpt");
   const [loading, setLoading] = createSignal(true);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   const [draft, setDraft] = createSignal<Draft | null>(null);
+  const list = () => settings()[provider()];
+  const choice = () => providerChoice(provider());
 
   const reloadSettings = async () => {
     if (busy()) return;
@@ -51,7 +57,8 @@ export default function ProjectBookmarks() {
     setBusy(true);
     setError("");
     try {
-      const latest = await invoke<ProjectSettings>(command, args);
+      // Rust validates the list named here; it never infers it from a tab.
+      const latest = await invoke<ProjectSettings>(command, { provider: provider(), ...args });
       setSettings(latest);
       return true;
     } catch (cause) {
@@ -63,10 +70,17 @@ export default function ProjectBookmarks() {
     }
   };
 
+  const selectProvider = (next: ProviderId) => {
+    if (busy() || next === provider()) return;
+    setProvider(next);
+    setDraft(null);
+    setError("");
+  };
+
   const save = async () => {
     const current = draft();
     if (!current || busy()) return;
-    const problem = validationError(current);
+    const problem = validationError(provider(), current);
     if (problem) { setError(problem); return; }
     const fields = { name: current.name.trim(), url: current.url.trim(), messagePrefix: current.messagePrefix };
     const saved = current.id
@@ -78,7 +92,7 @@ export default function ProjectBookmarks() {
   const editor = () => (
     <div class="project-editor">
       <label>名稱<input value={draft()?.name ?? ""} disabled={busy()} onInput={(event) => setDraft({ ...draft()!, name: event.currentTarget.value })} /></label>
-      <label>URL<input type="url" value={draft()?.url ?? ""} disabled={busy()} onInput={(event) => setDraft({ ...draft()!, url: event.currentTarget.value })} /></label>
+      <label>URL<input type="url" value={draft()?.url ?? ""} placeholder={choice().urlHint} disabled={busy()} onInput={(event) => setDraft({ ...draft()!, url: event.currentTarget.value })} /></label>
       <label>Message Prefix<textarea rows="3" value={draft()?.messagePrefix ?? ""} disabled={busy()} onInput={(event) => setDraft({ ...draft()!, messagePrefix: event.currentTarget.value })} /></label>
       <div class="project-actions">
         <button type="button" class="primary-button" disabled={busy()} onClick={save}>儲存</button>
@@ -91,38 +105,54 @@ export default function ProjectBookmarks() {
   return (
     <>
       <h1>專案書籤</h1>
-      <p class="bookmark-intro">儲存常用的 ChatGPT Project，並設定開啟新分頁時預設使用的 Project。</p>
+      <p class="bookmark-intro">ChatGPT（G）與 Claude（C）各自保存常用的 Project、Default Project 與 Message Prefix，互不影響。</p>
+
+      <div class="provider-tabs" role="tablist" aria-label="書籤平台">
+        <For each={PROVIDER_CHOICES}>{(item) => (
+          <button
+            type="button"
+            role="tab"
+            class="provider-tab"
+            classList={{ "is-active": provider() === item.id }}
+            aria-selected={provider() === item.id}
+            disabled={busy()}
+            onClick={() => selectProvider(item.id)}
+          >
+            <span class="provider-letter" aria-hidden="true">{item.letter}</span>{item.name}
+          </button>
+        )}</For>
+      </div>
 
       <div class="default-project">
-        <label for="default-project" class="setting-label">Default project</label>
-        <select id="default-project" disabled={loading() || busy()} value={settings().defaultProjectId ?? ""}
+        <label for="default-project" class="setting-label">{choice().name} Default project</label>
+        <select id="default-project" disabled={loading() || busy()} value={list().defaultProjectId ?? ""}
           onChange={async (event) => {
             const id = event.currentTarget.value || null;
             const select = event.currentTarget;
             if (!await mutate("set_default_project", { id })) {
-              select.value = settings().defaultProjectId ?? "";
+              select.value = list().defaultProjectId ?? "";
             }
           }}>
-          <option value="">chatgpt.com</option>
-          <For each={settings().projects}>{(project) => <option value={project.id}>{project.name}</option>}</For>
+          <option value="">{choice().builtin}</option>
+          <For each={list().projects}>{(project) => <option value={project.id}>{project.name}</option>}</For>
         </select>
-        <p class="setting-description">選擇 chatgpt.com 時，新建 ChatGPT 分頁會開啟 https://chatgpt.com。</p>
+        <p class="setting-description">選擇 {choice().builtin} 時，新建 {choice().name} 分頁會開啟 {choice().home}。</p>
       </div>
 
       <div class="projects-heading">
-        <h2>Projects</h2>
+        <h2>{choice().name} Projects</h2>
         <button type="button" class="primary-button" disabled={loading() || busy()} onClick={() => { setDraft(emptyDraft()); setError(""); }}><FiPlus aria-hidden="true" />新增 Project</button>
       </div>
       <Show when={draft()?.id === null}>{editor()}</Show>
-      <Show when={!loading() && settings().projects.length === 0 && draft() === null}>
-        <p class="empty-projects">尚未新增 Project。</p>
+      <Show when={!loading() && list().projects.length === 0 && draft() === null}>
+        <p class="empty-projects">尚未新增 {choice().name} Project。</p>
       </Show>
-      <For each={settings().projects}>{(project) => (
+      <For each={list().projects}>{(project) => (
         <Show when={draft()?.id !== project.id} fallback={editor()}>
           <article class="project-item">
             <div class="project-item-top">
               <strong>{project.name}</strong>
-              <Show when={settings().defaultProjectId === project.id}><span class="default-badge">Default</span></Show>
+              <Show when={list().defaultProjectId === project.id}><span class="default-badge">Default</span></Show>
             </div>
             <div class="project-field"><span>URL</span><span class="project-value">{project.url}</span></div>
             <div class="project-field"><span>Message Prefix</span><span class="project-value prefix-value">{project.messagePrefix || "—"}</span></div>

@@ -37,8 +37,9 @@ function harness(initialText = "", sendLabel = "Send") {
     addEventListener(type, callback) { documentListeners[type] = callback; },
   };
   const window = { addEventListener() {} };
+  window.top = window;
   const context = {
-    window, document,
+    window, document, location: { protocol: "https:", hostname: "chatgpt.com" },
     console: { info() {}, warn() {}, debug() {}, error() {} },
     Date: class extends Date { static now() { return now; } },
     setInterval(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay, due: now + delay }); return id; },

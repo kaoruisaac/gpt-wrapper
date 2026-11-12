@@ -1,13 +1,16 @@
 import { createSignal, onCleanup, onMount, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 
-type Action = "ptt" | "submit";
-type Settings = { ptt: string[]; submit: string[] };
+type Action = "ptt" | "submit" | "switchTabs";
+type Settings = { ptt: string[]; submit: string[]; switchTabs: string[] };
 const DEFAULTS: Settings = {
   ptt: ["Ctrl+Digit0", "Ctrl+Numpad0"],
   submit: ["Ctrl+Period", "Ctrl+NumpadDecimal"],
+  switchTabs: ["Ctrl+Shift+Equal", "Ctrl+NumpadAdd"],
 };
-const clone = (value: Settings): Settings => ({ ptt: [...value.ptt], submit: [...value.submit] });
+const clone = (value: Settings): Settings => ({
+  ptt: [...value.ptt], submit: [...value.submit], switchTabs: [...value.switchTabs],
+});
 const labels: Record<string, string> = {
   Period: ".", Comma: ",", Slash: "/", Backslash: "Backslash", Semicolon: ";",
   Quote: "'", BracketLeft: "[", BracketRight: "]", Minus: "-", Equal: "=",
@@ -23,6 +26,7 @@ function keyName(code: string): string {
   return labels[code] || code;
 }
 function format(binding: string) {
+  if (binding === "Ctrl+Shift+Equal") return ["Ctrl", "+"];
   return binding.split("+").map((part) => part === "Ctrl" || part === "Alt" || part === "Shift" ? part : keyName(part));
 }
 function supported(code: string): boolean {
@@ -77,7 +81,7 @@ export default function ShortcutsSettings() {
     }
     if (!supported(event.code)) { setCaptureError("此按鍵不支援全域快捷鍵註冊。"); return; }
     const binding = mod + "+" + event.code;
-    const duplicate = (["ptt", "submit"] as Action[]).some(action =>
+    const duplicate = (["ptt", "submit", "switchTabs"] as Action[]).some(action =>
       settings()[action].some((item, index) => item === binding && (action !== current.action || index !== current.index)));
     if (duplicate) { setCaptureError("這組快捷鍵已被使用：" + format(binding).join(" + ")); return; }
     if (current.index === null && settings()[current.action].length >= 16) {
@@ -115,6 +119,7 @@ export default function ShortcutsSettings() {
       <For each={[
         { id: "ptt" as Action, title: "PTT 聽寫", desc: "按住開始聽寫，放開結束；是否自動送出由 General 控制。" },
         { id: "submit" as Action, title: "Explicit Submit", desc: "前景送出訊息；隱藏至系統匣時切換預設專案。" },
+        { id: "switchTabs" as Action, title: "Switch Tabs", desc: "依目前分頁排列切換下一個 Tab，最後一個會回到第一個。" },
       ]}>
         {action => (
           <section class="shortcut-action">

@@ -10,7 +10,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -52,10 +52,77 @@ struct Peer {
     hseq: u32,
     began: Instant,
     controls: Controls,
+    // Dropping the peer or revoking Wi-Fi-only control invalidates queued UI work.
+    switch_tab_session: Option<Arc<()>>,
     codec: Option<Codec>,
     invalid_frames: u64,
     bad_tags: u64,
 }
+impl Peer {
+    fn runtime_allowed(&self, records: &HashMap<String, Record>) -> bool {
+        self.authenticated
+            && self.wifi_only
+            && matches!(self.phase.as_str(), "FINALIZED" | "PAIRED")
+            && records
+                .get(&self.record.device)
+                .is_some_and(|r| r.state == PairState::Paired)
+    }
+
+    fn apply_controls(
+        &mut self,
+        frame: &Frame,
+        runtime_allowed: bool,
+        unlocked: bool,
+        selected: Option<&str>,
+        audio_ready: bool,
+    ) -> Vec<Kind> {
+        let allowed = runtime_allowed && unlocked && selected == Some(self.record.device.as_str());
+        self.controls.apply(frame, allowed && audio_ready, allowed)
+    }
+}
+
+struct SwitchTabDispatch {
+    device: String,
+    pair_id: String,
+    session: Weak<()>,
+    revision: u64,
+    os_generation: u64,
+}
+impl SwitchTabDispatch {
+    fn allowed(&self, h: &HostState, unlocked: bool, os_generation: u64) -> bool {
+        unlocked
+            && os_generation == self.os_generation
+            && self.session.strong_count() != 0
+            && h.ready
+            && h.runtime.invalidate == self.revision
+            && h.runtime.selected.as_deref() == Some(self.device.as_str())
+            && h.records.get(&self.device).is_some_and(|record| {
+                record.state == PairState::Paired && record.pair_id == self.pair_id
+            })
+            && !h.runtime.live.as_ref().is_some_and(|live| live.held)
+    }
+
+    fn dispatch(
+        self,
+        app: &AppHandle,
+        shared: &Arc<Mutex<HostState>>,
+        source: crate::switch_tabs_gesture::Source,
+        edge: crate::switch_tabs_gesture::Edge,
+    ) {
+        let shared = Arc::clone(shared);
+        let validator: crate::switch_tabs_gesture::Validator = Arc::new(move || {
+            shared.lock().is_ok_and(|h| {
+                self.allowed(
+                    &h,
+                    super::workstation::ready(),
+                    super::workstation::generation(),
+                )
+            })
+        });
+        crate::switch_tabs_gesture::input(app, source, edge, Some(validator));
+    }
+}
+
 pub fn start(shared: Arc<Mutex<HostState>>, stop: Arc<AtomicBool>, app: AppHandle) {
     thread::spawn(move || {
         let mut delay = 5;
@@ -192,6 +259,7 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                 }
             }
             revoke_permissions(&control, &mut peers);
+            crate::switch_tabs_gesture::cancel_device(app);
             let notify = super::workstation::generation() != os_generation
                 || (was_unlocked && !unlocked)
                 || (was_audio && !audio_ready)
@@ -213,6 +281,7 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
             .live
             .as_ref()
             .map(|s| s.identity.device.clone());
+        let mut expired_switch_peer = false;
         peers.retain(|id, p| {
             let record_matches = records
                 .get(id)
@@ -221,12 +290,16 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                 && p.last_state.elapsed() < Duration::from_secs(if p.authenticated { 2 } else { 3 })
                 && p.began.elapsed() < Duration::from_secs(86400);
             if !keep {
+                expired_switch_peer |= p.switch_tab_session.is_some();
                 eprintln!("[esp32-receiver] peer_expired record_changed={} authenticated={} control_age_ms={} session_age_ms={} seq={} invalid_frames={} bad_tags={}",
                     !record_matches, p.authenticated, p.last_state.elapsed().as_millis(),
                     p.began.elapsed().as_millis(), p.seq, p.invalid_frames, p.bad_tags);
             }
             keep
         });
+        if expired_switch_peer {
+            crate::switch_tabs_gesture::cancel_device(app);
+        }
         if active_before
             .as_ref()
             .is_some_and(|id| !peers.contains_key(id))
@@ -281,6 +354,7 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                             hseq: 0,
                             began: Instant::now(),
                             controls: Controls::default(),
+                            switch_tab_session: None,
                             codec: None,
                             invalid_frames: 0,
                             bad_tags: 0,
@@ -335,6 +409,7 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                         p.wifi_only = true;
                     } else if fields[5] == "B" {
                         p.wifi_only = false;
+                        p.switch_tab_session = None;
                         let mut h = shared.lock().map_err(|_| "host_lock")?;
                         if h.runtime
                             .live
@@ -362,6 +437,7 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                         )
                     {
                         p.phase.clear();
+                        p.switch_tab_session = None;
                         let mut h = shared.lock().map_err(|_| "host_lock")?;
                         if h.runtime.selected.as_deref() == Some(&p.record.device) {
                             h.runtime.route_error=Some("E21: incompatible app/firmware protocol; update the incompatible endpoint".into());
@@ -388,11 +464,7 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                         p.invalid_frames = p.invalid_frames.saturating_add(1);
                         continue;
                     };
-                    let runtime_allowed = records
-                        .get(&p.record.device)
-                        .is_some_and(|r| r.state == PairState::Paired)
-                        && p.wifi_only
-                        && matches!(p.phase.as_str(), "FINALIZED" | "PAIRED");
+                    let runtime_allowed = p.runtime_allowed(&records);
                     if !runtime_allowed && !frame.idle_management() {
                         continue;
                     }
@@ -400,15 +472,27 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                     echo[1] = "A";
                     let _ =
                         control.send_to(sign(&p.record.key, &echo.join("|")).as_bytes(), source);
-                    if frame.seq > p.seq {
+                    // Switch edges participate in replay but never extend audio
+                    // state freshness or the PTT control lease.
+                    let switch_tab = matches!(
+                        frame.action.as_str(),
+                        "SWITCH_DOWN" | "SWITCH_UP" | "SWITCH_CANCEL" | "SWITCH_TAB"
+                    );
+                    if !switch_tab && frame.seq > p.seq {
                         p.seq = frame.seq;
                         p.last_state = Instant::now();
+                        if frame.mode == "RESETTING" {
+                            p.switch_tab_session = None;
+                        }
                     }
-                    let allowed = runtime_allowed
-                        && unlocked
-                        && selected.as_deref() == Some(&p.record.device);
-                    let kinds = p.controls.apply(&frame, allowed && audio_ready, allowed);
-                    if runtime_allowed {
+                    let kinds = p.apply_controls(
+                        &frame,
+                        runtime_allowed,
+                        unlocked,
+                        selected.as_deref(),
+                        audio_ready,
+                    );
+                    if runtime_allowed && !switch_tab {
                         shared
                             .lock()
                             .map_err(|_| "host_lock")?
@@ -416,6 +500,76 @@ fn run(shared: &Arc<Mutex<HostState>>, stop: &AtomicBool, app: &AppHandle) -> Re
                             .insert(p.record.device.clone(), (p.dn.clone(), p.hn.clone()));
                     }
                     for kind in kinds {
+                        if kind == Kind::SwitchLegacy {
+                            let session = p.switch_tab_session.get_or_insert_with(|| Arc::new(()));
+                            let request = SwitchTabDispatch {
+                                device: p.record.device.clone(),
+                                pair_id: p.record.pair_id.clone(),
+                                session: Arc::downgrade(session),
+                                revision,
+                                os_generation,
+                            };
+                            let source = crate::switch_tabs_gesture::Source::Device {
+                                device: p.record.device.clone(),
+                                dn: p.dn.clone(),
+                                hn: p.hn.clone(),
+                            };
+                            // Old V2 firmware sends one edge; keep its original short-press behavior.
+                            request.dispatch(
+                                app,
+                                shared,
+                                source.clone(),
+                                crate::switch_tabs_gesture::Edge::Down,
+                            );
+                            SwitchTabDispatch {
+                                device: p.record.device.clone(),
+                                pair_id: p.record.pair_id.clone(),
+                                session: Arc::downgrade(session),
+                                revision,
+                                os_generation,
+                            }
+                            .dispatch(
+                                app,
+                                shared,
+                                source,
+                                crate::switch_tabs_gesture::Edge::Up,
+                            );
+                            continue;
+                        }
+                        let switch_edge = match kind {
+                            Kind::SwitchDown => Some(crate::switch_tabs_gesture::Edge::Down),
+                            Kind::SwitchUp => Some(crate::switch_tabs_gesture::Edge::Up),
+                            Kind::SwitchCancel => Some(crate::switch_tabs_gesture::Edge::Cancel),
+                            _ => None,
+                        };
+                        if let Some(edge) = switch_edge {
+                            if kind == Kind::SwitchDown {
+                                p.switch_tab_session.get_or_insert_with(|| Arc::new(()));
+                            }
+                            if let Some(session) = p.switch_tab_session.as_ref() {
+                                SwitchTabDispatch {
+                                    device: p.record.device.clone(),
+                                    pair_id: p.record.pair_id.clone(),
+                                    session: Arc::downgrade(session),
+                                    revision,
+                                    os_generation,
+                                }
+                                .dispatch(
+                                    app,
+                                    shared,
+                                    crate::switch_tabs_gesture::Source::Device {
+                                        device: p.record.device.clone(),
+                                        dn: p.dn.clone(),
+                                        hn: p.hn.clone(),
+                                    },
+                                    edge,
+                                );
+                            }
+                            if kind == Kind::SwitchCancel {
+                                p.switch_tab_session = None;
+                            }
+                            continue;
+                        }
                         let identity = Identity {
                             device: p.record.device.clone(),
                             pair_id: p.record.pair_id.clone(),
@@ -613,6 +767,7 @@ fn revoke_permissions(socket: &UdpSocket, peers: &mut HashMap<String, Peer>) {
 }
 
 fn cancel(shared: &Arc<Mutex<HostState>>, app: &AppHandle, notify: bool) {
+    crate::switch_tabs_gesture::cancel_device(app);
     if let Ok(mut h) = shared.lock() {
         if notify {
             if let Some(live) = h.runtime.live.as_ref().filter(|l| l.held) {
@@ -638,5 +793,131 @@ fn cancel(shared: &Arc<Mutex<HostState>>, app: &AppHandle, notify: bool) {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paired_record() -> Record {
+        Record {
+            device: "AABBCCDDEEFF".into(),
+            pair_id: "pair".into(),
+            key: vec![42; 32],
+            ssid: "test".into(),
+            name: "test".into(),
+            state: PairState::Paired,
+        }
+    }
+
+    #[test]
+    fn receiver_requires_authorized_peer_for_switch_edges_without_audio() {
+        let record = paired_record();
+        let device = record.device.clone();
+        let mut records = HashMap::from([(device.clone(), record.clone())]);
+        let now = Instant::now();
+        let mut peer = Peer {
+            record,
+            endpoint: "127.0.0.1:3334".parse().unwrap(),
+            dn: "dn".into(),
+            hn: "hn".into(),
+            authenticated: false,
+            phase: "PAIRED".into(),
+            wifi_only: true,
+            seq: 0,
+            last_state: now,
+            last_g: now,
+            hseq: 0,
+            began: now,
+            controls: Controls::default(),
+            switch_tab_session: None,
+            codec: None,
+            invalid_frames: 0,
+            bad_tags: 0,
+        };
+        let state = Frame::parse(&[
+            "X1", "E", &device, "dn", "hn", "1", "STATE", "0", "0", "IDLE", "0", "0", "0", "0",
+        ])
+        .unwrap();
+        peer.controls.apply(&state, false, false);
+        let mut down = Frame {
+            seq: 1,
+            action: "SWITCH_DOWN".into(),
+            ..state
+        };
+        let mut apply = |peer: &mut Peer, records: &HashMap<String, Record>, unlocked, selected| {
+            down.seq += 1;
+            peer.apply_controls(
+                &down,
+                peer.runtime_allowed(records),
+                unlocked,
+                selected,
+                false,
+            )
+        };
+        assert!(apply(&mut peer, &records, true, Some(&device)).is_empty());
+        peer.authenticated = true;
+        peer.wifi_only = false;
+        assert!(apply(&mut peer, &records, true, Some(&device)).is_empty());
+        peer.wifi_only = true;
+        peer.phase.clear();
+        assert!(apply(&mut peer, &records, true, Some(&device)).is_empty());
+        peer.phase = "PAIRED".into();
+        records.get_mut(&device).unwrap().state = PairState::Prepared;
+        assert!(apply(&mut peer, &records, true, Some(&device)).is_empty());
+        records.get_mut(&device).unwrap().state = PairState::Paired;
+        assert!(apply(&mut peer, &records, true, Some("other")).is_empty());
+        assert!(apply(&mut peer, &records, false, Some(&device)).is_empty());
+        assert_eq!(
+            apply(&mut peer, &records, true, Some(&device)),
+            vec![Kind::SwitchDown]
+        );
+        let release = Frame {
+            seq: down.seq + 1,
+            action: "SWITCH_UP".into(),
+            ..down
+        };
+        assert_eq!(
+            peer.apply_controls(&release, true, true, Some(&device), false),
+            vec![Kind::SwitchUp]
+        );
+        assert_eq!(peer.controls.latest.unwrap().action, "STATE");
+    }
+    #[test]
+    fn queued_switch_event_rechecks_authorization_without_touching_bridge() {
+        let record = paired_record();
+        let device = record.device.clone();
+        let session = Arc::new(());
+        let request = SwitchTabDispatch {
+            device: device.clone(),
+            pair_id: record.pair_id.clone(),
+            session: Arc::downgrade(&session),
+            revision: 0,
+            os_generation: 3,
+        };
+        let mut host = HostState {
+            ready: true,
+            ..HostState::default()
+        };
+        host.records.insert(device.clone(), record);
+        assert!(!request.allowed(&host, true, 3));
+        host.runtime.selected = Some(device.clone());
+        let bridge = Arc::clone(&host.bridge);
+        bridge.lock().unwrap().gate = true;
+        assert!(request.allowed(&host, true, 3));
+        assert!(bridge.lock().unwrap().gate);
+        assert!(!request.allowed(&host, false, 3));
+        assert!(!request.allowed(&host, true, 4));
+        host.runtime.invalidate += 1;
+        assert!(!request.allowed(&host, true, 3));
+        host.runtime.invalidate -= 1;
+        host.records.get_mut(&device).unwrap().state = PairState::Quarantined;
+        assert!(!request.allowed(&host, true, 3));
+        host.records.get_mut(&device).unwrap().state = PairState::Paired;
+        drop(session);
+        assert!(!request.allowed(&host, true, 3));
+        assert!(bridge.lock().unwrap().gate);
+        assert!(host.runtime.live.is_none());
     }
 }

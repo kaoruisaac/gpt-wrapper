@@ -27,13 +27,14 @@ function harness(channel = true) {
     chrome: channel ? { webview } : undefined,
     addEventListener: () => {},
   };
+  window.top = window;
   class MutationObserver {
     constructor(callback) { observe = callback; }
     observe() {}
     disconnect() {}
   }
   vm.runInNewContext(script, {
-    window, document, MutationObserver,
+    window, document, MutationObserver, location: { protocol: "https:", hostname: "chatgpt.com" },
     setTimeout: (callback) => { timers.push(callback); return timers.length; },
     clearTimeout: () => {},
     console: { debug: () => {} },

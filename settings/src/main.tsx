@@ -219,7 +219,7 @@ function GeneralSettings() {
         />
         <div class="setting-copy">
           <label class="setting-label" for="notification-sound">通知音效</label>
-          <p class="setting-description">ChatGPT 回覆完成且顯示背景通知時播放提示音</p>
+          <p class="setting-description">ChatGPT 或 Claude 回覆完成且顯示背景通知時播放提示音</p>
         </div>
       </div>
 

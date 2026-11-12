@@ -1,9 +1,33 @@
-// Trusted ChatGPT top-frame audio routing for Dictation and Voice Mode.
-// Device enumeration belongs exclusively to the user-invoked Settings inventory.
+// Trusted provider top-frame audio routing for Dictation (and ChatGPT Voice
+// Mode). Device enumeration for Settings belongs to microphone_inventory.js.
 (() => {
-  if (window !== window.top || location.protocol !== "https:" ||
-      !["chatgpt.com", "chat.openai.com"].includes(location.hostname) ||
+  // Rust pins the tab's provider here; an unpinned copy (tests) derives it
+  // from the trusted host. A pinned tab never routes another provider's page.
+  const PINNED = /*GPT_WRAPPER_PROVIDER*/null;
+  const PROVIDERS = {
+    chatgpt: {
+      name: "ChatGPT", hosts: ["chatgpt.com", "chat.openai.com"],
+      control: "button[aria-label]",
+      dictation: ["聽寫", "開始聽寫", "开始听写", "Start dictation", "Dictate"],
+      voice: ["開始語音對話", "Start Voice"],
+      stop: ["停止", "Stop"],
+    },
+    // Claude Voice Mode capture is not identified, so only Dictation is
+    // classified; any other capture keeps the site's native behavior.
+    claude: {
+      name: "Claude", hosts: ["claude.ai"],
+      control: "[aria-label]",
+      dictation: ["口述輸入"],
+      voice: [],
+      stop: ["完成聽寫"],
+    },
+  };
+  const providerId = Object.keys(PROVIDERS)
+    .find((id) => PROVIDERS[id].hosts.includes(location.hostname));
+  if (window !== window.top || location.protocol !== "https:" || !providerId ||
+      (PINNED !== null && PINNED !== providerId) ||
       window.__GPT_WRAPPER_MIC_ROUTE__) return;
+  const site = PROVIDERS[providerId];
   const media = navigator.mediaDevices;
   if (!media || typeof media.getUserMedia !== "function") return;
   const nativeCapture = media.getUserMedia;
@@ -22,7 +46,7 @@
     for (const track of old.tracks) { try { track.stop(); } catch {} managedTracks.delete(track); }
     devicePost("revoked", old);
   };
-  // Only streams acquired from a recognized ChatGPT interaction are managed.
+  // Only streams acquired from a recognized provider interaction are managed.
   const managedTracks = new Map();
   let toast = null;
 
@@ -36,7 +60,8 @@
   };
   const reasonText = {
     unavailable: "選定的麥克風目前無法使用。可直接重試，或到 Settings → General 檢查裝置。",
-    permission: "ChatGPT 麥克風權限被拒絕。請檢查權限後重試。",
+    permission: `${site.name} 麥克風權限被拒絕。請檢查網站權限後重試。`,
+    confirm: `${site.name} 無法唯一辨識所選麥克風。請到 Settings → General，選擇 ${site.name} 來源後重新確認麥克風。`,
     mismatch: "取得的音源與所選麥克風不同，已停止該次收音。",
     pending: "麥克風設定同步中，請稍後再試。",
     capture: "無法啟用選定麥克風。可重試或到 Settings → General 重新整理。",
@@ -83,10 +108,7 @@
     notify("error", reason, ticket);
     showError(reason);
   };
-  const labels = {
-    dictation: ["聽寫", "開始聽寫", "开始听写", "Start dictation", "Dictate"],
-    voice: ["開始語音對話", "Start Voice"],
-  };
+  const labels = { dictation: site.dictation, voice: site.voice };
   const newTicket = (purpose) => {
     const now = Date.now();
     return {
@@ -97,12 +119,12 @@
   };
   // Only recognized buttons open a capture classification window.
   document.addEventListener("click", (event) => {
-    const button = event.target?.closest?.("button[aria-label]");
+    const button = event.target?.closest?.(site.control);
     const label = button?.getAttribute("aria-label")?.trim();
     const purpose = labels.voice.includes(label) ? "voice"
       : labels.dictation.includes(label) ? "dictation" : null;
     if (!purpose) {
-      if (["停止", "Stop"].includes(label)) {
+      if (site.stop.includes(label)) {
         // Keep the last Dictation attempt to associate a delayed failure
         // after PTT Up, but stop classifying new requests.
         intent = null;
@@ -111,10 +133,10 @@
     }
     intent = null;
     lastTicket = null;
-    if (!policy) {
+    if (!policy || policy.pending || policy.unresolved) {
       event.preventDefault();
       event.stopImmediatePropagation();
-      showError("pending");
+      showError(policy?.unresolved ? "confirm" : "pending");
       return;
     }
     hideError();
@@ -249,10 +271,14 @@
     configure(next, nextEpoch) {
       if (!Number.isSafeInteger(nextEpoch) || nextEpoch < epoch ||
           !next || !["default", "device"].includes(next.mode) ||
-          (next.mode === "device" && (!next.deviceId || !next.label))) return;
+          (next.mode === "device" && (!next.label || (!next.deviceId && !next.resolve)))) return;
       if (nextEpoch === epoch && policy) {
+        // A failed origin match is retried on each re-sync (e.g. after the
+        // user grants this site microphone permission).
+        if (policy.unresolved && next.resolve) { resolvePolicy(next, epoch); return; }
+        if (policy.pending) return;
         if (policy.mode === next.mode &&
-            (next.mode === "default" || policy.deviceId === next.deviceId)) notify("ready");
+            (next.mode === "default" || next.resolve || policy.deviceId === next.deviceId)) notify("ready");
         return;
       }
       if (deviceLease) revokeDevice(deviceLease.id);
@@ -273,6 +299,15 @@
       const continuing = intent?.purpose === "dictation" && intent.active &&
         !intent.failed && next.mode === "device";
       epoch = nextEpoch;
+      if (next.resolve) {
+        policy = Object.freeze({ ...next, deviceId: null, pending: true });
+        intent = null;
+        lastTicket = null;
+        hideError();
+        if (interruptedVoice) showError("restart");
+        resolvePolicy(next, nextEpoch);
+        return;
+      }
       policy = Object.freeze({ ...next });
       intent = continuing ? { ...intent, epoch, failed: false } : null;
       lastTicket = intent;
@@ -282,4 +317,34 @@
     },
     showError,
   };
+
+  // The shared choice came from another provider's origin, whose device IDs
+  // are not valid here. Match the same physical device by its exact label in
+  // this origin's own inventory; never pick the first device or fall back to
+  // Windows Default when that is impossible.
+  let resolving = 0;
+  async function resolvePolicy(next, resolveEpoch) {
+    const attempt = ++resolving;
+    policy = Object.freeze({ ...next, deviceId: null, pending: true });
+    let reason = "missing", deviceId = null;
+    try {
+      const inputs = (await media.enumerateDevices()).filter((d) =>
+        d.kind === "audioinput" && d.deviceId &&
+        !["default", "communications"].includes(d.deviceId));
+      const matches = inputs.filter((d) => d.label === next.label);
+      if (inputs.length && inputs.every((d) => !d.label)) reason = "permission";
+      else if (matches.length > 1) reason = "ambiguous";
+      else if (matches.length === 1) deviceId = matches[0].deviceId;
+    } catch {
+      reason = "permission";
+    }
+    if (attempt !== resolving || resolveEpoch !== epoch) return;
+    if (deviceId) {
+      policy = Object.freeze({ mode: "device", label: next.label, groupId: "", deviceId });
+      notify("ready");
+    } else {
+      policy = Object.freeze({ ...next, deviceId: null, unresolved: true });
+      notify("unresolved", reason);
+    }
+  }
 })();

@@ -5,12 +5,15 @@ mod devices;
 mod general_settings;
 mod microphone_inventory;
 mod project_settings;
+mod provider;
 mod shortcut_settings;
 mod standby_navigation;
+mod switch_tabs_gesture;
 mod tab_completion_notifications;
 
 use general_settings::GeneralSettingsState;
-use project_settings::{ProjectSettings, ProjectSettingsState, TabSpec};
+use project_settings::{ProjectList, ProjectSettings, ProjectSettingsState, TabSpec};
+use provider::Provider;
 use serde::{Deserialize, Serialize};
 use shortcut_settings::{parse_and_validate, ShortcutSettings, ShortcutSettingsState};
 use std::{
@@ -58,6 +61,9 @@ use windows::{
 };
 
 const ADAPTER_SCRIPT: &str = include_str!("chatgpt_adapter.js");
+const CLAUDE_ADAPTER_SCRIPT: &str = include_str!("claude_adapter.js");
+// Placeholder replaced with the tab's provider ID in shared page scripts.
+const PROVIDER_PIN_MARKER: &str = "/*GPT_WRAPPER_PROVIDER*/null";
 const MICROPHONE_POC_SCRIPT: &str = include_str!("microphone_poc.js");
 const MICROPHONE_INVENTORY_SCRIPT: &str = include_str!("microphone_inventory.js");
 const MICROPHONE_ROUTE_SCRIPT: &str = include_str!("microphone_route.js");
@@ -78,7 +84,7 @@ fn trusted_chatgpt_source(source: &str) -> bool {
 const MAIN_WINDOW_LABEL: &str = "main";
 const SETTINGS_WINDOW_LABEL: &str = "settings";
 const HOST_WEBVIEW_LABEL: &str = "tab-host";
-const CHATGPT_WEBVIEW_PREFIX: &str = "chatgpt-tab-";
+const TAB_WEBVIEW_PREFIX: &str = "provider-tab-";
 const TAB_BOOTSTRAP_PATH: &str = "loading.html";
 const TAB_BAR_HEIGHT: f64 = 38.0;
 const LOADING_BACKGROUND: Color = Color(0, 0, 0, 255);
@@ -93,7 +99,19 @@ struct Rect {
     y: f64,
     #[serde(default, rename = "nativeSend")]
     native_send: bool,
+    // Claude controls report whether they are enabled; ChatGPT keeps its
+    // original visible-button behavior.
+    #[serde(default = "rect_enabled_default")]
+    enabled: bool,
 }
+
+const fn rect_enabled_default() -> bool {
+    true
+}
+
+// Claude dictation controls fixed by the dual-provider contract.
+const CLAUDE_START_LABEL: &str = "口述輸入";
+const CLAUDE_FINISH_LABEL: &str = "完成聽寫";
 
 #[derive(Clone, Copy, Debug)]
 enum DictationTarget {
@@ -104,51 +122,78 @@ enum DictationTarget {
 }
 
 impl DictationTarget {
-    fn rect_script(self) -> String {
-        let start_labels = ["聽寫", "開始聽寫", "开始听写", "Start dictation", "Dictate"];
-        // "Submit dictation" inserts the transcription into the composer; a
-        // "Transcribe and send" control can submit the entire message instead.
-        let insert_labels = [
-            "停止聽寫",
-            "Stop dictation",
-            "Submit dictation",
-            "提交听写内容",
-            "送出聽寫內容",
-            "Insert transcription",
-            "完成轉錄",
-            "完成转录",
-        ];
-        let native_send_labels = ["Transcribe and send", "轉錄並傳送"];
-        let (labels, native_labels): (Vec<&str>, Vec<&str>) = match self {
-            Self::Start => (start_labels.to_vec(), vec![]),
-            Self::Finish { allow_native_send } => (
-                insert_labels.to_vec(),
-                if allow_native_send {
-                    native_send_labels.to_vec()
-                } else {
-                    vec![]
-                },
-            ),
-        };
+    fn labels(self, provider: Provider) -> (Vec<&'static str>, Vec<&'static str>) {
+        match provider {
+            Provider::Chatgpt => {
+                let start_labels = ["聽寫", "開始聽寫", "开始听写", "Start dictation", "Dictate"];
+                // "Submit dictation" inserts the transcription into the composer; a
+                // "Transcribe and send" control can submit the entire message instead.
+                let insert_labels = [
+                    "停止聽寫",
+                    "Stop dictation",
+                    "Submit dictation",
+                    "提交听写内容",
+                    "送出聽寫內容",
+                    "Insert transcription",
+                    "完成轉錄",
+                    "完成转录",
+                ];
+                let native_send_labels = ["Transcribe and send", "轉錄並傳送"];
+                match self {
+                    Self::Start => (start_labels.to_vec(), vec![]),
+                    Self::Finish { allow_native_send } => (
+                        insert_labels.to_vec(),
+                        if allow_native_send {
+                            native_send_labels.to_vec()
+                        } else {
+                            vec![]
+                        },
+                    ),
+                }
+            }
+            // Claude's Finish only ends dictation. It is never treated as a
+            // native send, so auto-submit=false can never send a message.
+            Provider::Claude => match self {
+                Self::Start => (vec![CLAUDE_START_LABEL], vec![]),
+                Self::Finish { .. } => (vec![CLAUDE_FINISH_LABEL], vec![]),
+            },
+        }
+    }
 
+    // Returns a Rect, null when no visible control exists, or the string
+    // "untrusted-origin" (which never parses as a Rect) when the document is
+    // not the provider's trusted top-level page. Callers fail closed on it.
+    fn rect_script(self, provider: Provider) -> String {
+        let (labels, native_labels) = self.labels(provider);
+        let selector = match provider {
+            Provider::Chatgpt => "button",
+            Provider::Claude => "[aria-label]",
+        };
         format!(
             r#"(() => {{
-  const insertLabels = {};
-  const nativeLabels = {};
-  const buttons = [...document.querySelectorAll("button")];
+  if (window !== window.top || location.protocol !== "https:" || !{hosts}.includes(location.hostname)) return "untrusted-origin";
+  const insertLabels = {insert};
+  const nativeLabels = {native};
+  const checkEnabled = {check_enabled};
+  const controls = [...document.querySelectorAll({selector})];
   for (const [labels, nativeSend] of [[insertLabels, false], [nativeLabels, true]]) {{
-    for (const b of buttons) {{
+    for (const b of controls) {{
       const label = (b.getAttribute("aria-label") || "").trim();
       const r = b.getBoundingClientRect();
       if (r.width > 0 && r.height > 0 && labels.includes(label)) {{
-        return {{ x: r.left + r.width / 2, y: r.top + r.height / 2, nativeSend }};
+        const rect = {{ x: r.left + r.width / 2, y: r.top + r.height / 2, nativeSend }};
+        if (checkEnabled) rect.enabled = !b.disabled && b.getAttribute("aria-disabled") !== "true";
+        return rect;
       }}
     }}
   }}
   return null;
 }})()"#,
-            serde_json::to_string(&labels).unwrap(),
-            serde_json::to_string(&native_labels).unwrap(),
+            hosts = serde_json::to_string(provider.hosts()).unwrap(),
+            insert = serde_json::to_string(&labels).unwrap(),
+            native = serde_json::to_string(&native_labels).unwrap(),
+            check_enabled = provider == Provider::Claude,
+            selector = serde_json::to_string(selector).unwrap(),
         )
     }
 }
@@ -168,8 +213,12 @@ struct TabStatusMessage {
     status: TabStatus,
 }
 
-fn decode_tab_status(source: &str, payload: &str) -> Result<TabStatus, &'static str> {
-    if !trusted_chatgpt_source(source) {
+fn decode_tab_status(
+    provider: Provider,
+    source: &str,
+    payload: &str,
+) -> Result<TabStatus, &'static str> {
+    if !provider.trusts_source(source) {
         return Err("source rejected");
     }
     let message: TabStatusMessage =
@@ -186,21 +235,43 @@ struct TabInfo {
     id: usize,
     title: String,
     status: TabStatus,
+    provider: Provider,
 }
 
+// The Tab Bar only receives the active provider's tabs.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TabSnapshot {
+    active_provider: Provider,
     tabs: Vec<TabInfo>,
     active_tab_id: Option<usize>,
 }
 
 #[derive(Debug)]
+struct ProviderSwitchPlan {
+    previous_provider: Provider,
+    previous_tab: Option<usize>,
+    target_tab: Option<usize>,
+}
+
+struct AddedTab {
+    tab_id: usize,
+    activated: bool,
+    previous_active: Option<usize>,
+    previous_last: Option<usize>,
+}
+
+#[derive(Debug)]
 struct TabManager {
+    // One global tab ID space and order; every tab carries its provider.
     tabs: Vec<TabInfo>,
     contexts: HashMap<usize, TabContext>,
     loaded_tabs: HashSet<usize>,
+    // Invariant: None or a tab of `active_provider`.
     active_tab_id: Option<usize>,
+    active_provider: Provider,
+    last_active: HashMap<Provider, usize>,
+    provider_switch_in_progress: bool,
     next_tab_id: usize,
     standby_ptt_tab_id: Option<usize>,
     standby_ptt_ready: bool,
@@ -210,6 +281,7 @@ struct TabManager {
 
 #[derive(Debug)]
 struct TabContext {
+    provider: Provider,
     spec: TabSpec,
     // WebView document.title, including for standby tabs not yet shown in the Tab Bar.
     page_title: String,
@@ -221,10 +293,11 @@ struct TabContext {
 }
 
 impl TabContext {
-    fn new(spec: TabSpec) -> Self {
+    fn new(spec: TabSpec, provider: Provider) -> Self {
         Self {
+            provider,
             spec,
-            page_title: project_settings::CHATGPT_TITLE.to_string(),
+            page_title: provider.default_title().to_string(),
             status: TabStatus::Fallback,
             prefix_applied: false,
             prefix_in_progress: false,
@@ -242,7 +315,7 @@ impl TabContext {
         let ready = navigation.ready();
         if navigate {
             // A new destination must not inherit the previous document's title.
-            self.page_title = project_settings::CHATGPT_TITLE.to_string();
+            self.page_title = self.provider.default_title().to_string();
         }
         if self.spec != spec || navigate {
             self.prefix_applied = false;
@@ -261,6 +334,9 @@ impl TabManager {
             contexts: HashMap::new(),
             loaded_tabs: HashSet::new(),
             active_tab_id: None,
+            active_provider: Provider::default(),
+            last_active: HashMap::new(),
+            provider_switch_in_progress: false,
             next_tab_id: 1,
             standby_ptt_tab_id: None,
             standby_ptt_ready: false,
@@ -291,7 +367,7 @@ impl TabManager {
             return false;
         };
         let title = if page_title.trim().is_empty() {
-            project_settings::CHATGPT_TITLE
+            context.provider.default_title()
         } else {
             page_title.trim()
         };
@@ -310,14 +386,160 @@ impl TabManager {
 
     fn snapshot(&self) -> TabSnapshot {
         TabSnapshot {
-            tabs: self.tabs.iter().cloned().collect(),
+            active_provider: self.active_provider,
+            tabs: self
+                .tabs
+                .iter()
+                .filter(|tab| tab.provider == self.active_provider)
+                .cloned()
+                .collect(),
             active_tab_id: self.active_tab_id,
         }
     }
 
+    fn provider_of(&self, tab_id: usize) -> Option<Provider> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.provider)
+            .or_else(|| self.contexts.get(&tab_id).map(|context| context.provider))
+    }
+
+    fn provider_tab_ids(&self, provider: Provider) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.provider == provider)
+            .map(|tab| tab.id)
+            .collect()
+    }
+
+    // Selects the visible tab and remembers it as its provider's last tab.
+    fn set_active(&mut self, tab_id: Option<usize>) {
+        self.active_tab_id = tab_id;
+        if let Some(id) = tab_id {
+            if let Some(provider) = self.provider_of(id) {
+                self.last_active.insert(provider, id);
+            }
+        }
+    }
+
+    fn ensure_not_switching(&self) -> Result<(), String> {
+        if self.provider_switch_in_progress {
+            Err("平台切換中，請稍候再操作分頁。".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    // Host IPC may only address tabs of the visible provider.
+    fn ensure_visible_tab(&self, tab_id: usize) -> Result<(), String> {
+        match self.tabs.iter().find(|tab| tab.id == tab_id) {
+            Some(tab) if tab.provider == self.active_provider => Ok(()),
+            Some(_) => Err(format!("tab {tab_id} belongs to another provider")),
+            None => Err(format!("tab {tab_id} does not exist")),
+        }
+    }
+
+    // New tabs activate only within the visible provider. A tab created for a
+    // hidden provider (e.g. a link opened just before a switch) waits there.
+    fn add_tab(&mut self, provider: Provider, spec: TabSpec, background_ptt: bool) -> AddedTab {
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let previous_active = self.active_tab_id;
+        let previous_last = self.last_active.get(&provider).copied();
+        self.tabs.push(TabInfo {
+            id: tab_id,
+            title: provider.default_title().to_string(),
+            status: TabStatus::Fallback,
+            provider,
+        });
+        let mut context = TabContext::new(spec, provider);
+        context.background_ptt_pending = background_ptt;
+        self.contexts.insert(tab_id, context);
+        let activated = provider == self.active_provider;
+        if activated {
+            self.set_active(Some(tab_id));
+        } else {
+            self.last_active.insert(provider, tab_id);
+        }
+        AddedTab {
+            tab_id,
+            activated,
+            previous_active,
+            previous_last,
+        }
+    }
+
+    fn rollback_add(&mut self, added: &AddedTab) {
+        let provider = self.provider_of(added.tab_id);
+        self.remove_tab(added.tab_id);
+        if let (Some(provider), Some(previous)) = (provider, added.previous_last) {
+            if self.provider_of(previous) == Some(provider) {
+                self.last_active.insert(provider, previous);
+            }
+        }
+        if added.activated && self.active_tab_id.is_none() {
+            let previous = added
+                .previous_active
+                .filter(|id| self.provider_of(*id) == Some(self.active_provider));
+            self.active_tab_id = previous;
+        }
+    }
+
+    fn remove_tab(&mut self, tab_id: usize) {
+        self.tabs.retain(|tab| tab.id != tab_id);
+        self.loaded_tabs.remove(&tab_id);
+        self.contexts.remove(&tab_id);
+        self.last_active.retain(|_, id| *id != tab_id);
+        if self.active_tab_id == Some(tab_id) {
+            self.active_tab_id = None;
+        }
+    }
+
+    // A replacement is only chosen inside the closing tab's provider. Closing
+    // the last tab leaves that provider empty rather than borrowing a tab.
+    fn close_replacement(&self, tab_id: usize) -> Result<(bool, Option<usize>), String> {
+        let provider = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.provider)
+            .ok_or_else(|| format!("tab {tab_id} does not exist"))?;
+        let ids = self.provider_tab_ids(provider);
+        let index = ids.iter().position(|id| *id == tab_id).unwrap_or(0);
+        let was_active = self.active_tab_id == Some(tab_id);
+        let replacement = if !was_active {
+            self.active_tab_id
+        } else if index + 1 < ids.len() {
+            Some(ids[index + 1])
+        } else if index > 0 {
+            Some(ids[index - 1])
+        } else {
+            None
+        };
+        Ok((was_active, replacement))
+    }
+
+    fn next_visible_tab_id(&self) -> Option<usize> {
+        let ids = self.provider_tab_ids(self.active_provider);
+        if ids.len() <= 1 {
+            return None;
+        }
+        let next_index = ids
+            .iter()
+            .position(|id| Some(*id) == self.active_tab_id)
+            .map(|index| (index + 1) % ids.len())
+            .unwrap_or(0);
+        Some(ids[next_index])
+    }
+
     // Tab order is independent from tab identity and the active WebView.
+    // Only the visible provider's tabs are reordered; the other provider's
+    // tabs keep their slots in the global order.
     fn reorder(&mut self, tab_ids: &[usize]) -> Result<(), String> {
-        if tab_ids.len() != self.tabs.len() {
+        let provider = self.active_provider;
+        let current = self.provider_tab_ids(provider);
+        if tab_ids.len() != current.len() {
             return Err("tab order must contain every visible tab exactly once".to_string());
         }
 
@@ -327,14 +549,72 @@ impl TabManager {
             .enumerate()
             .map(|(index, id)| (id, index))
             .collect();
-        if positions.len() != self.tabs.len()
-            || self.tabs.iter().any(|tab| !positions.contains_key(&tab.id))
+        if positions.len() != current.len() || current.iter().any(|id| !positions.contains_key(id))
         {
             return Err("tab order contains missing, duplicate, or unknown tab IDs".to_string());
         }
 
-        self.tabs.sort_by_key(|tab| positions[&tab.id]);
+        let slots: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.provider == provider)
+            .map(|(index, _)| index)
+            .collect();
+        let mut ordered: Vec<TabInfo> = slots.iter().map(|index| self.tabs[*index].clone()).collect();
+        ordered.sort_by_key(|tab| positions[&tab.id]);
+        for (slot, tab) in slots.into_iter().zip(ordered) {
+            self.tabs[slot] = tab;
+        }
         Ok(())
+    }
+
+    fn provider_switch_target(&self, provider: Provider) -> Option<usize> {
+        let ids = self.provider_tab_ids(provider);
+        self.last_active
+            .get(&provider)
+            .copied()
+            .filter(|id| ids.contains(id))
+            .or_else(|| ids.first().copied())
+    }
+
+    // Ok(None): already on that provider. A returned plan must always be
+    // finished with end_provider_switch.
+    fn begin_provider_switch(
+        &mut self,
+        provider: Provider,
+    ) -> Result<Option<ProviderSwitchPlan>, String> {
+        if self.provider_switch_in_progress {
+            return Err("平台切換中，請稍候。".to_string());
+        }
+        if provider == self.active_provider {
+            return Ok(None);
+        }
+        self.provider_switch_in_progress = true;
+        Ok(Some(ProviderSwitchPlan {
+            previous_provider: self.active_provider,
+            previous_tab: self.active_tab_id,
+            target_tab: self.provider_switch_target(provider),
+        }))
+    }
+
+    fn commit_provider_switch(&mut self, provider: Provider, tab_id: Option<usize>) {
+        self.active_provider = provider;
+        self.active_tab_id = None;
+        self.set_active(tab_id.filter(|id| self.provider_of(*id) == Some(provider)));
+    }
+
+    fn rollback_provider_switch(&mut self, plan: &ProviderSwitchPlan) {
+        self.active_provider = plan.previous_provider;
+        self.active_tab_id = None;
+        let previous = plan
+            .previous_tab
+            .filter(|id| self.provider_of(*id) == Some(plan.previous_provider));
+        self.set_active(previous);
+    }
+
+    fn end_provider_switch(&mut self) {
+        self.provider_switch_in_progress = false;
     }
 }
 
@@ -461,6 +741,20 @@ impl PttTracker {
                 .lock()
                 .map(|events| events.is_empty())
                 .unwrap_or(false)
+    }
+
+    // Only an active PTT session blocks a provider switch. A tab merely marked
+    // recovery_needed must not lock other tabs or providers.
+    fn provider_switch_blocker(&self) -> Option<&'static str> {
+        if self.is_held() || self.start_in_flight.load(Ordering::SeqCst) != 0 {
+            Some("正在使用 PTT 聽寫，放開後再切換平台。")
+        } else if self.recovery_in_flight.load(Ordering::SeqCst) != 0 {
+            Some("正在檢查聽寫狀態，完成後再切換平台。")
+        } else if self.finish_in_flight.load(Ordering::SeqCst) != 0 {
+            Some("聽寫結束處理中，完成後再切換平台。")
+        } else {
+            None
+        }
     }
 
     fn recovery_needed(&self, tab_id: usize) -> bool {
@@ -872,17 +1166,46 @@ impl SettingsWindowState {
 }
 
 fn tab_label(tab_id: usize) -> String {
-    format!("{CHATGPT_WEBVIEW_PREFIX}{tab_id}")
+    format!("{TAB_WEBVIEW_PREFIX}{tab_id}")
 }
 
 fn tab_id_from_label(label: &str) -> Option<usize> {
     label
-        .strip_prefix(CHATGPT_WEBVIEW_PREFIX)
+        .strip_prefix(TAB_WEBVIEW_PREFIX)
         .and_then(|value| value.parse().ok())
 }
 
 fn snapshot(app_handle: &AppHandle) -> Result<TabSnapshot, String> {
     Ok(app_handle.state::<TabState>().lock()?.snapshot())
+}
+
+fn tab_provider(app_handle: &AppHandle, tab_id: usize) -> Option<Provider> {
+    app_handle
+        .state::<TabState>()
+        .lock()
+        .ok()
+        .and_then(|tabs| tabs.provider_of(tab_id))
+}
+
+fn active_provider(app_handle: &AppHandle) -> Result<Provider, String> {
+    Ok(app_handle.state::<TabState>().lock()?.active_provider)
+}
+
+// Each provider's own Default Project (or its home page).
+fn default_tab_spec_for(app_handle: &AppHandle, provider: Provider) -> Result<TabSpec, String> {
+    Ok(app_handle
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .default_tab_spec(provider))
+}
+
+fn provider_home_spec(provider: Provider) -> TabSpec {
+    TabSpec {
+        url: provider.home_url(),
+        title: provider.default_title().to_string(),
+        project_id: None,
+        message_prefix: String::new(),
+    }
 }
 
 fn content_size(window: &Window) -> Result<(f64, f64), String> {
@@ -914,10 +1237,10 @@ fn layout_webviews(window: &Window) -> Result<(), String> {
         } else if tab_id_from_label(webview.label()).is_some() {
             webview
                 .set_position(LogicalPosition::new(0.0, TAB_BAR_HEIGHT))
-                .map_err(|error| format!("failed to position ChatGPT tab: {error}"))?;
+                .map_err(|error| format!("failed to position provider tab: {error}"))?;
             webview
                 .set_size(LogicalSize::new(width, content_height))
-                .map_err(|error| format!("failed to resize ChatGPT tab: {error}"))?;
+                .map_err(|error| format!("failed to resize provider tab: {error}"))?;
         }
     }
 
@@ -1132,6 +1455,7 @@ fn install_tab_status_listener(
     app_handle: &AppHandle,
     webview: &Webview,
     tab_id: usize,
+    provider: Provider,
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
     let setup_error = Arc::new(Mutex::new(None));
@@ -1171,13 +1495,17 @@ fn install_tab_status_listener(
                     return Ok(());
                 }
                 let raw = CoTaskMemPWSTR::from(raw).to_string();
+                // Audio routing and inventory messages are trusted only from the
+                // tab's own provider origin (checked inside the handlers).
                 if microphone_inventory::handle_route_message(&app_handle, tab_id, &source, &raw)
-                    || microphone_inventory::handle_message(&app_handle, tab_id, &source, &raw) {
+                    || microphone_inventory::handle_message(&app_handle, tab_id, &source, &raw)
+                {
                     return Ok(());
                 }
                 // Developer-only capture-path evidence. Reject other origins and
                 // never expose these logs in a production build.
-                if microphone_poc_enabled()
+                if provider == Provider::Chatgpt
+                    && microphone_poc_enabled()
                     && serde_json::from_str::<serde_json::Value>(&raw)
                         .ok()
                         .and_then(|value| {
@@ -1195,7 +1523,7 @@ fn install_tab_status_listener(
                         c.navigation.as_ref().is_none_or(|n| n.ready())))
                     .unwrap_or(false);
                 if !page_ready { return Ok(()); }
-                match decode_tab_status(&source, &raw) {
+                match decode_tab_status(provider, &source, &raw) {
                     Ok(status) => {
                         #[cfg(debug_assertions)]
                         eprintln!("[gpt-wrapper] status tab {tab_id}: accepted {status:?}");
@@ -1311,13 +1639,10 @@ fn handle_tab_page_load(
     event: PageLoadEvent,
     page_url: &url::Url,
 ) {
+    let provider = tab_provider(webview.app_handle(), tab_id);
     if event == PageLoadEvent::Finished {
-        let current_spec = webview
-            .app_handle()
-            .state::<ProjectSettingsState>()
-            .snapshot()
-            .ok()
-            .map(|settings| settings.default_tab_spec());
+        let current_spec =
+            provider.and_then(|provider| default_tab_spec_for(webview.app_handle(), provider).ok());
         let allowed = webview
             .app_handle()
             .state::<TabState>()
@@ -1365,8 +1690,12 @@ fn handle_tab_page_load(
         return;
     }
 
-    if let Err(error) = microphone_inventory::sync_tab(webview.app_handle(), tab_id, &webview) {
-        eprintln!("[gpt-wrapper] failed to sync microphone selection on tab {tab_id}: {error}");
+    // Every provider tab receives its own origin's microphone policy
+    // (sync_tab checks the provider and its trusted origin).
+    if provider.is_some() {
+        if let Err(error) = microphone_inventory::sync_tab(webview.app_handle(), tab_id, &webview) {
+            eprintln!("[gpt-wrapper] failed to sync microphone selection on tab {tab_id}: {error}");
+        }
     }
     // Re-report the current DOM state after navigation even if the first event was missed.
     if let Err(error) = webview.eval("window.__GPT_WRAPPER__?.reportStatus?.();") {
@@ -1444,10 +1773,10 @@ fn handle_tab_page_load(
 }
 
 // Links opened into a GPT Wrapper tab do not inherit the default Project prefix.
-fn link_tab_spec(link_uri: &str) -> Result<TabSpec, String> {
+fn link_tab_spec(provider: Provider, link_uri: &str) -> Result<TabSpec, String> {
     Ok(TabSpec {
         url: project_settings::valid_url(link_uri)?,
-        title: project_settings::CHATGPT_TITLE.to_string(),
+        title: provider.default_title().to_string(),
         project_id: None,
         message_prefix: String::new(),
     })
@@ -1489,7 +1818,8 @@ mod external_link_tests {
 
     #[test]
     fn new_tabs_use_clicked_urls_without_project_prefix() {
-        let spec = link_tab_spec("https://chatgpt.com/c/test?view=full#latest").unwrap();
+        let spec =
+            link_tab_spec(Provider::Chatgpt, "https://chatgpt.com/c/test?view=full#latest").unwrap();
         assert_eq!(
             spec.url.as_str(),
             "https://chatgpt.com/c/test?view=full#latest"
@@ -1506,7 +1836,10 @@ mod external_link_tests {
             "file:///C:/secret",
             "mailto:user@example.com",
         ] {
-            assert!(link_tab_spec(url).is_err(), "unexpected allowed URL: {url}");
+            assert!(
+                link_tab_spec(Provider::Claude, url).is_err(),
+                "unexpected allowed URL: {url}"
+            );
         }
     }
 
@@ -1547,6 +1880,7 @@ fn install_link_context_menu(
     app: &AppHandle,
     webview: &Webview,
     tab_id: usize,
+    provider: Provider,
 ) -> Result<(), String> {
     let app = app.clone();
     let setup_error = Arc::new(Mutex::new(None));
@@ -1576,7 +1910,7 @@ fn install_link_context_menu(
                         let mut raw_link = PWSTR::null();
                         unsafe { target.LinkUri(&mut raw_link)? };
                         let link_uri = CoTaskMemPWSTR::from(raw_link).to_string();
-                        let Ok(spec) = link_tab_spec(&link_uri) else {
+                        let Ok(spec) = link_tab_spec(provider, &link_uri) else {
                             return Ok(());
                         };
                         let url = spec.url.clone();
@@ -1614,7 +1948,8 @@ fn install_link_context_menu(
                                 let worker_app = tab_app.clone();
                                 let worker_spec = spec.clone();
                                 tauri::async_runtime::spawn_blocking(move || {
-                                    match create_tab_with_spec(&worker_app, worker_spec, false) {
+                                    // The link stays with the source tab's provider.
+                                    match create_tab_with_spec(&worker_app, provider, worker_spec, false) {
                                         Ok(_) => refresh_tab_host(&worker_app),
                                         Err(error) => eprintln!(
                                             "[gpt-wrapper] failed to open link in new tab: {error}"
@@ -1711,28 +2046,55 @@ fn install_external_new_window_handler(webview: &Webview, tab_id: usize) -> Resu
     result.map_or(Ok(()), Err)
 }
 
-fn create_chatgpt_webview(
+// Shared page scripts are pinned to the tab's provider, so a tab that
+// navigates to the other provider's site never routes audio or reports
+// inventory there.
+fn pin_provider(script: &str, provider: Provider) -> String {
+    debug_assert!(script.contains(PROVIDER_PIN_MARKER));
+    script.replacen(
+        PROVIDER_PIN_MARKER,
+        &serde_json::to_string(provider.id()).expect("provider ID is serializable"),
+        1,
+    )
+}
+
+// Each provider gets only its own DOM adapter. Microphone inventory/routing
+// are shared implementations pinned to the provider's own origin.
+fn provider_initialization_scripts(provider: Provider) -> Vec<String> {
+    let adapter = match provider {
+        Provider::Chatgpt => ADAPTER_SCRIPT,
+        Provider::Claude => CLAUDE_ADAPTER_SCRIPT,
+    };
+    let mut scripts = vec![
+        adapter.to_string(),
+        pin_provider(MICROPHONE_INVENTORY_SCRIPT, provider),
+        pin_provider(MICROPHONE_ROUTE_SCRIPT, provider),
+    ];
+    if provider == Provider::Chatgpt && microphone_poc_enabled() {
+        scripts.push(MICROPHONE_POC_SCRIPT.to_string());
+    }
+    scripts
+}
+
+fn create_provider_webview(
     app_handle: &AppHandle,
     tab_id: usize,
-    chatgpt_url: url::Url,
+    provider: Provider,
+    page_url: url::Url,
 ) -> Result<Webview, String> {
     let window = app_handle
         .get_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "main window is missing".to_string())?;
     let (width, content_height) = content_size(&window)?;
 
-    let builder = WebviewBuilder::new(
+    let mut builder = WebviewBuilder::new(
         tab_label(tab_id),
         WebviewUrl::App(TAB_BOOTSTRAP_PATH.into()),
-    )
-    .initialization_script(ADAPTER_SCRIPT)
-    .initialization_script(MICROPHONE_INVENTORY_SCRIPT)
-    .initialization_script(MICROPHONE_ROUTE_SCRIPT)
-    .initialization_script(if microphone_poc_enabled() {
-        MICROPHONE_POC_SCRIPT
-    } else {
-        ""
-    })
+    );
+    for script in provider_initialization_scripts(provider) {
+        builder = builder.initialization_script(script);
+    }
+    let builder = builder
     .background_color(LOADING_BACKGROUND)
     .focused(false)
     .on_document_title_changed(move |webview, title| {
@@ -1757,16 +2119,16 @@ fn create_chatgpt_webview(
             LogicalPosition::new(0.0, TAB_BAR_HEIGHT),
             LogicalSize::new(width, content_height),
         )
-        .map_err(|error| format!("failed to create ChatGPT tab {tab_id}: {error}"))?;
+        .map_err(|error| format!("failed to create {provider:?} tab {tab_id}: {error}"))?;
 
     if let Err(error) = webview.hide() {
         let _ = webview.close();
         return Err(format!(
-            "failed to hide ChatGPT tab {tab_id} before navigation: {error}"
+            "failed to hide {provider:?} tab {tab_id} before navigation: {error}"
         ));
     }
 
-    if let Err(error) = install_tab_status_listener(app_handle, &webview, tab_id) {
+    if let Err(error) = install_tab_status_listener(app_handle, &webview, tab_id, provider) {
         let _ = webview.close();
         return Err(error);
     }
@@ -1782,62 +2144,50 @@ fn create_chatgpt_webview(
     }
 
     // Keep the main browser usable even if an old WebView2 runtime lacks this API.
-    if let Err(error) = install_link_context_menu(app_handle, &webview, tab_id) {
+    if let Err(error) = install_link_context_menu(app_handle, &webview, tab_id, provider) {
         eprintln!("[gpt-wrapper] link context menu unavailable on tab {tab_id}: {error}");
     }
 
-    if let Err(error) = webview.navigate(chatgpt_url) {
+    if let Err(error) = webview.navigate(page_url) {
         let _ = webview.close();
-        return Err(format!("failed to navigate ChatGPT tab {tab_id}: {error}"));
+        return Err(format!("failed to navigate {provider:?} tab {tab_id}: {error}"));
     }
 
     Ok(webview)
 }
 
+// "+" / Switch Tabs long press / startup: a new tab of the visible provider.
 fn create_tab_internal(app_handle: &AppHandle) -> Result<TabSnapshot, String> {
-    let spec = app_handle
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .default_tab_spec();
-    create_tab_with_spec(app_handle, spec, false)
+    let provider = {
+        let state = app_handle.state::<TabState>();
+        let tabs = state.lock()?;
+        tabs.ensure_not_switching()?;
+        tabs.active_provider
+    };
+    let spec = default_tab_spec_for(app_handle, provider)?;
+    create_tab_with_spec(app_handle, provider, spec, false)
 }
 
 fn create_tab_with_spec(
     app_handle: &AppHandle,
+    provider: Provider,
     spec: TabSpec,
     background_ptt: bool,
 ) -> Result<TabSnapshot, String> {
     let state = app_handle.state::<TabState>();
-    let (tab_id, previous_active) = {
-        let mut tabs = state.lock()?;
-        let tab_id = tabs.next_tab_id;
-        tabs.next_tab_id += 1;
-        let previous_active = tabs.active_tab_id;
-        tabs.tabs.push(TabInfo {
-            id: tab_id,
-            title: project_settings::CHATGPT_TITLE.to_string(),
-            status: TabStatus::Fallback,
-        });
-        let mut context = TabContext::new(spec.clone());
-        context.background_ptt_pending = background_ptt;
-        tabs.contexts.insert(tab_id, context);
-        tabs.active_tab_id = Some(tab_id);
-        (tab_id, previous_active)
-    };
+    let added = state.lock()?.add_tab(provider, spec.clone(), background_ptt);
 
-    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url) {
-        let mut tabs = state.lock()?;
-        tabs.tabs.retain(|tab| tab.id != tab_id);
-        tabs.contexts.remove(&tab_id);
-        tabs.loaded_tabs.remove(&tab_id);
-        tabs.active_tab_id = previous_active;
+    if let Err(error) = create_provider_webview(app_handle, added.tab_id, provider, spec.url) {
+        state.lock()?.rollback_add(&added);
         return Err(error);
     }
 
-    if let Some(previous_id) = previous_active {
-        if let Some(previous) = get_tab_webview(app_handle, previous_id) {
-            if let Err(error) = previous.hide() {
-                eprintln!("[gpt-wrapper] failed to hide previous tab {previous_id}: {error:?}");
+    if added.activated {
+        if let Some(previous_id) = added.previous_active {
+            if let Some(previous) = get_tab_webview(app_handle, previous_id) {
+                if let Err(error) = previous.hide() {
+                    eprintln!("[gpt-wrapper] failed to hide previous tab {previous_id}: {error:?}");
+                }
             }
         }
     }
@@ -1845,11 +2195,19 @@ fn create_tab_with_spec(
     snapshot(app_handle)
 }
 
+// The standby tab serves the provider that was visible when the window was
+// hidden to the tray.
+fn standby_provider(app: &AppHandle) -> Result<Provider, String> {
+    let state = app.state::<TabState>();
+    let tabs = state.lock()?;
+    Ok(tabs
+        .standby_ptt_tab_id
+        .and_then(|id| tabs.contexts.get(&id).map(|context| context.provider))
+        .unwrap_or(tabs.active_provider))
+}
+
 fn schedule_standby_target(app: &AppHandle) -> Result<(), String> {
-    let spec = app
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .default_tab_spec();
+    let spec = default_tab_spec_for(app, standby_provider(app)?)?;
     let start_worker = {
         let state = app.state::<TabState>();
         let mut tabs = state.lock()?;
@@ -1962,10 +2320,7 @@ fn spawn_standby_worker(app: AppHandle) {
 
 // All callers run on the UI thread. Never hold TabState across WebView operations.
 fn apply_standby_target(app: &AppHandle) -> Result<usize, String> {
-    let spec = app
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .default_tab_spec();
+    let spec = default_tab_spec_for(app, standby_provider(app)?)?;
     let (id, navigate) = {
         let state = app.state::<TabState>();
         let mut tabs = state.lock()?;
@@ -2045,10 +2400,8 @@ fn apply_standby_target(app: &AppHandle) -> Result<usize, String> {
 }
 
 fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
-    let spec = app_handle
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .default_tab_spec();
+    let provider = active_provider(app_handle)?;
+    let spec = default_tab_spec_for(app_handle, provider)?;
     let state = app_handle.state::<TabState>();
     let tab_id = {
         let mut tabs = state.lock()?;
@@ -2060,13 +2413,13 @@ fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
         tabs.next_tab_id += 1;
         tabs.standby_ptt_tab_id = Some(tab_id);
         tabs.standby_ptt_ready = false;
-        let mut context = TabContext::new(spec.clone());
+        let mut context = TabContext::new(spec.clone(), provider);
         context.navigation = Some(standby_navigation::Navigation::new(spec.url.clone()));
         tabs.contexts.insert(tab_id, context);
         tab_id
     };
 
-    if let Err(error) = create_chatgpt_webview(app_handle, tab_id, spec.url.clone()) {
+    if let Err(error) = create_provider_webview(app_handle, tab_id, provider, spec.url.clone()) {
         let mut tabs = state.lock()?;
         if tabs.standby_ptt_tab_id == Some(tab_id) {
             tabs.standby_ptt_tab_id = None;
@@ -2079,12 +2432,7 @@ fn ensure_standby_ptt_tab(app_handle: &AppHandle) -> Result<(), String> {
 
     // A settings write may have overlapped the first WebView creation. Convert
     // any newer target into a normal debounce against this newly assigned ID.
-    if app_handle
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .default_tab_spec()
-        != spec
-    {
+    if default_tab_spec_for(app_handle, provider)? != spec {
         schedule_standby_target(app_handle)?;
     }
     println!("[gpt-wrapper] standby PTT tab {tab_id} warming in background");
@@ -2127,10 +2475,7 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
             .cancel();
     }
     apply_standby_target(app_handle)?;
-    let current_spec = app_handle
-        .state::<ProjectSettingsState>()
-        .snapshot()?
-        .default_tab_spec();
+    let current_spec = default_tab_spec_for(app_handle, standby_provider(app_handle)?)?;
     let state = app_handle.state::<TabState>();
     let standby_id = {
         let tabs = state.lock()?;
@@ -2144,11 +2489,16 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
     };
     let webview = get_tab_webview(app_handle, standby_id)
         .ok_or_else(|| format!("standby PTT webview {standby_id} is missing"))?;
-    let (previous_active, ready) = {
+    let (previous_active, ready, provider_changed) = {
         let mut tabs = state.lock()?;
         if tabs.standby_ptt_tab_id != Some(standby_id) {
             return Err("standby PTT tab changed during promotion".to_string());
         }
+        let provider = tabs
+            .contexts
+            .get(&standby_id)
+            .map(|context| context.provider)
+            .ok_or("standby context missing")?;
 
         let previous_active = tabs.active_tab_id;
         let ready = tabs.standby_ptt_ready;
@@ -2170,13 +2520,21 @@ fn promote_standby_ptt_tab(app_handle: &AppHandle) -> Result<(usize, bool), Stri
             id: standby_id,
             title,
             status,
+            provider,
         });
-        tabs.active_tab_id = Some(standby_id);
+        // Explicit internal provider activation: the standby belongs to the
+        // provider that was visible when the window went to the tray.
+        let provider_changed = tabs.active_provider != provider;
+        tabs.active_provider = provider;
+        tabs.set_active(Some(standby_id));
         if ready {
             tabs.loaded_tabs.insert(standby_id);
         }
-        (previous_active, ready)
+        (previous_active, ready, provider_changed)
     };
+    if provider_changed {
+        persist_active_provider(app_handle);
+    }
 
     if let Some(previous_id) = previous_active {
         if let Some(previous) = get_tab_webview(app_handle, previous_id) {
@@ -2203,9 +2561,8 @@ fn switch_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnaps
     let state = app_handle.state::<TabState>();
     let previous_active = {
         let tabs = state.lock()?;
-        if !tabs.tabs.iter().any(|tab| tab.id == tab_id) {
-            return Err(format!("tab {tab_id} does not exist"));
-        }
+        tabs.ensure_not_switching()?;
+        tabs.ensure_visible_tab(tab_id)?;
         tabs.active_tab_id
     };
 
@@ -2222,14 +2579,30 @@ fn switch_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnaps
 
         if let Some(previous_id) = previous_active {
             if let Some(previous) = get_tab_webview(app_handle, previous_id) {
-                previous
-                    .hide()
-                    .map_err(|error| format!("failed to hide tab {previous_id}: {error}"))?;
+                if let Err(error) = previous.hide() {
+                    if is_loaded {
+                        let _ = target.hide();
+                    }
+                    return Err(format!("failed to hide tab {previous_id}: {error}"));
+                }
             }
         }
 
-        let mut tabs = state.lock()?;
-        tabs.active_tab_id = Some(tab_id);
+        let committed = {
+            let mut tabs = state.lock()?;
+            // A provider switch may have overlapped the WebView operations.
+            if tabs.provider_switch_in_progress || tabs.ensure_visible_tab(tab_id).is_err() {
+                false
+            } else {
+                tabs.set_active(Some(tab_id));
+                true
+            }
+        };
+        if !committed {
+            let _ = target.hide();
+            focus_active_tab(app_handle);
+            return Err("平台已切換，分頁切換已取消。".to_string());
+        }
     }
 
     if is_loaded {
@@ -2241,33 +2614,25 @@ fn switch_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnaps
     snapshot(app_handle)
 }
 
+fn cycle_tab_internal(app_handle: &AppHandle) -> Result<(), String> {
+    let next_id = app_handle.state::<TabState>().lock()?.next_visible_tab_id();
+    if let Some(tab_id) = next_id {
+        switch_tab_internal(app_handle, tab_id)?;
+        refresh_tab_host(app_handle);
+    }
+    Ok(())
+}
+
 fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapshot, String> {
+    let state = app_handle.state::<TabState>();
+    {
+        let tabs = state.lock()?;
+        tabs.ensure_not_switching()?;
+        tabs.ensure_visible_tab(tab_id)?;
+    }
     devices::runtime::tab_invalidated(app_handle, tab_id);
     app_handle.state::<PttState>().0.clear_tab(tab_id);
-    let state = app_handle.state::<TabState>();
-    let (was_active, replacement) = {
-        let tabs = state.lock()?;
-        let index = tabs
-            .tabs
-            .iter()
-            .position(|tab| tab.id == tab_id)
-            .ok_or_else(|| format!("tab {tab_id} does not exist"))?;
-
-        let was_active = tabs.active_tab_id == Some(tab_id);
-        let replacement = if was_active {
-            if index + 1 < tabs.tabs.len() {
-                Some(tabs.tabs[index + 1].id)
-            } else if index > 0 {
-                Some(tabs.tabs[index - 1].id)
-            } else {
-                None
-            }
-        } else {
-            tabs.active_tab_id
-        };
-
-        (was_active, replacement)
-    };
+    let (was_active, replacement) = state.lock()?.close_replacement(tab_id)?;
 
     let webview = get_tab_webview(app_handle, tab_id)
         .ok_or_else(|| format!("webview for tab {tab_id} is missing"))?;
@@ -2275,38 +2640,155 @@ fn close_tab_internal(app_handle: &AppHandle, tab_id: usize) -> Result<TabSnapsh
         .close()
         .map_err(|error| format!("failed to close tab {tab_id}: {error}"))?;
 
-    {
+    let show_replacement = {
         let mut tabs = state.lock()?;
-        tabs.tabs.retain(|tab| tab.id != tab_id);
-        tabs.loaded_tabs.remove(&tab_id);
-        tabs.contexts.remove(&tab_id);
-        if was_active {
-            tabs.active_tab_id = replacement;
+        let still_active = tabs.active_tab_id == Some(tab_id);
+        tabs.remove_tab(tab_id);
+        // An empty provider stays empty; "+" or a later switch creates a tab.
+        let replacement = replacement.filter(|id| tabs.ensure_visible_tab(*id).is_ok());
+        if was_active && still_active {
+            tabs.set_active(replacement);
+            replacement
+        } else {
+            None
         }
-    }
+    };
     tab_completion_notifications::cancel_tab(app_handle, tab_id);
 
-    if was_active {
-        if let Some(replacement_id) = replacement {
-            if is_tab_loaded(app_handle, replacement_id) {
-                if let Some(replacement_webview) = get_tab_webview(app_handle, replacement_id) {
-                    replacement_webview
-                        .show()
-                        .map_err(|error| format!("failed to show tab {replacement_id}: {error}"))?;
-                    replacement_webview.set_focus().map_err(|error| {
-                        format!("failed to focus tab {replacement_id}: {error}")
-                    })?;
-                }
+    if let Some(replacement_id) = show_replacement {
+        if is_tab_loaded(app_handle, replacement_id) {
+            if let Some(replacement_webview) = get_tab_webview(app_handle, replacement_id) {
+                replacement_webview
+                    .show()
+                    .map_err(|error| format!("failed to show tab {replacement_id}: {error}"))?;
+                replacement_webview
+                    .set_focus()
+                    .map_err(|error| format!("failed to focus tab {replacement_id}: {error}"))?;
             }
         }
     }
 
-    let needs_replacement = state.lock()?.tabs.is_empty();
-    if needs_replacement {
-        return create_tab_internal(app_handle);
+    snapshot(app_handle)
+}
+
+fn persist_active_provider(app_handle: &AppHandle) {
+    let Ok(provider) = active_provider(app_handle) else {
+        return;
+    };
+    if let Err(error) = app_handle
+        .state::<GeneralSettingsState>()
+        .set_active_provider(provider)
+    {
+        eprintln!("[gpt-wrapper] failed to persist active provider {provider:?}: {error}");
+    }
+}
+
+fn show_tab_if_loaded(app_handle: &AppHandle, tab_id: Option<usize>) {
+    let Some(tab_id) = tab_id else {
+        return;
+    };
+    if !is_tab_loaded(app_handle, tab_id) {
+        return;
+    }
+    if let Some(webview) = get_tab_webview(app_handle, tab_id) {
+        let _ = webview.show();
+        let _ = webview.set_focus();
+    }
+}
+
+// Switching providers only changes which WebView is visible. Hidden WebViews
+// are never reloaded or closed, so drafts, generation and observers continue.
+fn switch_provider_internal(
+    app_handle: &AppHandle,
+    provider: Provider,
+) -> Result<TabSnapshot, String> {
+    let tracker = Arc::clone(&app_handle.state::<PttState>().0);
+    if let Some(reason) = tracker.provider_switch_blocker() {
+        return Err(reason.to_string());
+    }
+    let state = app_handle.state::<TabState>();
+    let plan = state.lock()?.begin_provider_switch(provider)?;
+    let Some(plan) = plan else {
+        focus_active_tab(app_handle);
+        return snapshot(app_handle);
+    };
+    let result = run_provider_switch(app_handle, &tracker, provider, &plan);
+    if let Ok(mut tabs) = state.lock() {
+        tabs.end_provider_switch();
+    }
+    result?;
+    persist_active_provider(app_handle);
+    println!(
+        "[gpt-wrapper] provider switched {:?} -> {provider:?}",
+        plan.previous_provider
+    );
+    snapshot(app_handle)
+}
+
+fn run_provider_switch(
+    app_handle: &AppHandle,
+    tracker: &Arc<PttTracker>,
+    provider: Provider,
+    plan: &ProviderSwitchPlan,
+) -> Result<(), String> {
+    let state = app_handle.state::<TabState>();
+    let previous = plan
+        .previous_tab
+        .and_then(|id| get_tab_webview(app_handle, id));
+    let target = match plan.target_tab {
+        Some(id) => Some((
+            id,
+            get_tab_webview(app_handle, id)
+                .ok_or_else(|| format!("webview for tab {id} is missing"))?,
+            is_tab_loaded(app_handle, id),
+        )),
+        None => None,
+    };
+    let spec = match target {
+        Some(_) => None,
+        None => Some(default_tab_spec_for(app_handle, provider)?),
+    };
+
+    // Never leave two tab WebViews visible: hide the old provider first.
+    if let Some(previous) = &previous {
+        previous
+            .hide()
+            .map_err(|error| format!("failed to hide current tab: {error}"))?;
+    }
+    let restore_previous = || show_tab_if_loaded(app_handle, plan.previous_tab);
+
+    // PTT may have been pressed while the WebViews were changing.
+    if let Some(reason) = tracker.provider_switch_blocker() {
+        restore_previous();
+        return Err(reason.to_string());
     }
 
-    snapshot(app_handle)
+    match (target, spec) {
+        (Some((id, webview, loaded)), _) => {
+            if loaded {
+                if let Err(error) = webview.show() {
+                    restore_previous();
+                    return Err(format!("failed to show tab {id}: {error}"));
+                }
+            }
+            state.lock()?.commit_provider_switch(provider, Some(id));
+            if loaded {
+                let _ = webview.set_focus();
+            }
+            Ok(())
+        }
+        (None, Some(spec)) => {
+            // First visit (or every tab closed): create the provider home tab.
+            state.lock()?.commit_provider_switch(provider, None);
+            if let Err(error) = create_tab_with_spec(app_handle, provider, spec, false) {
+                state.lock()?.rollback_provider_switch(plan);
+                restore_previous();
+                return Err(error);
+            }
+            Ok(())
+        }
+        (None, None) => unreachable!("a provider switch needs a target tab or a spec"),
+    }
 }
 
 #[tauri::command]
@@ -2350,21 +2832,57 @@ async fn create_tab(app: AppHandle, webview: Webview) -> Result<TabSnapshot, Str
     create_tab_internal(&app)
 }
 
+// Host-only. Hidden-provider WebViews stay alive; see switch_provider_internal.
+#[tauri::command]
+async fn switch_provider(
+    app: AppHandle,
+    webview: Webview,
+    provider: Provider,
+) -> Result<TabSnapshot, String> {
+    ensure_host_webview(&webview)?;
+    switch_provider_internal(&app, provider)
+}
+
+// A bookmark request names its provider explicitly. It is served only while
+// that provider is the visible one, so a stale menu result from before a
+// provider switch is rejected instead of opening the wrong list's Project.
+fn ensure_bookmarks_visible(app: &AppHandle, provider: Provider) -> Result<(), String> {
+    let state = app.state::<TabState>();
+    let tabs = state.lock()?;
+    tabs.ensure_not_switching()?;
+    if tabs.active_provider == provider {
+        Ok(())
+    } else {
+        Err("書籤選單已過期：目前顯示的平台已變更，請重新開啟。".to_string())
+    }
+}
+
+// Nil selects the provider's built-in home page; any other ID must belong
+// to that provider's list.
+fn bookmark_tab_spec(
+    settings: &ProjectSettings,
+    provider: Provider,
+    project_id: Uuid,
+) -> Result<TabSpec, String> {
+    if project_id.is_nil() {
+        Ok(provider_home_spec(provider))
+    } else {
+        settings.list(provider).project_tab_spec(provider, project_id)
+    }
+}
+
 #[tauri::command]
 async fn create_project_tab(
     app: AppHandle,
     webview: Webview,
+    provider: Provider,
     project_id: Uuid,
 ) -> Result<TabSnapshot, String> {
     ensure_host_webview(&webview)?;
-    let spec = if project_id.is_nil() {
-        ProjectSettings::default().default_tab_spec()
-    } else {
-        app.state::<ProjectSettingsState>()
-            .snapshot()?
-            .project_tab_spec(project_id)?
-    };
-    create_tab_with_spec(&app, spec, false)
+    ensure_bookmarks_visible(&app, provider)?;
+    let settings = app.state::<ProjectSettingsState>().snapshot()?;
+    let spec = bookmark_tab_spec(&settings, provider, project_id)?;
+    create_tab_with_spec(&app, provider, spec, false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2385,7 +2903,8 @@ impl Drop for PopupMenu {
 
 fn track_project_bookmark_menu(
     app: &AppHandle,
-    settings: ProjectSettings,
+    provider: Provider,
+    settings: ProjectList,
     anchor: MenuAnchor,
 ) -> Result<Option<Uuid>, String> {
     // IPC can reach the UI thread after the mouse has already been released.
@@ -2400,7 +2919,9 @@ fn track_project_bookmark_menu(
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     let menu = PopupMenu(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
 
-    let builtin_label: Vec<u16> = "ChatGPT.com\0".encode_utf16().collect();
+    let builtin_label: Vec<u16> = format!("{}\0", background_project_switcher::builtin_label(provider))
+        .encode_utf16()
+        .collect();
     let builtin_flags = if settings.default_project_id.is_none() {
         MF_STRING | MF_CHECKED
     } else {
@@ -2445,18 +2966,24 @@ fn track_project_bookmark_menu(
 async fn show_project_bookmark_menu(
     app: AppHandle,
     webview: Webview,
+    provider: Provider,
     anchor: MenuAnchor,
 ) -> Result<Option<Uuid>, String> {
     ensure_host_webview(&webview)?;
+    ensure_bookmarks_visible(&app, provider)?;
     if !anchor.right.is_finite() || !anchor.bottom.is_finite() {
         return Err("invalid bookmark menu anchor".into());
     }
-    let settings = app.state::<ProjectSettingsState>().snapshot()?;
+    let settings = app
+        .state::<ProjectSettingsState>()
+        .snapshot()?
+        .list(provider)
+        .clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (sender, receiver) = std::sync::mpsc::channel();
         let app_for_ui = app.clone();
         app.run_on_main_thread(move || {
-            let _ = sender.send(track_project_bookmark_menu(&app_for_ui, settings, anchor));
+            let _ = sender.send(track_project_bookmark_menu(&app_for_ui, provider, settings, anchor));
         })
         .map_err(|error| error.to_string())?;
         receiver.recv().map_err(|error| error.to_string())?
@@ -2480,6 +3007,7 @@ fn reorder_tabs(
     ensure_host_webview(&webview)?;
     let state = app.state::<TabState>();
     let mut tabs = state.lock()?;
+    tabs.ensure_not_switching()?;
     tabs.reorder(&tab_ids)?;
     Ok(tabs.snapshot())
 }
@@ -2498,12 +3026,17 @@ fn ensure_settings_webview(webview: &Webview) -> Result<(), String> {
     }
 }
 
+// Only the named provider's list changes. The tray standby is re-targeted
+// only when its own provider's Default Project changed.
 fn update_project_settings(
     app: &AppHandle,
-    change: impl FnOnce(&mut ProjectSettings) -> Result<(), String>,
+    provider: Provider,
+    change: impl FnOnce(&mut ProjectList) -> Result<(), String>,
 ) -> Result<ProjectSettings, String> {
-    let (settings, default_changed) = app.state::<ProjectSettingsState>().update(change)?;
-    if default_changed {
+    let (settings, default_changed) = app
+        .state::<ProjectSettingsState>()
+        .update(provider, change)?;
+    if default_changed && standby_provider(app).is_ok_and(|standby| standby == provider) {
         if let Err(error) = schedule_standby_target(app) {
             eprintln!("[gpt-wrapper] failed to schedule persisted standby target: {error}");
         }
@@ -2517,17 +3050,20 @@ fn get_project_settings(app: AppHandle, webview: Webview) -> Result<ProjectSetti
     app.state::<ProjectSettingsState>().snapshot()
 }
 
+// Settings names the provider whose list it edits; Rust never infers it from
+// the active tab or the Tab Bar.
 #[tauri::command]
 fn create_project(
     app: AppHandle,
     webview: Webview,
+    provider: Provider,
     name: String,
     url: String,
     message_prefix: String,
 ) -> Result<ProjectSettings, String> {
     ensure_settings_webview(&webview)?;
-    update_project_settings(&app, |data| {
-        project_settings::create(data, name, url, message_prefix)
+    update_project_settings(&app, provider, |data| {
+        project_settings::create(data, provider, name, url, message_prefix)
     })
 }
 
@@ -2535,31 +3071,40 @@ fn create_project(
 fn edit_project(
     app: AppHandle,
     webview: Webview,
+    provider: Provider,
     id: Uuid,
     name: String,
     url: String,
     message_prefix: String,
 ) -> Result<ProjectSettings, String> {
     ensure_settings_webview(&webview)?;
-    update_project_settings(&app, |data| {
-        project_settings::edit(data, id, name, url, message_prefix)
+    update_project_settings(&app, provider, |data| {
+        project_settings::edit(data, provider, id, name, url, message_prefix)
     })
 }
 
 #[tauri::command]
-fn delete_project(app: AppHandle, webview: Webview, id: Uuid) -> Result<ProjectSettings, String> {
+fn delete_project(
+    app: AppHandle,
+    webview: Webview,
+    provider: Provider,
+    id: Uuid,
+) -> Result<ProjectSettings, String> {
     ensure_settings_webview(&webview)?;
-    update_project_settings(&app, |data| project_settings::delete(data, id))
+    update_project_settings(&app, provider, |data| project_settings::delete(data, id))
 }
 
 #[tauri::command]
 fn set_default_project(
     app: AppHandle,
     webview: Webview,
+    provider: Provider,
     id: Option<Uuid>,
 ) -> Result<ProjectSettings, String> {
     ensure_settings_webview(&webview)?;
-    update_project_settings(&app, |data| project_settings::set_default(data, id))
+    update_project_settings(&app, provider, |data| {
+        project_settings::set_default(data, id)
+    })
 }
 
 #[tauri::command]
@@ -2895,8 +3440,22 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
     Ok(())
 }
 
+// The provider of a tab WebView, from Rust state (never from the page).
+fn webview_tab_provider(webview: &Webview) -> Option<Provider> {
+    let tab_id = tab_id_from_label(webview.label())?;
+    tab_provider(webview.app_handle(), tab_id)
+}
+
+// A tab without a known provider gets a lookup that always fails closed.
+fn provider_rect_script(provider: Option<Provider>, target: DictationTarget) -> String {
+    match provider {
+        Some(provider) => target.rect_script(provider),
+        None => "\"untrusted-origin\"".to_string(),
+    }
+}
+
 fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Option<ClickGuard>) {
-    let script = HSTRING::from(target.rect_script());
+    let script = HSTRING::from(provider_rect_script(webview_tab_provider(webview), target));
 
     let result = webview.with_webview(move |platform_webview| {
         let controller = platform_webview.controller();
@@ -2918,6 +3477,12 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                 if let Err(error) = result {
                     eprintln!("[gpt-wrapper] button lookup script failed: {error:?}");
                 } else { match serde_json::from_str::<Option<Rect>>(&raw) {
+                    Ok(Some(rect)) if !rect.enabled => {
+                        eprintln!(
+                            "[gpt-wrapper] {:?} dictation control is visible but disabled",
+                            target
+                        );
+                    }
                     Ok(Some(rect)) => {
                         match &guard {
                             Some(ClickGuard::Start(tracker, app, tab_id, generation)) => {
@@ -3120,12 +3685,12 @@ fn verify_start_visible(
         fail_start(app, tracker, tab_id, generation);
         return;
     };
-    let script = HSTRING::from(
+    let script = HSTRING::from(provider_rect_script(
+        tab_provider(&app, tab_id),
         DictationTarget::Finish {
             allow_native_send: true,
-        }
-        .rect_script(),
-    );
+        },
+    ));
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
             return;
@@ -3215,12 +3780,12 @@ fn verify_finish_stopped(
     };
     // Check every known recording completion control, not just the selected
     // action, so a remaining Send/Insert choice isn't mistaken for completion.
-    let script = HSTRING::from(
+    let script = HSTRING::from(provider_rect_script(
+        tab_provider(&app, tab_id),
         DictationTarget::Finish {
             allow_native_send: true,
-        }
-        .rect_script(),
-    );
+        },
+    ));
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
             return;
@@ -3356,20 +3921,22 @@ fn schedule_ptt_start(
 
 // Reuse the exact Start/Finish selectors for the recovery probe. Only the
 // safe (nativeSend=false) Finish can be clicked during recovery.
-fn recovery_probe_script() -> String {
+fn recovery_probe_script(provider: Provider) -> String {
     format!(
         r#"(() => {{
   const start = {};
   const finish = {};
+  if (typeof start === "string" || typeof finish === "string") return {{kind: "unknown"}};
+  if (finish && finish.enabled === false) return {{kind: "unknown"}};
   if (finish) return {{kind: finish.nativeSend ? "unsafe" : "safe", x: finish.x, y: finish.y}};
   if (start) return {{kind: "idle"}};
   return {{kind: "unknown"}};
 }})()"#,
-        DictationTarget::Start.rect_script(),
+        DictationTarget::Start.rect_script(provider),
         DictationTarget::Finish {
             allow_native_send: true
         }
-        .rect_script()
+        .rect_script(provider)
     )
 }
 
@@ -3426,14 +3993,18 @@ fn probe_ptt_recovery(
             &tracker,
             tab_id,
             generation,
-            "ChatGPT 分頁尚未準備好，請再試一次。",
+            "分頁尚未準備好，請再試一次。",
         );
         return;
     };
-    let script = HSTRING::from(recovery_probe_script());
+    let Some(provider) = tab_provider(&app, tab_id) else {
+        abort_ptt_recovery(&app, &tracker, tab_id, generation, "分頁已關閉，請再試一次。");
+        return;
+    };
+    let script = HSTRING::from(recovery_probe_script(provider));
     let result = tab.with_webview(move |platform| {
         let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
-            abort_ptt_recovery(&app, &tracker, tab_id, generation, "無法讀取 ChatGPT 聽寫狀態，請再試一次。");
+            abort_ptt_recovery(&app, &tracker, tab_id, generation, "無法讀取聽寫狀態，請再試一次。");
             return;
         };
         let click_core = core.clone();
@@ -3471,7 +4042,7 @@ fn probe_ptt_recovery(
                     if let (Some(x), Some(y)) = (x, y) {
                         if tracker.is_recovering(tab_id, generation) {
                             // Trusted click only on a known transcription-only Finish.
-                            let rect = Rect { x, y, native_send: false };
+                            let rect = Rect { x, y, native_send: false, enabled: true };
                             dispatch_trusted_click(&click_core, rect);
                         }
                     } else {
@@ -3512,7 +4083,16 @@ fn probe_ptt_recovery(
 
 // Both the device Submit signal and the Ctrl+. shortcut invoke this same WebView action.
 // The DOM adapter checks the draft, dictation state, Send button and duplicate requests.
+// The DOM dictation adapter is provider specific and selected by the tab's
+// provider, so a tab whose provider is unknown (closed) gets no DOM operations.
+fn dictation_supported(app_handle: &AppHandle, tab_id: usize) -> bool {
+    tab_provider(app_handle, tab_id).is_some()
+}
+
 fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
+    if !dictation_supported(app_handle, tab_id) {
+        return;
+    }
     if !is_tab_loaded(app_handle, tab_id) {
         eprintln!("[gpt-wrapper] Submit target tab {tab_id} is not loaded");
         return;
@@ -3530,6 +4110,15 @@ fn request_explicit_send(app_handle: &AppHandle, tab_id: usize) {
 // Keyboard dispatch and authenticated X1 device input converge here. Device input
 // crosses the session/selection/sequence boundary in devices::runtime first.
 fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTracker>) {
+    if matches!(
+        event,
+        PttEvent::Down(_)
+            | PttEvent::SubmitDevice
+            | PttEvent::SubmitDeviceAt(_)
+            | PttEvent::SubmitKeyboard(_)
+    ) {
+        switch_tabs_gesture::cancel_all(app_handle);
+    }
     // Tray-only Submit must never borrow a pending PTT target or a deferred Send.
     // Run before the foreground defer/target routing; this path needs no active tab.
     if app_handle
@@ -3539,7 +4128,11 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
         && matches!(event, PttEvent::SubmitKeyboard(_) | PttEvent::SubmitDevice)
     {
         if tracker.safe_for_background_switch() {
-            background_project_switcher::press(app_handle);
+            // The provider that was visible when the window went to the tray.
+            match standby_provider(app_handle) {
+                Ok(provider) => background_project_switcher::press(app_handle, provider),
+                Err(error) => eprintln!("[gpt-wrapper] background Project switch failed: {error}"),
+            }
         } else {
             eprintln!("[gpt-wrapper] background Project switch rejected: PTT/Finish still active");
         }
@@ -3568,11 +4161,11 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                             "[gpt-wrapper] standby promotion failed, creating fallback tab: {error}"
                         );
                         discard_standby_ptt_tab(app_handle);
-                        let fallback = app_handle
-                            .state::<ProjectSettingsState>()
-                            .snapshot()
-                            .map(|settings| settings.default_tab_spec())
-                            .and_then(|spec| create_tab_with_spec(app_handle, spec, true));
+                        let fallback = active_provider(app_handle).and_then(|provider| {
+                            default_tab_spec_for(app_handle, provider).and_then(|spec| {
+                                create_tab_with_spec(app_handle, provider, spec, true)
+                            })
+                        });
                         if let Err(create_error) = fallback {
                             eprintln!(
                                 "[gpt-wrapper] failed to create fallback PTT tab: {create_error}"
@@ -3596,6 +4189,17 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                     restore_to_foreground(&window);
                 } else {
                     eprintln!("[gpt-wrapper] main window missing");
+                    return;
+                }
+
+                if !dictation_supported(app_handle, tab_id) {
+                    if let Ok(mut tabs) = app_handle.state::<TabState>().lock() {
+                        if let Some(context) = tabs.contexts.get_mut(&tab_id) {
+                            context.background_ptt_pending = false;
+                        }
+                    }
+                    refresh_tab_host(app_handle);
+                    focus_active_tab(app_handle);
                     return;
                 }
 
@@ -3624,16 +4228,28 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 return;
             }
 
+            let switching = app_handle
+                .state::<TabState>()
+                .lock()
+                .map(|tabs| tabs.provider_switch_in_progress)
+                .unwrap_or(true);
+            if switching {
+                eprintln!("[gpt-wrapper] PTT ignored while the provider is switching");
+                return;
+            }
             let Some(tab_id) = active_tab_id(app_handle) else {
-                eprintln!("[gpt-wrapper] active ChatGPT tab missing");
+                eprintln!("[gpt-wrapper] active tab missing");
                 return;
             };
+            if !dictation_supported(app_handle, tab_id) {
+                return;
+            }
             if !is_tab_loaded(app_handle, tab_id) {
-                eprintln!("[gpt-wrapper] active ChatGPT tab {tab_id} is still loading");
+                eprintln!("[gpt-wrapper] active tab {tab_id} is still loading");
                 return;
             }
             let Some(webview) = get_tab_webview(app_handle, tab_id) else {
-                eprintln!("[gpt-wrapper] active ChatGPT webview missing");
+                eprintln!("[gpt-wrapper] active tab webview missing");
                 return;
             };
             if tracker.recovery_needed(tab_id) {
@@ -3850,6 +4466,7 @@ struct KeyboardShortcutState {
     update_lock: Mutex<()>,
     ptt_keys_down: Arc<Mutex<HashSet<u32>>>,
     submit_keys_down: Arc<Mutex<HashSet<u32>>>,
+    switch_tabs_keys_down: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl KeyboardShortcutState {
@@ -3858,6 +4475,7 @@ impl KeyboardShortcutState {
             update_lock: Mutex::new(()),
             ptt_keys_down: Arc::new(Mutex::new(HashSet::new())),
             submit_keys_down: Arc::new(Mutex::new(HashSet::new())),
+            switch_tabs_keys_down: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -3866,6 +4484,9 @@ impl KeyboardShortcutState {
             held.clear();
         }
         if let Ok(mut held) = self.submit_keys_down.lock() {
+            held.clear();
+        }
+        if let Ok(mut held) = self.switch_tabs_keys_down.lock() {
             held.clear();
         }
     }
@@ -3884,7 +4505,7 @@ fn register_keyboard_shortcuts(
     tracker: &Arc<PttTracker>,
     keyboard: &KeyboardShortcutState,
 ) -> Result<(), String> {
-    let (ptt, submit) = parse_and_validate(settings)?;
+    let (ptt, submit, switch_tabs) = parse_and_validate(settings)?;
     for (index, shortcut) in ptt.into_iter().enumerate() {
         let held = Arc::clone(&keyboard.ptt_keys_down);
         let tracker = Arc::clone(tracker);
@@ -3958,6 +4579,46 @@ fn register_keyboard_shortcuts(
                 )
             })?;
     }
+    for (index, shortcut) in switch_tabs.into_iter().enumerate() {
+        let held = Arc::clone(&keyboard.switch_tabs_keys_down);
+        app.global_shortcut()
+            .on_shortcut(shortcut, move |app, shortcut, event| {
+                if event.state() == ShortcutState::Pressed && settings_has_focus(app) {
+                    return;
+                }
+                let Ok(mut pressed) = held.lock() else {
+                    return;
+                };
+                let edge = match event.state() {
+                    ShortcutState::Pressed => {
+                        if !pressed.insert(shortcut.id()) {
+                            return;
+                        }
+                        switch_tabs_gesture::Edge::Down
+                    }
+                    ShortcutState::Released => {
+                        if !pressed.remove(&shortcut.id()) {
+                            return;
+                        }
+                        switch_tabs_gesture::Edge::Up
+                    }
+                };
+                drop(pressed);
+                switch_tabs_gesture::input(
+                    app,
+                    switch_tabs_gesture::Source::Keyboard(shortcut.id()),
+                    edge,
+                    None,
+                );
+            })
+            .map_err(|error| {
+                format!(
+                    "無法註冊 Switch Tabs 快捷鍵 {}（{}）：{error}",
+                    index + 1,
+                    settings.switch_tabs[index]
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -3994,6 +4655,7 @@ fn set_shortcut_settings(
     manager
         .unregister_all()
         .map_err(|e| format!("無法更新快捷鍵：{e}"))?;
+    switch_tabs_gesture::cancel_all(&app);
     keyboard.reset();
     if let Err(error) = register_keyboard_shortcuts(&app, &settings, tracker, &keyboard) {
         let _ = manager.unregister_all();
@@ -4049,6 +4711,7 @@ fn main() {
             devices::devices_wifi,
             get_tabs,
             create_tab,
+            switch_provider,
             create_project_tab,
             show_project_bookmark_menu,
             switch_tab,
@@ -4081,6 +4744,7 @@ fn main() {
             let launched_by_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
 
             app.manage(TabState::new());
+            app.manage(switch_tabs_gesture::State::default());
             app.manage(microphone_inventory::InventoryBridge::new());
             app.manage(microphone_inventory::MicrophoneRouting::new());
 
@@ -4104,6 +4768,15 @@ fn main() {
                 app.path().app_config_dir()?.join("shortcut-settings.json");
             app.manage(ShortcutSettingsState::load(shortcut_settings_path));
             app.manage(KeyboardShortcutState::new());
+            // Older installs have no saved provider and start on ChatGPT.
+            let saved_provider = app
+                .state::<GeneralSettingsState>()
+                .active_provider()
+                .unwrap_or_default();
+            app.state::<TabState>()
+                .lock()
+                .map_err(tauri::Error::AssetNotFound)?
+                .active_provider = saved_provider;
             let window = WindowBuilder::new(app, MAIN_WINDOW_LABEL)
                 .title("GPT Wrapper")
                 .background_color(LOADING_BACKGROUND)
@@ -4179,7 +4852,7 @@ fn main() {
                 println!("[gpt-wrapper] launched by Windows autostart in tray-only mode.");
             }
 
-            println!("[gpt-wrapper] main window and initial ChatGPT tab created.");
+            println!("[gpt-wrapper] main window and initial {saved_provider:?} tab created.");
 
             let settings = app
                 .state::<ShortcutSettingsState>()
@@ -4226,10 +4899,10 @@ mod ptt_tests {
 
     #[test]
     fn standby_same_url_adopts_full_spec_and_resets_prefix_without_navigation() {
-        let mut spec = ProjectSettings::default().default_tab_spec();
+        let mut spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
         spec.project_id = Some(Uuid::new_v4());
         spec.message_prefix = "old".into();
-        let mut context = TabContext::new(spec.clone());
+        let mut context = TabContext::new(spec.clone(), Provider::Chatgpt);
         let mut navigation = standby_navigation::Navigation::new(spec.url.clone());
         assert!(navigation.started(1, &spec.url));
         assert!(navigation.finished(1, &spec.url, true));
@@ -4248,8 +4921,8 @@ mod ptt_tests {
 
     #[test]
     fn standby_spec_change_during_loading_never_reuses_old_prefix_or_ready() {
-        let spec = ProjectSettings::default().default_tab_spec();
-        let mut context = TabContext::new(spec.clone());
+        let spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
+        let mut context = TabContext::new(spec.clone(), Provider::Chatgpt);
         let mut navigation = standby_navigation::Navigation::new(spec.url.clone());
         assert!(navigation.started(1, &spec.url));
         context.navigation = Some(navigation);
@@ -4299,7 +4972,7 @@ mod ptt_tests {
         let insert_only = DictationTarget::Finish {
             allow_native_send: false,
         }
-        .rect_script();
+        .rect_script(Provider::Chatgpt);
         assert!(insert_only.contains("停止聽寫"));
         assert!(insert_only.contains("Stop dictation"));
         assert!(insert_only.contains("Submit dictation"));
@@ -4308,7 +4981,7 @@ mod ptt_tests {
         let with_fallback = DictationTarget::Finish {
             allow_native_send: true,
         }
-        .rect_script();
+        .rect_script(Provider::Chatgpt);
         assert!(with_fallback.contains("Transcribe and send"));
         let native: Rect = serde_json::from_str(r#"{"x":1,"y":2,"nativeSend":true}"#).unwrap();
         assert!(native.native_send);
@@ -4424,7 +5097,7 @@ mod ptt_tests {
 
     #[test]
     fn recovery_probe_uses_safe_finish_before_native_send() {
-        let script = recovery_probe_script();
+        let script = recovery_probe_script(Provider::Chatgpt);
         assert!(script.contains("停止聽寫"));
         assert!(script.contains("Stop dictation"));
         assert!(script.contains("Transcribe and send"));
@@ -4666,14 +5339,14 @@ mod tab_status_tests {
         let source = "https://chatgpt.com/c/123";
         assert_eq!(
             decode_tab_status(
-                source,
+                Provider::Chatgpt, source,
                 r#"{"kind":"gpt-wrapper-tab-status","status":"working"}"#
             ),
             Ok(TabStatus::Working)
         );
         assert_eq!(
             decode_tab_status(
-                "https://chat.openai.com/",
+                Provider::Chatgpt, "https://chat.openai.com/",
                 r#"{"kind":"gpt-wrapper-tab-status","status":"voice"}"#
             ),
             Ok(TabStatus::Voice)
@@ -4685,33 +5358,33 @@ mod tab_status_tests {
         ] {
             assert_eq!(
                 decode_tab_status(
-                    untrusted,
+                    Provider::Chatgpt, untrusted,
                     r#"{"kind":"gpt-wrapper-tab-status","status":"send"}"#
                 ),
                 Err("source rejected")
             );
         }
         assert_eq!(
-            decode_tab_status(source, r#"{"kind":"other","status":"send"}"#),
+            decode_tab_status(Provider::Chatgpt, source, r#"{"kind":"other","status":"send"}"#),
             Err("payload rejected")
         );
         assert_eq!(
             decode_tab_status(
-                source,
+                Provider::Chatgpt, source,
                 r#"{"kind":"gpt-wrapper-tab-status","status":"unknown"}"#
             ),
             Err("payload rejected")
         );
         assert_eq!(
             decode_tab_status(
-                source,
+                Provider::Chatgpt, source,
                 r#"{"kind":"gpt-wrapper-tab-status","status":"send"}"#
             ),
             Ok(TabStatus::Send)
         );
         assert_eq!(
             decode_tab_status(
-                source,
+                Provider::Chatgpt, source,
                 r#"{"kind":"gpt-wrapper-tab-status","status":"fallback"}"#
             ),
             Ok(TabStatus::Fallback)
@@ -4721,15 +5394,16 @@ mod tab_status_tests {
     #[test]
     fn updates_only_the_matching_tab_and_preserves_standby_status() {
         let mut tabs = TabManager::new();
-        let spec = ProjectSettings::default().default_tab_spec();
+        let spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
         for id in [1, 2, 3] {
-            tabs.contexts.insert(id, TabContext::new(spec.clone()));
+            tabs.contexts.insert(id, TabContext::new(spec.clone(), Provider::Chatgpt));
         }
         for id in [1, 2] {
             tabs.tabs.push(TabInfo {
                 id,
                 title: String::new(),
                 status: TabStatus::Fallback,
+                provider: Provider::Chatgpt,
             });
         }
         assert!(tabs.update_status(2, TabStatus::Working));
@@ -4744,13 +5418,14 @@ mod tab_status_tests {
     #[test]
     fn document_titles_update_matching_visible_tabs_only() {
         let mut tabs = TabManager::new();
-        let spec = ProjectSettings::default().default_tab_spec();
+        let spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
         for id in [1, 2] {
-            tabs.contexts.insert(id, TabContext::new(spec.clone()));
+            tabs.contexts.insert(id, TabContext::new(spec.clone(), Provider::Chatgpt));
             tabs.tabs.push(TabInfo {
                 id,
                 title: project_settings::CHATGPT_TITLE.to_string(),
                 status: TabStatus::Fallback,
+                provider: Provider::Chatgpt,
             });
         }
 
@@ -4770,9 +5445,9 @@ mod tab_status_tests {
     #[test]
     fn standby_title_is_retained_on_promotion() {
         let mut tabs = TabManager::new();
-        let spec = ProjectSettings::default().default_tab_spec();
+        let spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
         let id = 3;
-        let mut standby = TabContext::new(spec.clone());
+        let mut standby = TabContext::new(spec.clone(), Provider::Chatgpt);
         standby.navigation = Some(standby_navigation::Navigation::new(spec.url.clone()));
         tabs.contexts.insert(id, standby);
 
@@ -4789,6 +5464,7 @@ mod tab_status_tests {
             id,
             title: context.page_title.clone(),
             status: context.status,
+            provider: Provider::Chatgpt,
         });
         assert_eq!(
             tabs.snapshot().tabs[0].title,
@@ -4800,8 +5476,8 @@ mod tab_status_tests {
 
     #[test]
     fn standby_navigation_clears_previous_document_title() {
-        let spec = ProjectSettings::default().default_tab_spec();
-        let mut standby = TabContext::new(spec.clone());
+        let spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
+        let mut standby = TabContext::new(spec.clone(), Provider::Chatgpt);
         standby.navigation = Some(standby_navigation::Navigation::new(spec.url.clone()));
         standby.page_title = "Old project conversation — ChatGPT".to_string();
 
@@ -4820,20 +5496,49 @@ mod tab_status_tests {
     }
 
     #[test]
-    fn reorder_tabs_changes_only_visible_order() {
+    fn switch_tabs_cycles_visible_order_and_skips_standby() {
         let mut tabs = TabManager::new();
-        let spec = ProjectSettings::default().default_tab_spec();
+        assert_eq!(tabs.next_visible_tab_id(), None);
         for id in [1, 2, 3] {
-            tabs.contexts.insert(id, TabContext::new(spec.clone()));
             tabs.tabs.push(TabInfo {
                 id,
                 title: format!("Tab {id}"),
                 status: TabStatus::Fallback,
+                provider: Provider::Chatgpt,
+            });
+        }
+        tabs.standby_ptt_tab_id = Some(4);
+        tabs.active_tab_id = Some(1);
+        assert_eq!(tabs.next_visible_tab_id(), Some(2));
+        tabs.active_tab_id = Some(2);
+        assert_eq!(tabs.next_visible_tab_id(), Some(3));
+        tabs.active_tab_id = Some(3);
+        assert_eq!(tabs.next_visible_tab_id(), Some(1));
+        tabs.reorder(&[3, 1, 2]).unwrap();
+        tabs.active_tab_id = Some(3);
+        assert_eq!(tabs.next_visible_tab_id(), Some(1));
+        tabs.active_tab_id = Some(2);
+        assert_eq!(tabs.next_visible_tab_id(), Some(3));
+        tabs.tabs.retain(|tab| tab.id == 2);
+        assert_eq!(tabs.next_visible_tab_id(), None);
+    }
+
+    #[test]
+    fn reorder_tabs_changes_only_visible_order() {
+        let mut tabs = TabManager::new();
+        let spec = ProjectSettings::default().default_tab_spec(Provider::Chatgpt);
+        for id in [1, 2, 3] {
+            tabs.contexts.insert(id, TabContext::new(spec.clone(), Provider::Chatgpt));
+            tabs.tabs.push(TabInfo {
+                id,
+                title: format!("Tab {id}"),
+                status: TabStatus::Fallback,
+                provider: Provider::Chatgpt,
             });
         }
         tabs.active_tab_id = Some(2);
         tabs.standby_ptt_tab_id = Some(4);
-        tabs.contexts.insert(4, TabContext::new(spec));
+        tabs.contexts.insert(4, TabContext::new(spec, Provider::Chatgpt));
 
         assert!(tabs.reorder(&[3, 1, 2]).is_ok());
         assert_eq!(
@@ -4851,5 +5556,368 @@ mod tab_status_tests {
                 vec![3, 1, 2]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_tab_tests {
+    use super::*;
+
+    fn spec(provider: Provider) -> TabSpec {
+        provider_home_spec(provider)
+    }
+
+    // G tabs and C tabs interleaved in the global order: G1 C1 G2 C2 G3 ...
+    fn mixed(g: usize, c: usize) -> (TabManager, Vec<usize>, Vec<usize>) {
+        let mut tabs = TabManager::new();
+        let (mut gs, mut cs) = (Vec::new(), Vec::new());
+        for index in 0..g.max(c) {
+            if index < g {
+                gs.push(tabs.add_tab(Provider::Chatgpt, spec(Provider::Chatgpt), false).tab_id);
+            }
+            if index < c {
+                cs.push(tabs.add_tab(Provider::Claude, spec(Provider::Claude), false).tab_id);
+            }
+        }
+        (tabs, gs, cs)
+    }
+
+    fn ids(snapshot: &TabSnapshot) -> Vec<usize> {
+        snapshot.tabs.iter().map(|tab| tab.id).collect()
+    }
+
+    fn switch(tabs: &mut TabManager, provider: Provider) -> Option<usize> {
+        let plan = tabs.begin_provider_switch(provider).unwrap().unwrap();
+        tabs.commit_provider_switch(provider, plan.target_tab);
+        tabs.end_provider_switch();
+        plan.target_tab
+    }
+
+    #[test]
+    fn new_install_starts_on_chatgpt_and_snapshot_is_provider_scoped() {
+        let (tabs, gs, cs) = mixed(3, 2);
+        assert_eq!(tabs.active_provider, Provider::Chatgpt);
+        let snapshot = tabs.snapshot();
+        assert_eq!(snapshot.active_provider, Provider::Chatgpt);
+        assert_eq!(ids(&snapshot), gs);
+        assert_eq!(snapshot.active_tab_id, Some(gs[2]));
+        assert!(snapshot.tabs.iter().all(|tab| tab.provider == Provider::Chatgpt));
+        // Hidden-provider tabs were created in the background.
+        assert!(cs.iter().all(|id| tabs.provider_of(*id) == Some(Provider::Claude)));
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["activeProvider"], "chatgpt");
+        assert_eq!(json["activeTabId"], gs[2]);
+        assert_eq!(json["tabs"][0]["provider"], "chatgpt");
+    }
+
+    #[test]
+    fn switching_restores_each_providers_last_active_tab() {
+        let (mut tabs, gs, cs) = mixed(3, 2);
+        tabs.set_active(Some(gs[1]));
+        assert_eq!(switch(&mut tabs, Provider::Claude), Some(cs[1]));
+        assert_eq!(tabs.active_tab_id, Some(cs[1]));
+        assert_eq!(ids(&tabs.snapshot()), cs);
+        tabs.set_active(Some(cs[0]));
+
+        assert_eq!(switch(&mut tabs, Provider::Chatgpt), Some(gs[1]));
+        assert_eq!(tabs.snapshot().active_tab_id, Some(gs[1]));
+        assert_eq!(ids(&tabs.snapshot()), gs);
+        assert_eq!(switch(&mut tabs, Provider::Claude), Some(cs[0]));
+        // Neither provider's list was changed by switching.
+        assert_eq!(ids(&tabs.snapshot()), cs);
+    }
+
+    #[test]
+    fn first_visit_to_an_empty_provider_needs_a_new_tab() {
+        let (mut tabs, gs, _) = mixed(2, 0);
+        let plan = tabs.begin_provider_switch(Provider::Claude).unwrap().unwrap();
+        assert_eq!(plan.target_tab, None);
+        assert_eq!(plan.previous_tab, Some(gs[1]));
+        tabs.commit_provider_switch(Provider::Claude, None);
+        // Never borrow a tab across providers.
+        assert_eq!(tabs.active_tab_id, None);
+        assert!(tabs.snapshot().tabs.is_empty());
+        let added = tabs.add_tab(Provider::Claude, spec(Provider::Claude), false);
+        assert!(added.activated);
+        assert_eq!(tabs.snapshot().active_tab_id, Some(added.tab_id));
+        tabs.end_provider_switch();
+        assert_eq!(
+            tabs.contexts[&added.tab_id].spec.url.as_str(),
+            "https://claude.ai/"
+        );
+        assert_eq!(tabs.snapshot().tabs[0].title, "Claude");
+    }
+
+    #[test]
+    fn failed_switch_rolls_back_to_previous_provider_and_tab() {
+        let (mut tabs, gs, _) = mixed(2, 0);
+        tabs.set_active(Some(gs[0]));
+        let plan = tabs.begin_provider_switch(Provider::Claude).unwrap().unwrap();
+        tabs.commit_provider_switch(Provider::Claude, None);
+        tabs.rollback_provider_switch(&plan);
+        tabs.end_provider_switch();
+        assert_eq!(tabs.active_provider, Provider::Chatgpt);
+        assert_eq!(tabs.active_tab_id, Some(gs[0]));
+        assert!(!tabs.provider_switch_in_progress);
+    }
+
+    #[test]
+    fn overlapping_switches_and_tab_commands_are_rejected() {
+        let (mut tabs, gs, _) = mixed(2, 1);
+        assert!(tabs.begin_provider_switch(Provider::Chatgpt).unwrap().is_none());
+        assert!(!tabs.provider_switch_in_progress);
+        assert!(tabs.begin_provider_switch(Provider::Claude).unwrap().is_some());
+        assert!(tabs.begin_provider_switch(Provider::Claude).is_err());
+        assert!(tabs.begin_provider_switch(Provider::Chatgpt).is_err());
+        assert!(tabs.ensure_not_switching().is_err());
+        tabs.end_provider_switch();
+        assert!(tabs.ensure_not_switching().is_ok());
+        assert_eq!(tabs.active_tab_id, Some(gs[1]));
+    }
+
+    #[test]
+    fn ipc_cannot_address_hidden_provider_tabs() {
+        let (mut tabs, gs, cs) = mixed(2, 2);
+        assert!(tabs.ensure_visible_tab(gs[0]).is_ok());
+        assert!(tabs.ensure_visible_tab(cs[0]).is_err());
+        assert!(tabs.ensure_visible_tab(999).is_err());
+        assert!(tabs.close_replacement(999).is_err());
+        switch(&mut tabs, Provider::Claude);
+        assert!(tabs.ensure_visible_tab(gs[0]).is_err());
+        assert!(tabs.ensure_visible_tab(cs[1]).is_ok());
+    }
+
+    #[test]
+    fn switch_tabs_cycles_only_within_the_active_provider() {
+        let (mut tabs, gs, cs) = mixed(3, 2);
+        tabs.set_active(Some(gs[0]));
+        assert_eq!(tabs.next_visible_tab_id(), Some(gs[1]));
+        tabs.set_active(Some(gs[2]));
+        assert_eq!(tabs.next_visible_tab_id(), Some(gs[0]));
+        switch(&mut tabs, Provider::Claude);
+        tabs.set_active(Some(cs[1]));
+        assert_eq!(tabs.next_visible_tab_id(), Some(cs[0]));
+        tabs.remove_tab(cs[0]);
+        assert_eq!(tabs.next_visible_tab_id(), None, "a single tab never cycles");
+    }
+
+    #[test]
+    fn reorder_is_scoped_to_the_visible_provider() {
+        let (mut tabs, gs, cs) = mixed(3, 2);
+        let global = |tabs: &TabManager| tabs.tabs.iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(global(&tabs), vec![gs[0], cs[0], gs[1], cs[1], gs[2]]);
+        tabs.reorder(&[gs[2], gs[0], gs[1]]).unwrap();
+        assert_eq!(ids(&tabs.snapshot()), vec![gs[2], gs[0], gs[1]]);
+        // Claude tabs keep their own slots and order.
+        assert_eq!(global(&tabs), vec![gs[2], cs[0], gs[0], cs[1], gs[1]]);
+        assert!(tabs.reorder(&[gs[2], gs[0], cs[0]]).is_err());
+        assert!(tabs.reorder(&[gs[2], gs[0], gs[1], cs[0], cs[1]]).is_err());
+        assert!(tabs.reorder(&[gs[2], gs[2], gs[1]]).is_err());
+        assert_eq!(ids(&tabs.snapshot()), vec![gs[2], gs[0], gs[1]]);
+
+        switch(&mut tabs, Provider::Claude);
+        tabs.reorder(&[cs[1], cs[0]]).unwrap();
+        assert_eq!(global(&tabs), vec![gs[2], cs[1], gs[0], cs[0], gs[1]]);
+        switch(&mut tabs, Provider::Chatgpt);
+        assert_eq!(ids(&tabs.snapshot()), vec![gs[2], gs[0], gs[1]]);
+    }
+
+    #[test]
+    fn closing_picks_a_replacement_only_inside_the_provider() {
+        let (mut tabs, gs, cs) = mixed(2, 2);
+        tabs.set_active(Some(gs[0]));
+        // Global order is G0 C0 G1 C1; the neighbour is G1, never C0.
+        assert_eq!(tabs.close_replacement(gs[0]).unwrap(), (true, Some(gs[1])));
+        tabs.remove_tab(gs[0]);
+        tabs.set_active(Some(gs[1]));
+        assert_eq!(tabs.close_replacement(gs[1]).unwrap(), (true, None));
+        tabs.remove_tab(gs[1]);
+        assert_eq!(tabs.active_tab_id, None);
+        assert!(tabs.snapshot().tabs.is_empty());
+        assert!(!tabs.last_active.contains_key(&Provider::Chatgpt));
+        // The empty provider does not borrow Claude tabs.
+        assert_eq!(tabs.next_visible_tab_id(), None);
+        assert_eq!(tabs.provider_switch_target(Provider::Claude), Some(cs[1]));
+        assert_eq!(tabs.provider_switch_target(Provider::Chatgpt), None);
+    }
+
+    #[test]
+    fn closing_the_remembered_tab_falls_back_to_the_first_provider_tab() {
+        let (mut tabs, _, cs) = mixed(1, 3);
+        assert_eq!(tabs.provider_switch_target(Provider::Claude), Some(cs[2]));
+        tabs.remove_tab(cs[2]);
+        assert_eq!(tabs.provider_switch_target(Provider::Claude), Some(cs[0]));
+    }
+
+    #[test]
+    fn hidden_provider_tab_creation_does_not_steal_visibility_and_rolls_back() {
+        let (mut tabs, gs, cs) = mixed(2, 1);
+        let added = tabs.add_tab(Provider::Claude, spec(Provider::Claude), false);
+        assert!(!added.activated);
+        assert_eq!(tabs.active_tab_id, Some(gs[1]));
+        assert_eq!(tabs.last_active[&Provider::Claude], added.tab_id);
+        tabs.rollback_add(&added);
+        assert_eq!(tabs.last_active[&Provider::Claude], cs[0]);
+        assert_eq!(tabs.provider_of(added.tab_id), None);
+
+        let visible = tabs.add_tab(Provider::Chatgpt, spec(Provider::Chatgpt), false);
+        assert!(visible.activated);
+        tabs.rollback_add(&visible);
+        assert_eq!(tabs.active_tab_id, Some(gs[1]));
+        assert_eq!(tabs.last_active[&Provider::Chatgpt], gs[1]);
+    }
+
+    #[test]
+    fn tab_ids_are_one_global_sequence() {
+        let (tabs, gs, cs) = mixed(2, 2);
+        let mut all = gs.clone();
+        all.extend(&cs);
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 4);
+        assert_eq!(tabs.next_tab_id, 5);
+    }
+
+    #[test]
+    fn only_active_ptt_work_blocks_a_provider_switch() {
+        let tracker = PttTracker::new();
+        assert_eq!(tracker.provider_switch_blocker(), None);
+        // A leftover recovery marker on some tab must not lock providers.
+        tracker.mark_recovery_needed(7);
+        assert_eq!(tracker.provider_switch_blocker(), None);
+
+        let generation = tracker.begin(PttSource::Keyboard, 1).unwrap();
+        assert!(tracker.provider_switch_blocker().is_some());
+        let finish = tracker.finish(PttSource::Keyboard).unwrap();
+        assert_eq!(tracker.provider_switch_blocker(), None);
+        tracker.finish_in_flight.store(finish.generation, Ordering::SeqCst);
+        assert!(tracker.provider_switch_blocker().is_some());
+        assert!(tracker.finish_completed(generation).is_some());
+        assert_eq!(tracker.provider_switch_blocker(), None);
+
+        let recovery = tracker.begin_recovery(PttSource::Device, 7).unwrap();
+        assert!(tracker.provider_switch_blocker().is_some());
+        assert!(tracker.abort_recovery(7, recovery));
+        assert_eq!(tracker.provider_switch_blocker(), None);
+    }
+
+    #[test]
+    fn status_messages_are_trusted_per_provider() {
+        let payload = r#"{"kind":"gpt-wrapper-tab-status","status":"working"}"#;
+        assert_eq!(
+            decode_tab_status(Provider::Chatgpt, "https://chatgpt.com/", payload),
+            Ok(TabStatus::Working)
+        );
+        assert_eq!(
+            decode_tab_status(Provider::Chatgpt, "https://claude.ai/", payload),
+            Err("source rejected")
+        );
+        assert_eq!(
+            decode_tab_status(Provider::Claude, "https://chatgpt.com/", payload),
+            Err("source rejected")
+        );
+        assert_eq!(
+            decode_tab_status(Provider::Claude, "https://claude.ai/chat/1", payload),
+            Ok(TabStatus::Working)
+        );
+    }
+
+    #[test]
+    fn each_provider_gets_only_its_own_adapter_and_pinned_scripts() {
+        let claude = provider_initialization_scripts(Provider::Claude);
+        assert!(claude.iter().any(|s| s == CLAUDE_ADAPTER_SCRIPT));
+        assert!(!claude.iter().any(|s| s == ADAPTER_SCRIPT));
+        assert!(claude.iter().all(|s| !s.contains(PROVIDER_PIN_MARKER)));
+        assert_eq!(
+            claude.iter().filter(|s| s.contains("const PINNED = \"claude\"")).count(),
+            2
+        );
+        let chatgpt = provider_initialization_scripts(Provider::Chatgpt);
+        assert!(chatgpt.iter().any(|s| s == ADAPTER_SCRIPT));
+        assert!(!chatgpt.iter().any(|s| s == CLAUDE_ADAPTER_SCRIPT));
+        assert_eq!(
+            chatgpt.iter().filter(|s| s.contains("const PINNED = \"chatgpt\"")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn claude_dictation_selectors_follow_the_contract_and_never_send_natively() {
+        let start = DictationTarget::Start.rect_script(Provider::Claude);
+        assert!(start.contains("口述輸入"));
+        assert!(!start.contains("Start dictation"));
+        assert!(start.contains(r#"["claude.ai"].includes(location.hostname)"#));
+        for allow_native_send in [false, true] {
+            let finish = DictationTarget::Finish { allow_native_send }.rect_script(Provider::Claude);
+            assert!(finish.contains("完成聽寫"));
+            assert!(finish.contains("const nativeLabels = [];"));
+            assert!(!finish.contains("停止聽寫"));
+        }
+        let chatgpt = DictationTarget::Start.rect_script(Provider::Chatgpt);
+        assert!(!chatgpt.contains("口述輸入"));
+        assert!(chatgpt.contains(r#"["chatgpt.com","chat.openai.com"].includes(location.hostname)"#));
+        // A disabled Claude control is never clicked; legacy rects stay enabled.
+        let disabled: Rect = serde_json::from_str(r#"{"x":1,"y":2,"enabled":false}"#).unwrap();
+        assert!(!disabled.enabled);
+        let legacy: Rect = serde_json::from_str(r#"{"x":1,"y":2}"#).unwrap();
+        assert!(legacy.enabled);
+        // An untrusted page is neither a control nor "no control".
+        assert!(serde_json::from_str::<Option<Rect>>(r#""untrusted-origin""#).is_err());
+        assert_eq!(provider_rect_script(None, DictationTarget::Start), "\"untrusted-origin\"");
+        let probe = recovery_probe_script(Provider::Claude);
+        assert!(probe.contains("完成聽寫"));
+        assert!(probe.contains(r#"typeof finish === "string""#));
+    }
+
+    #[test]
+    fn link_tabs_keep_the_source_provider_title() {
+        let spec = link_tab_spec(Provider::Claude, "https://claude.ai/chat/abc").unwrap();
+        assert_eq!(spec.title, "Claude");
+        assert_eq!(spec.message_prefix, "");
+        let context = TabContext::new(spec, Provider::Claude);
+        assert_eq!(context.page_title, "Claude");
+    }
+
+    #[test]
+    fn empty_titles_fall_back_to_the_tab_provider_name() {
+        let (mut tabs, _, cs) = mixed(0, 1);
+        tabs.update_title(cs[0], "Some chat - Claude");
+        assert!(tabs.update_title(cs[0], "  "));
+        assert_eq!(tabs.tabs[0].title, "Claude");
+    }
+
+    #[test]
+    fn bookmark_tabs_only_open_projects_of_the_named_provider() {
+        let mut settings = ProjectSettings::default();
+        project_settings::create(
+            settings.list_mut(Provider::Chatgpt),
+            Provider::Chatgpt,
+            "G1".into(),
+            "https://chatgpt.com/g/1".into(),
+            "".into(),
+        )
+        .unwrap();
+        project_settings::create(
+            settings.list_mut(Provider::Claude),
+            Provider::Claude,
+            "C1".into(),
+            "https://claude.ai/project/1".into(),
+            "Prefix ".into(),
+        )
+        .unwrap();
+        let g1 = settings.chatgpt.projects[0].id;
+        let c1 = settings.claude.projects[0].id;
+        let spec = bookmark_tab_spec(&settings, Provider::Claude, c1).unwrap();
+        assert_eq!(spec.url.as_str(), "https://claude.ai/project/1");
+        assert_eq!(spec.message_prefix, "Prefix ");
+        assert!(bookmark_tab_spec(&settings, Provider::Claude, g1).is_err());
+        assert!(bookmark_tab_spec(&settings, Provider::Chatgpt, c1).is_err());
+        let home = bookmark_tab_spec(&settings, Provider::Claude, Uuid::nil()).unwrap();
+        assert_eq!(home.url.as_str(), "https://claude.ai/");
+        assert_eq!(home.project_id, None);
+        // Opening a bookmark never changes either Default Project.
+        assert_eq!(settings.claude.default_project_id, None);
+        assert_eq!(settings.default_tab_spec(Provider::Claude).url.as_str(), "https://claude.ai/");
     }
 }

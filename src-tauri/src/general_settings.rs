@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::Mutex};
 use uuid::Uuid;
+
+use crate::provider::Provider;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(
@@ -24,6 +26,47 @@ impl Default for PreferredMicrophone {
     }
 }
 
+/// A provider-origin device ID the user explicitly confirmed for the shared
+/// microphone choice. WebView2 device IDs are per origin, so a ChatGPT ID is
+/// never reused on Claude (or the reverse).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedMicrophone {
+    pub device_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub group_id: String,
+}
+
+/// The capture policy sent to one tab. `resolve` means no ID is known for the
+/// tab's origin: the page must match the chosen device by its exact label in
+/// its own inventory and fail closed when that match is missing or ambiguous.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MicrophonePolicy {
+    Default,
+    Device {
+        device_id: String,
+        label: String,
+        group_id: String,
+        resolve: bool,
+    },
+}
+
+/// How a provider obtains the device ID for the shared choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MicrophoneBinding {
+    Default,
+    Selected,
+    Confirmed,
+    NeedsConfirmation,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeneralSettings {
@@ -33,6 +76,79 @@ struct GeneralSettings {
     ptt_auto_submit: bool,
     #[serde(default)]
     preferred_microphone: PreferredMicrophone,
+    // Older installs have no value and fall back to ChatGPT.
+    #[serde(default, deserialize_with = "lenient_provider")]
+    active_provider: Provider,
+    // The provider origin the preferred device ID was enumerated in. Legacy
+    // selections came from ChatGPT.
+    #[serde(default, deserialize_with = "lenient_provider")]
+    microphone_source: Provider,
+    #[serde(default, deserialize_with = "lenient_confirmations")]
+    microphone_confirmations: BTreeMap<Provider, ConfirmedMicrophone>,
+}
+
+fn lenient_confirmations<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<Provider, ConfirmedMicrophone>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+impl GeneralSettings {
+    fn microphone_policy(&self, provider: Provider) -> MicrophonePolicy {
+        match &self.preferred_microphone {
+            PreferredMicrophone::Default => MicrophonePolicy::Default,
+            PreferredMicrophone::Device {
+                device_id,
+                label,
+                group_id,
+            } => {
+                if self.microphone_source == provider {
+                    return MicrophonePolicy::Device {
+                        device_id: device_id.clone(),
+                        label: label.clone(),
+                        group_id: group_id.clone(),
+                        resolve: false,
+                    };
+                }
+                match self
+                    .microphone_confirmations
+                    .get(&provider)
+                    .filter(|confirmed| confirmed.label == *label)
+                {
+                    Some(confirmed) => MicrophonePolicy::Device {
+                        device_id: confirmed.device_id.clone(),
+                        label: label.clone(),
+                        group_id: confirmed.group_id.clone(),
+                        resolve: false,
+                    },
+                    None => MicrophonePolicy::Device {
+                        device_id: String::new(),
+                        label: label.clone(),
+                        group_id: String::new(),
+                        resolve: true,
+                    },
+                }
+            }
+        }
+    }
+
+    fn microphone_binding(&self, provider: Provider) -> MicrophoneBinding {
+        match self.microphone_policy(provider) {
+            MicrophonePolicy::Default => MicrophoneBinding::Default,
+            MicrophonePolicy::Device { resolve: true, .. } => MicrophoneBinding::NeedsConfirmation,
+            MicrophonePolicy::Device { .. } if self.microphone_source == provider => {
+                MicrophoneBinding::Selected
+            }
+            MicrophonePolicy::Device { .. } => MicrophoneBinding::Confirmed,
+        }
+    }
+}
+
+// An unknown provider ID must not discard the other saved preferences.
+fn lenient_provider<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Provider, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 const fn default_notification_sound_enabled() -> bool {
@@ -49,6 +165,9 @@ impl Default for GeneralSettings {
             notification_sound_enabled: default_notification_sound_enabled(),
             ptt_auto_submit: default_ptt_auto_submit(),
             preferred_microphone: PreferredMicrophone::default(),
+            active_provider: Provider::default(),
+            microphone_source: Provider::default(),
+            microphone_confirmations: BTreeMap::new(),
         }
     }
 }
@@ -117,6 +236,28 @@ impl GeneralSettingsState {
         Ok(current.ptt_auto_submit)
     }
 
+    pub fn active_provider(&self) -> Result<Provider, String> {
+        Ok(self
+            .data
+            .lock()
+            .map_err(|_| "general settings lock was poisoned".to_string())?
+            .active_provider)
+    }
+
+    pub fn set_active_provider(&self, provider: Provider) -> Result<Provider, String> {
+        let mut current = self
+            .data
+            .lock()
+            .map_err(|_| "general settings lock was poisoned".to_string())?;
+        if current.active_provider == provider {
+            return Ok(provider);
+        }
+        let mut next = current.clone();
+        next.active_provider = provider;
+        self.persist(&mut current, next)?;
+        Ok(current.active_provider)
+    }
+
     pub fn preferred_microphone(&self) -> Result<PreferredMicrophone, String> {
         Ok(self
             .data
@@ -126,8 +267,37 @@ impl GeneralSettingsState {
             .clone())
     }
 
+    pub fn microphone_policy(&self, provider: Provider) -> Result<MicrophonePolicy, String> {
+        Ok(self
+            .data
+            .lock()
+            .map_err(|_| "general settings lock was poisoned".to_string())?
+            .microphone_policy(provider))
+    }
+
+    pub fn microphone_binding(&self, provider: Provider) -> Result<MicrophoneBinding, String> {
+        Ok(self
+            .data
+            .lock()
+            .map_err(|_| "general settings lock was poisoned".to_string())?
+            .microphone_binding(provider))
+    }
+
+    #[cfg(test)]
     pub fn set_preferred_microphone(
         &self,
+        preference: PreferredMicrophone,
+    ) -> Result<PreferredMicrophone, String> {
+        self.set_microphone_for(Provider::Chatgpt, preference)
+    }
+
+    /// Saves a choice made from `provider`'s own inventory. Choosing the same
+    /// device name from another provider confirms that origin's ID without
+    /// changing the shared choice; any other device replaces the choice and
+    /// drops confirmations that belonged to the previous device.
+    pub fn set_microphone_for(
+        &self,
+        provider: Provider,
         preference: PreferredMicrophone,
     ) -> Result<PreferredMicrophone, String> {
         if let PreferredMicrophone::Device {
@@ -151,7 +321,40 @@ impl GeneralSettingsState {
             .lock()
             .map_err(|_| "general settings lock was poisoned".to_string())?;
         let mut next = current.clone();
-        next.preferred_microphone = preference;
+        match (&current.preferred_microphone, &preference) {
+            (_, PreferredMicrophone::Default) => {
+                next.preferred_microphone = PreferredMicrophone::Default;
+                next.microphone_source = provider;
+                next.microphone_confirmations.clear();
+            }
+            (
+                PreferredMicrophone::Device { label: old, .. },
+                PreferredMicrophone::Device {
+                    device_id,
+                    label,
+                    group_id,
+                },
+            ) if old == label && current.microphone_source != provider => {
+                next.microphone_confirmations.insert(
+                    provider,
+                    ConfirmedMicrophone {
+                        device_id: device_id.clone(),
+                        label: label.clone(),
+                        group_id: group_id.clone(),
+                    },
+                );
+            }
+            (old, PreferredMicrophone::Device { label, .. }) => {
+                let same_device =
+                    matches!(old, PreferredMicrophone::Device { label: l, .. } if l == label);
+                next.preferred_microphone = preference.clone();
+                next.microphone_source = provider;
+                next.microphone_confirmations.remove(&provider);
+                if !same_device {
+                    next.microphone_confirmations.clear();
+                }
+            }
+        }
         self.persist(&mut current, next)?;
         Ok(current.preferred_microphone.clone())
     }
@@ -218,6 +421,39 @@ mod tests {
         let state = GeneralSettingsState::load(blocked);
         assert!(state.set_notification_sound_enabled(false).is_err());
         assert!(state.notification_sound_enabled().unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn active_provider_defaults_to_chatgpt_and_persists_without_touching_others() {
+        let directory =
+            std::env::temp_dir().join(format!("gpt-wrapper-provider-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("general-settings.json");
+        assert_eq!(
+            GeneralSettingsState::load(path.clone()).active_provider().unwrap(),
+            Provider::Chatgpt
+        );
+        // Upgrade from a settings file written before providers existed.
+        fs::write(&path, r#"{"pttAutoSubmit":false,"notificationSoundEnabled":false}"#).unwrap();
+        let state = GeneralSettingsState::load(path.clone());
+        assert_eq!(state.active_provider().unwrap(), Provider::Chatgpt);
+        assert_eq!(state.set_active_provider(Provider::Claude).unwrap(), Provider::Claude);
+        let loaded = GeneralSettingsState::load(path.clone());
+        assert_eq!(loaded.active_provider().unwrap(), Provider::Claude);
+        assert!(!loaded.ptt_auto_submit().unwrap());
+        assert!(!loaded.notification_sound_enabled().unwrap());
+        assert!(fs::read_to_string(&path).unwrap().contains(r#""activeProvider": "claude""#));
+        // Unknown provider IDs must not crash or silently pick Claude.
+        fs::write(&path, r#"{"activeProvider":"gemini","pttAutoSubmit":false}"#).unwrap();
+        let unknown = GeneralSettingsState::load(path);
+        assert_eq!(unknown.active_provider().unwrap(), Provider::Chatgpt);
+        assert!(!unknown.ptt_auto_submit().unwrap());
+        let blocked = directory.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        let state = GeneralSettingsState::load(blocked);
+        assert!(state.set_active_provider(Provider::Claude).is_err());
+        assert_eq!(state.active_provider().unwrap(), Provider::Chatgpt);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -305,6 +541,101 @@ mod tests {
             "legacy lock naturally disappears on write"
         );
         assert!(raw.contains("External"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn microphone_ids_are_never_reused_across_provider_origins() {
+        let directory =
+            std::env::temp_dir().join(format!("gpt-wrapper-mic-origin-{}", Uuid::new_v4()));
+        let path = directory.join("general-settings.json");
+        fs::create_dir_all(&directory).unwrap();
+        // A legacy selection was enumerated by ChatGPT.
+        fs::write(&path, r#"{"preferredMicrophone":{"mode":"device","deviceId":"gpt-B","label":"USB B","groupId":"gB"}}"#).unwrap();
+        let settings = GeneralSettingsState::load(path.clone());
+        assert_eq!(
+            settings.microphone_policy(Provider::Chatgpt).unwrap(),
+            MicrophonePolicy::Device {
+                device_id: "gpt-B".into(),
+                label: "USB B".into(),
+                group_id: "gB".into(),
+                resolve: false
+            }
+        );
+        assert_eq!(
+            settings.microphone_policy(Provider::Claude).unwrap(),
+            MicrophonePolicy::Device {
+                device_id: String::new(),
+                label: "USB B".into(),
+                group_id: String::new(),
+                resolve: true
+            },
+            "the ChatGPT ID must not be sent to Claude"
+        );
+        assert_eq!(
+            settings.microphone_binding(Provider::Claude).unwrap(),
+            MicrophoneBinding::NeedsConfirmation
+        );
+        // Confirming the same device from the Claude inventory keeps the choice.
+        settings
+            .set_microphone_for(
+                Provider::Claude,
+                PreferredMicrophone::Device {
+                    device_id: "claude-B".into(),
+                    label: "USB B".into(),
+                    group_id: "cB".into(),
+                },
+            )
+            .unwrap();
+        let reloaded = GeneralSettingsState::load(path.clone());
+        assert_eq!(
+            reloaded.microphone_policy(Provider::Claude).unwrap(),
+            MicrophonePolicy::Device {
+                device_id: "claude-B".into(),
+                label: "USB B".into(),
+                group_id: "cB".into(),
+                resolve: false
+            }
+        );
+        assert_eq!(
+            reloaded.microphone_binding(Provider::Chatgpt).unwrap(),
+            MicrophoneBinding::Selected
+        );
+        assert_eq!(
+            reloaded.microphone_binding(Provider::Claude).unwrap(),
+            MicrophoneBinding::Confirmed
+        );
+        // Choosing another device from Claude replaces the shared choice and
+        // drops the stale ChatGPT binding.
+        reloaded
+            .set_microphone_for(
+                Provider::Claude,
+                PreferredMicrophone::Device {
+                    device_id: "claude-A".into(),
+                    label: "USB A".into(),
+                    group_id: "cA".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            reloaded.microphone_policy(Provider::Chatgpt).unwrap(),
+            MicrophonePolicy::Device { resolve: true, ref label, .. } if label == "USB A"
+        ));
+        reloaded
+            .set_microphone_for(Provider::Chatgpt, PreferredMicrophone::Default)
+            .unwrap();
+        assert_eq!(
+            reloaded.microphone_policy(Provider::Claude).unwrap(),
+            MicrophonePolicy::Default
+        );
+        // Corrupt binding data never discards the rest of the settings.
+        fs::write(&path, r#"{"pttAutoSubmit":false,"microphoneSource":"x","microphoneConfirmations":[1]}"#).unwrap();
+        let tolerant = GeneralSettingsState::load(path);
+        assert!(!tolerant.ptt_auto_submit().unwrap());
+        assert_eq!(
+            tolerant.microphone_policy(Provider::Claude).unwrap(),
+            MicrophonePolicy::Default
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

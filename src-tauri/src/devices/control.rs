@@ -62,6 +62,8 @@ impl Frame {
             }
             "UP" => !s.ptt && s.press > 0 && matches!(s.mode.as_str(), "IDLE" | "FINISH_NO_SEND"),
             "SUBMIT" => s.mode == "IDLE" && s.submit && !s.suppress,
+            "SWITCH_DOWN" | "SWITCH_UP" | "SWITCH_TAB" => s.switch_tab_state(),
+            "SWITCH_CANCEL" => true,
             "COMBO_BEGIN" => s.mode == "COMBO" && s.combo == s.seq,
             "COMBO_RESUME" => s.mode == "TALK" && s.combo > 0 && s.segment == s.seq && s.suppress,
             "COMBO_END" => s.mode == "FINISH_NO_SEND",
@@ -70,6 +72,13 @@ impl Frame {
             _ => false,
         };
         action.then_some(s)
+    }
+    fn switch_tab_state(&self) -> bool {
+        !self.ptt
+            && !self.submit
+            && matches!(self.mode.as_str(), "IDLE" | "FINISH_NO_SEND")
+            && self.segment < self.seq
+            && self.combo < self.seq
     }
     pub fn idle_management(&self) -> bool {
         self.action == "STATE"
@@ -113,6 +122,10 @@ pub enum Kind {
     Down,
     Up,
     Submit,
+    SwitchDown,
+    SwitchUp,
+    SwitchCancel,
+    SwitchLegacy,
     Pause,
     Resume,
     FinishNoSend,
@@ -126,13 +139,72 @@ pub struct Controls {
     pub active: u32,
     pub barrier: u32,
     pub consumed_press: u32,
+    pub switch_down_seq: Option<u32>,
 }
 impl Controls {
     // Only a strictly newer snapshot can alter PTT. Submit has a separate replay
     // window, but cannot cross a later press/Combo/cancellation boundary.
     pub fn apply(&mut self, f: &Frame, dictation: bool, submit: bool) -> Vec<Kind> {
-        if !self.replay.accept(f.seq as u64) {
+        let seq = u64::from(f.seq);
+        let newer = self.replay.high.is_none_or(|high| seq > high);
+        if !self.replay.accept(seq) {
             return vec![];
+        }
+        // Switch edges are separate from PTT snapshots. A late UP after a newer
+        // heartbeat may still close its matching DOWN, but cannot start a gesture.
+        match f.action.as_str() {
+            "SWITCH_TAB" => {
+                let busy = self.active != 0
+                    || self.switch_down_seq.is_some()
+                    || self
+                        .latest
+                        .as_ref()
+                        .is_some_and(|s| s.ptt || s.submit || s.mode == "RESETTING");
+                return if newer && submit && !busy && f.switch_tab_state() {
+                    vec![Kind::SwitchLegacy]
+                } else {
+                    vec![]
+                };
+            }
+            "SWITCH_DOWN" => {
+                let busy = self.active != 0
+                    || self
+                        .latest
+                        .as_ref()
+                        .is_some_and(|s| s.ptt || s.submit || s.mode == "RESETTING");
+                if newer
+                    && submit
+                    && !busy
+                    && self.switch_down_seq.is_none()
+                    && f.switch_tab_state()
+                {
+                    self.switch_down_seq = Some(f.seq);
+                    return vec![Kind::SwitchDown];
+                }
+                return vec![];
+            }
+            "SWITCH_UP" | "SWITCH_CANCEL" => {
+                let Some(down) = self.switch_down_seq else {
+                    return vec![];
+                };
+                if f.seq <= down {
+                    return vec![];
+                }
+                self.switch_down_seq = None;
+                if f.action == "SWITCH_UP" && submit && f.switch_tab_state() {
+                    return vec![Kind::SwitchUp];
+                }
+                return vec![Kind::SwitchCancel];
+            }
+            _ => {}
+        }
+        let mut switch_cancel = vec![];
+        if newer
+            && self.switch_down_seq.is_some()
+            && (f.ptt || f.submit || matches!(f.mode.as_str(), "COMBO" | "RESETTING" | "TALK"))
+        {
+            self.switch_down_seq = None;
+            switch_cancel.push(Kind::SwitchCancel);
         }
         if f.action == "SUBMIT" {
             let allowed = submit
@@ -144,10 +216,13 @@ impl Controls {
                     .as_ref()
                     .is_none_or(|s| !s.ptt && !s.submit && s.press == f.press);
             self.barrier = self.barrier.max(f.seq);
-            return if allowed { vec![Kind::Submit] } else { vec![] };
+            if allowed {
+                switch_cancel.push(Kind::Submit);
+            }
+            return switch_cancel;
         }
         if self.latest.as_ref().is_some_and(|s| f.seq <= s.seq) {
-            return vec![];
+            return switch_cancel;
         }
         if self
             .latest
@@ -156,7 +231,7 @@ impl Controls {
         {
             return vec![];
         }
-        let mut out = vec![];
+        let mut out = switch_cancel;
         let previous = self.latest.replace(f.clone());
         if f.suppress {
             self.barrier = self.barrier.max(f.combo);
@@ -437,5 +512,219 @@ mod tests {
         let mut bad = f;
         bad[8] = "1";
         assert!(Frame::parse(&bad).is_none());
+    }
+
+    #[test]
+    fn switch_edges_require_idle_snapshot_except_cancel() {
+        let idle = [
+            "X1",
+            "E",
+            "device",
+            "dn",
+            "hn",
+            "8",
+            "SWITCH_DOWN",
+            "0",
+            "0",
+            "IDLE",
+            "0",
+            "0",
+            "0",
+            "0",
+        ];
+        assert!(Frame::parse(&idle).is_some());
+        for (index, value) in [
+            (7, "1"),
+            (8, "1"),
+            (9, "TALK"),
+            (10, "1"),
+            (12, "1"),
+            (13, "1"),
+        ] {
+            let mut bad = idle;
+            bad[index] = value;
+            assert!(Frame::parse(&bad).is_none());
+        }
+        let mut up = idle;
+        up[6] = "SWITCH_UP";
+        assert!(Frame::parse(&up).is_some());
+        let mut cancel = idle;
+        cancel[6] = "SWITCH_CANCEL";
+        cancel[9..].copy_from_slice(&["TALK", "2", "2", "0", "0"]);
+        cancel[7] = "1";
+        assert!(Frame::parse(&cancel).is_some());
+    }
+    #[test]
+    fn down_up_replay_and_old_edges_do_not_retrigger() {
+        let mut c = Controls::default();
+        let down = frame(2, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false);
+        let up = frame(4, "SWITCH_UP", false, false, "IDLE", 0, 0, 0, false);
+        assert_eq!(c.apply(&down, false, true), vec![Kind::SwitchDown]);
+        assert!(c.apply(&down, false, true).is_empty());
+        // A periodic heartbeat may be newer than a delayed release.
+        assert!(c
+            .apply(
+                &frame(5, "STATE", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+        assert_eq!(c.apply(&up, false, true), vec![Kind::SwitchUp]);
+        assert!(c.apply(&up, false, true).is_empty());
+        assert!(c.switch_down_seq.is_none());
+        // An older new gesture never starts after the heartbeat.
+        assert!(c
+            .apply(
+                &frame(3, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+        assert_eq!(
+            c.apply(
+                &frame(6, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            ),
+            vec![Kind::SwitchDown]
+        );
+        assert_eq!(
+            c.apply(
+                &frame(7, "SWITCH_CANCEL", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            ),
+            vec![Kind::SwitchCancel]
+        );
+        assert!(c
+            .apply(
+                &frame(8, "SWITCH_UP", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+    }
+    #[test]
+    fn ptt_or_submit_interrupts_switch_without_affecting_their_events() {
+        let mut c = Controls::default();
+        c.apply(
+            &frame(1, "STATE", false, false, "IDLE", 0, 0, 0, false),
+            true,
+            true,
+        );
+        assert_eq!(
+            c.apply(
+                &frame(2, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            ),
+            vec![Kind::SwitchDown]
+        );
+        assert_eq!(
+            c.apply(
+                &frame(3, "DOWN", true, false, "TALK", 3, 3, 0, false),
+                true,
+                true
+            ),
+            vec![Kind::SwitchCancel, Kind::Down]
+        );
+        assert!(c.switch_down_seq.is_none());
+        assert!(c
+            .apply(
+                &frame(4, "SWITCH_UP", false, false, "IDLE", 3, 3, 0, false),
+                true,
+                true
+            )
+            .is_empty());
+        assert_eq!(
+            c.apply(
+                &frame(5, "UP", false, false, "IDLE", 3, 3, 0, false),
+                true,
+                true
+            ),
+            vec![Kind::Up]
+        );
+        assert_eq!(
+            c.apply(
+                &frame(6, "SWITCH_DOWN", false, false, "IDLE", 3, 3, 0, false),
+                false,
+                true
+            ),
+            vec![Kind::SwitchDown]
+        );
+        assert_eq!(
+            c.apply(
+                &frame(7, "SUBMIT", false, true, "IDLE", 3, 3, 0, false),
+                false,
+                true
+            ),
+            vec![Kind::SwitchCancel, Kind::Submit]
+        );
+        assert!(c.switch_down_seq.is_none());
+    }
+    #[test]
+    fn previous_v2_single_switch_packet_remains_a_short_press() {
+        let mut c = Controls::default();
+        let legacy = frame(2, "SWITCH_TAB", false, false, "IDLE", 0, 0, 0, false);
+        assert_eq!(c.apply(&legacy, false, true), vec![Kind::SwitchLegacy]);
+        assert!(c.apply(&legacy, false, true).is_empty());
+        assert!(c.switch_down_seq.is_none());
+        let down = frame(3, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false);
+        assert_eq!(c.apply(&down, false, true), vec![Kind::SwitchDown]);
+        assert!(c
+            .apply(
+                &frame(4, "SWITCH_TAB", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+    }
+    #[test]
+    fn orphan_up_and_forbidden_start_cannot_open_gesture() {
+        let mut c = Controls::default();
+        assert!(c
+            .apply(
+                &frame(3, "SWITCH_UP", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+        assert!(c
+            .apply(
+                &frame(2, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+        assert!(c
+            .apply(
+                &frame(4, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                false
+            )
+            .is_empty());
+        assert!(c
+            .apply(
+                &frame(5, "SWITCH_UP", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            )
+            .is_empty());
+        assert_eq!(
+            c.apply(
+                &frame(6, "SWITCH_DOWN", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                true
+            ),
+            vec![Kind::SwitchDown]
+        );
+        assert_eq!(
+            c.apply(
+                &frame(7, "SWITCH_UP", false, false, "IDLE", 0, 0, 0, false),
+                false,
+                false
+            ),
+            vec![Kind::SwitchCancel]
+        );
     }
 }

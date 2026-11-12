@@ -1,5 +1,8 @@
 (() => {
-  if (window.__GPT_WRAPPER__) return;
+  // Only the trusted top-level ChatGPT document receives DOM control.
+  if (window !== window.top || location.protocol !== "https:" ||
+      !["chatgpt.com", "chat.openai.com"].includes(location.hostname) ||
+      window.__GPT_WRAPPER__) return;
 
   const state = {
     before: "", timer: null, pendingTranscription: false,
@@ -153,6 +156,8 @@
   };
 
   window.__GPT_WRAPPER__ = {
+    provider: "chatgpt",
+
     showRecoveryStatus(message) {
       let notice = document.getElementById("gpt-wrapper-ptt-recovery");
       if (!notice) {

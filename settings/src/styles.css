@@ -316,7 +316,7 @@ button:disabled {
   }
 }
 
-/* ChatGPT dictation microphone: read-only inventory until audio routing is verified. */
+/* Shared dictation microphone; inventory comes from the selected provider origin. */
 .microphone-section {
   margin-top: 22px;
   border-top: 1px solid #ececec;
@@ -446,3 +446,42 @@ button:disabled {
 .device-wizard label > input:not([type="checkbox"]), .device-wizard select { display: block; width: 100%; margin-top: 6px; }
 .device-steps { display: flex; flex-wrap: wrap; gap: 24px; padding-left: 24px; }
 .device-steps [aria-current="step"] { font-weight: 700; text-decoration: underline; }
+
+/* G / C selector shared by Project Bookmarks and the microphone source. */
+.provider-tabs {
+  display: inline-flex;
+  gap: 4px;
+  margin: 0 0 16px;
+  padding: 3px;
+  border: 1px solid #e3e3e3;
+  border-radius: 9px;
+  background: #f7f7f8;
+}
+.provider-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #4b4b57;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.provider-tab.is-active { background: #fff; color: #202123; box-shadow: 0 1px 3px #0002; font-weight: 600; }
+.provider-tab:disabled { cursor: default; opacity: .7; }
+.provider-letter {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: #202123;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+.microphone-binding { font-size: 12px; line-height: 1.5; margin: 6px 0; color: #067647; }
+.microphone-binding.is-warning { color: #925e00; }

@@ -1,16 +1,27 @@
-import { For, batch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, batch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { render } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 import { FiPlus, FiX } from "solid-icons/fi";
+import {
+  PROVIDERS,
+  type ProviderId,
+  errorMessage,
+  providerChanged,
+  providerInfo,
+  switcherButtonState,
+} from "./provider";
 import "./styles.css";
 
 type TabInfo = {
   id: number;
   title: string;
   status: "working" | "send" | "voice" | "fallback";
+  provider: ProviderId;
 };
 
+// Rust only sends the active provider's tabs.
 type TabSnapshot = {
+  activeProvider: ProviderId;
   tabs: TabInfo[];
   activeTabId: number | null;
 };
@@ -26,9 +37,12 @@ declare global {
 }
 
 const EMPTY_SNAPSHOT: TabSnapshot = {
+  activeProvider: "chatgpt",
   tabs: [],
   activeTabId: null,
 };
+
+const NOTICE_MS = 4000;
 
 const LONG_PRESS_MS = 400;
 const DRAG_THRESHOLD_PX = 5;
@@ -75,9 +89,15 @@ function TabBarApp() {
   const [snapshot, setSnapshot] = createSignal<TabSnapshot>(EMPTY_SNAPSHOT);
   const [busy, setBusy] = createSignal(false);
   const [dragPreview, setDragPreview] = createSignal<DragPreview | null>(null);
+  const [pendingProvider, setPendingProvider] = createSignal<ProviderId | null>(null);
+  const [notice, setNotice] = createSignal<string | null>(null);
   const tabIds = createMemo(() => snapshot().tabs.map((tab) => tab.id));
+  const activeProvider = createMemo(() => snapshot().activeProvider);
+  const providerName = () => providerInfo(activeProvider()).name;
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let tabStrip: HTMLDivElement | undefined;
-  let gesture: { pointerId: number; startedAt: number; timer: ReturnType<typeof setTimeout> } | null = null;
+  // timer is null for providers without a long-press bookmark menu.
+  let gesture: { pointerId: number; startedAt: number; timer: ReturnType<typeof setTimeout> | null } | null = null;
   let drag: DragSession | null = null;
   let suppressClick: { tabId: number; until: number } | null = null;
   let revision = 0;
@@ -85,11 +105,19 @@ function TabBarApp() {
 
   const tabById = (id: number) => snapshot().tabs.find((tab) => tab.id === id);
 
+  const showNotice = (error: unknown) => {
+    clearTimeout(noticeTimer);
+    setNotice(errorMessage(error));
+    noticeTimer = setTimeout(() => setNotice(null), NOTICE_MS);
+  };
+
   // Ignore stale background snapshots while an optimistic reorder is being committed.
   const applySnapshot = (next: TabSnapshot) => {
-    if (drag && !sameOrder(drag.initialIds, next.tabs.map((tab) => tab.id))) {
+    if (drag && (providerChanged(snapshot(), next)
+      || !sameOrder(drag.initialIds, next.tabs.map((tab) => tab.id)))) {
       cancelDrag();
     }
+    if (providerChanged(snapshot(), next)) clearGesture();
     setSnapshot(next);
   };
 
@@ -116,7 +144,33 @@ function TabBarApp() {
       applySnapshot(await invoke<TabSnapshot>(command, args));
     } catch (error) {
       console.error(`[gpt-wrapper] ${command} failed:`, error);
+      showNotice(error);
+      void refresh();
     } finally {
+      setBusy(false);
+    }
+  };
+
+  // Rust validates the PTT gate and performs the WebView switch; the UI only
+  // prevents overlapping requests and restores the last confirmed state.
+  const switchProvider = async (provider: ProviderId) => {
+    if (busy() || drag || gesture || pendingProvider() || provider === activeProvider()) return;
+    revision++;
+    setBusy(true);
+    setPendingProvider(provider);
+    try {
+      applySnapshot(await invoke<TabSnapshot>("switch_provider", { provider }));
+      setNotice(null);
+    } catch (error) {
+      console.error("[gpt-wrapper] switch_provider failed:", error);
+      showNotice(error);
+      try {
+        applySnapshot(await invoke<TabSnapshot>("get_tabs"));
+      } catch (refreshError) {
+        console.error("[gpt-wrapper] failed to restore tabs:", refreshError);
+      }
+    } finally {
+      setPendingProvider(null);
       setBusy(false);
     }
   };
@@ -315,6 +369,7 @@ function TabBarApp() {
         applySnapshot(await invoke<TabSnapshot>("reorder_tabs", { tabIds: orderedIds }));
       } catch (error) {
         console.error("[gpt-wrapper] failed to reorder tabs:", error);
+        showNotice(error);
         try {
           settleTo(await invoke<TabSnapshot>("get_tabs"));
         } catch (refreshError) {
@@ -330,7 +385,7 @@ function TabBarApp() {
 
   const clearGesture = (button?: HTMLButtonElement) => {
     if (!gesture) return;
-    clearTimeout(gesture.timer);
+    if (gesture.timer !== null) clearTimeout(gesture.timer);
     if (button?.hasPointerCapture(gesture.pointerId)) {
       button.releasePointerCapture(gesture.pointerId);
     }
@@ -343,8 +398,15 @@ function TabBarApp() {
     const button = event.currentTarget as HTMLButtonElement;
     button.setPointerCapture(event.pointerId);
     const pointerId = event.pointerId;
+    // Each provider has its own Project Bookmarks; the menu and the new tab
+    // are requested for the provider visible when the press started.
+    const provider = activeProvider();
     const timer = setTimeout(() => {
       if (!gesture || gesture.pointerId !== pointerId) return;
+      if (activeProvider() !== provider) {
+        clearGesture(button);
+        return;
+      }
       // After the threshold, this gesture cannot fall back to a Default tab.
       gesture = null;
       setBusy(true);
@@ -353,14 +415,16 @@ function TabBarApp() {
       void (async () => {
         try {
           const projectId = await invoke<string | null>("show_project_bookmark_menu", {
+            provider,
             anchor: { right: rect.right, bottom: rect.bottom },
           });
           if (projectId) {
             revision++;
-            applySnapshot(await invoke<TabSnapshot>("create_project_tab", { projectId }));
+            applySnapshot(await invoke<TabSnapshot>("create_project_tab", { provider, projectId }));
           }
         } catch (error) {
           console.error("[gpt-wrapper] bookmark menu failed:", error);
+          showNotice(error);
         } finally {
           setBusy(false);
         }
@@ -372,7 +436,8 @@ function TabBarApp() {
   const finishNewTabGesture = (event: PointerEvent) => {
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     const button = event.currentTarget as HTMLButtonElement;
-    const isShortPress = performance.now() - gesture.startedAt < LONG_PRESS_MS;
+    const isShortPress = gesture.timer === null
+      || performance.now() - gesture.startedAt < LONG_PRESS_MS;
     clearGesture(button);
     if (event.type === "pointerup" && isShortPress) void runCommand("create_tab");
   };
@@ -413,6 +478,7 @@ function TabBarApp() {
     onCleanup(() => {
       cancelDrag();
       clearGesture();
+      clearTimeout(noticeTimer);
       window.removeEventListener("pointermove", movePointer);
       window.removeEventListener("pointerup", finishTabDrag);
       window.removeEventListener("pointercancel", finishTabDrag);
@@ -432,8 +498,44 @@ function TabBarApp() {
   };
 
   return (
-    <div id="gpt-wrapper-tab-bar" classList={{ "is-busy": busy(), "is-reordering": !!dragPreview() }}>
-      <div class="gpt-wrapper-tabs" role="tablist" aria-label="ChatGPT tabs" ref={tabStrip}>
+    <div
+      id="gpt-wrapper-tab-bar"
+      classList={{ "is-busy": busy(), "is-reordering": !!dragPreview() }}
+      data-provider={activeProvider()}
+    >
+      <div class="gpt-wrapper-provider-switcher" role="group" aria-label="Chat provider">
+        <For each={PROVIDERS}>
+          {(provider) => {
+            const state = () =>
+              switcherButtonState(provider.id, activeProvider(), pendingProvider(), busy());
+            return (
+              <button
+                class="gpt-wrapper-provider"
+                classList={{ "is-active": state().pressed, "is-pending": state().pending }}
+                type="button"
+                data-provider={provider.id}
+                aria-pressed={state().pressed}
+                aria-label={provider.name}
+                title={provider.name}
+                disabled={state().disabled && !state().pressed}
+                onClick={() => void switchProvider(provider.id)}
+              >
+                {provider.letter}
+              </button>
+            );
+          }}
+        </For>
+      </div>
+
+      <div
+        class="gpt-wrapper-tabs"
+        role="tablist"
+        aria-label={`${providerName()} tabs`}
+        ref={tabStrip}
+      >
+        <Show when={tabIds().length === 0}>
+          <span class="gpt-wrapper-tabs-empty">沒有 {providerName()} 分頁，按 + 開新分頁</span>
+        </Show>
         <For each={tabIds()}>
           {(tabId) => {
             const tab = () => tabById(tabId);
@@ -447,7 +549,7 @@ function TabBarApp() {
                 type="button"
                 data-tab-id={tabId}
                 aria-current={isActive() ? "page" : "false"}
-                title={tab()?.title ?? "ChatGPT"}
+                title={tab()?.title ?? providerName()}
                 style={{ transform: dragPreview() ? `translate3d(${dragPreview()!.offsets.get(tabId) ?? 0}px,0,0)` : undefined }}
                 onPointerDown={(event) => startTabDrag(event, tabId)}
                 onLostPointerCapture={(event) => {
@@ -464,12 +566,12 @@ function TabBarApp() {
                 }}
               >
                 <span class="gpt-wrapper-tab-dot" data-status={tab()?.status ?? "fallback"} aria-hidden="true" />
-                <span class="gpt-wrapper-tab-title">{tab()?.title ?? "ChatGPT"}</span>
+                <span class="gpt-wrapper-tab-title">{tab()?.title ?? providerName()}</span>
                 <span
                   class="gpt-wrapper-tab-close"
                   role="button"
                   tabIndex={0}
-                  aria-label={`Close ${tab()?.title ?? "ChatGPT"}`}
+                  aria-label={`Close ${tab()?.title ?? providerName()}`}
                   title="Close tab"
                   onClick={(event) => closeTab(event, tabId)}
                   onKeyDown={(event) => handleCloseKeyDown(event, tabId)}
@@ -485,8 +587,8 @@ function TabBarApp() {
       <button
         class="gpt-wrapper-new-tab"
         type="button"
-        aria-label="Open new ChatGPT tab"
-        title="New ChatGPT tab"
+        aria-label={`Open new ${providerName()} tab`}
+        title={`New ${providerName()} tab`}
         disabled={busy()}
         onPointerDown={startNewTabGesture}
         onPointerUp={finishNewTabGesture}
@@ -498,6 +600,12 @@ function TabBarApp() {
       >
         <FiPlus aria-hidden="true" />
       </button>
+
+      <Show when={notice()}>
+        <div class="gpt-wrapper-notice" role="alert" title={notice() ?? undefined}>
+          {notice()}
+        </div>
+      </Show>
     </div>
   );
 }

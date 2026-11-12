@@ -15,7 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{
-    project_settings::{ProjectSettings, ProjectSettingsState},
+    project_settings::{ProjectList, ProjectSettingsState},
+    provider::Provider,
     update_project_settings,
 };
 
@@ -116,13 +117,11 @@ impl BackgroundProjectSwitcherState {
     }
 }
 
-fn resolved_id(settings: &ProjectSettings) -> Option<Uuid> {
-    settings
-        .default_project_id
-        .filter(|id| settings.projects.iter().any(|project| project.id == *id))
+fn resolved_id(settings: &ProjectList) -> Option<Uuid> {
+    settings.resolved_default_id()
 }
 
-fn next_id(settings: &ProjectSettings) -> Option<Uuid> {
+fn next_id(settings: &ProjectList) -> Option<Uuid> {
     let current = resolved_id(settings);
     match current {
         None => settings.projects.first().map(|project| project.id),
@@ -135,11 +134,21 @@ fn next_id(settings: &ProjectSettings) -> Option<Uuid> {
     }
 }
 
-fn label_for(settings: &ProjectSettings) -> String {
-    resolved_id(settings)
+// The built-in entry of each provider's list (its home page).
+pub fn builtin_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Chatgpt => "ChatGPT.com",
+        Provider::Claude => "Claude.ai",
+    }
+}
+
+// Always names the provider (G / C) and its actual Default Project.
+fn label_for(provider: Provider, settings: &ProjectList) -> String {
+    let name = resolved_id(settings)
         .and_then(|id| settings.projects.iter().find(|p| p.id == id))
         .map(|p| p.name.clone())
-        .unwrap_or_else(|| "ChatGPT.com".to_string())
+        .unwrap_or_else(|| builtin_label(provider).to_string());
+    format!("{} · {name}", provider.letter())
 }
 
 fn update_script(label: &str) -> String {
@@ -385,7 +394,9 @@ pub fn dismiss(app: &AppHandle) {
     }
 }
 
-pub fn press(app: &AppHandle) {
+/// `provider` is the provider visible when the window went to the tray; only
+/// that provider's Default Project is previewed or rotated.
+pub fn press(app: &AppHandle, provider: Provider) {
     let state = app.state::<BackgroundProjectSwitcherState>();
     let (generation, label) = {
         // Serialize input selection transactions without holding the Toast
@@ -401,7 +412,7 @@ pub fn press(app: &AppHandle) {
             (session.active(now), session.generation)
         };
         let result = if continuing_session {
-            update_project_settings(app, |settings| {
+            update_project_settings(app, provider, |settings| {
                 // Compute the next selection inside the settings transaction,
                 // so concurrent Settings edits cannot supply a stale next ID.
                 let next = next_id(settings);
@@ -411,7 +422,7 @@ pub fn press(app: &AppHandle) {
             app.state::<ProjectSettingsState>().snapshot()
         };
         let label = match result {
-            Ok(settings) => label_for(&settings),
+            Ok(settings) => label_for(provider, settings.list(provider)),
             Err(error) => {
                 eprintln!("[gpt-wrapper] failed to save Default Project: {error}");
                 // Keep the selection in its last persisted state; a subsequent press may retry.
@@ -454,8 +465,8 @@ mod tests {
     use super::*;
     use crate::project_settings::ProjectBookmark;
 
-    fn sample() -> ProjectSettings {
-        ProjectSettings {
+    fn sample() -> ProjectList {
+        ProjectList {
             default_project_id: None,
             projects: vec![
                 ProjectBookmark {
@@ -486,7 +497,17 @@ mod tests {
         assert_eq!(next_id(&s), Some(s.projects[1].id));
         s.projects.clear();
         assert_eq!(next_id(&s), None);
-        assert_eq!(label_for(&s), "ChatGPT.com");
+        assert_eq!(label_for(Provider::Chatgpt, &s), "G · ChatGPT.com");
+        assert_eq!(label_for(Provider::Claude, &s), "C · Claude.ai");
+    }
+
+    #[test]
+    fn labels_name_the_provider_and_its_own_default() {
+        let mut s = sample();
+        s.default_project_id = Some(s.projects[1].id);
+        s.projects[1].name = "Research".into();
+        assert_eq!(label_for(Provider::Claude, &s), "C · Research");
+        assert_eq!(label_for(Provider::Chatgpt, &s), "G · Research");
     }
 
     #[test]
@@ -494,7 +515,7 @@ mod tests {
         let mut s = sample();
         s.default_project_id = Some(Uuid::new_v4());
         assert_eq!(next_id(&s), Some(s.projects[0].id));
-        assert_eq!(label_for(&s), "ChatGPT.com");
+        assert_eq!(label_for(Provider::Chatgpt, &s), "G · ChatGPT.com");
         s.projects.clear();
         assert_eq!(next_id(&s), None);
     }

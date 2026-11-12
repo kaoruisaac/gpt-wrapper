@@ -7,6 +7,12 @@ use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
 pub struct ShortcutSettings {
     pub ptt: Vec<String>,
     pub submit: Vec<String>,
+    #[serde(default = "default_switch_tabs_bindings")]
+    pub switch_tabs: Vec<String>,
+}
+
+fn default_switch_tabs_bindings() -> Vec<String> {
+    vec!["Ctrl+Shift+Equal".into(), "Ctrl+NumpadAdd".into()]
 }
 
 impl Default for ShortcutSettings {
@@ -14,6 +20,7 @@ impl Default for ShortcutSettings {
         Self {
             ptt: vec!["Ctrl+Digit0".into(), "Ctrl+Numpad0".into()],
             submit: vec!["Ctrl+Period".into(), "Ctrl+NumpadDecimal".into()],
+            switch_tabs: default_switch_tabs_bindings(),
         }
     }
 }
@@ -22,11 +29,11 @@ impl Default for ShortcutSettings {
 // Restrict modifiers to the four supported combinations and reject duplicate OS hotkey IDs.
 pub fn parse_and_validate(
     settings: &ShortcutSettings,
-) -> Result<(Vec<Shortcut>, Vec<Shortcut>), String> {
-    if settings.ptt.is_empty() || settings.submit.is_empty() {
-        return Err("PTT 與 Explicit Submit 必須各保留至少一組快捷鍵。".into());
+) -> Result<(Vec<Shortcut>, Vec<Shortcut>, Vec<Shortcut>), String> {
+    if settings.ptt.is_empty() || settings.submit.is_empty() || settings.switch_tabs.is_empty() {
+        return Err("PTT、Explicit Submit 與 Switch Tabs 必須各保留至少一組快捷鍵。".into());
     }
-    if settings.ptt.len() > 16 || settings.submit.len() > 16 {
+    if settings.ptt.len() > 16 || settings.submit.len() > 16 || settings.switch_tabs.len() > 16 {
         return Err("每個動作最多可設定 16 組快捷鍵。".into());
     }
     let mut ids = HashSet::new();
@@ -57,7 +64,8 @@ pub fn parse_and_validate(
     };
     let ptt = parse(&settings.ptt)?;
     let submit = parse(&settings.submit)?;
-    Ok((ptt, submit))
+    let switch_tabs = parse(&settings.switch_tabs)?;
+    Ok((ptt, submit, switch_tabs))
 }
 
 pub struct ShortcutSettingsState {
@@ -133,8 +141,16 @@ mod tests {
         let custom = ShortcutSettings {
             ptt: vec!["Ctrl+Shift+KeyK".into(), "Alt+F8".into()],
             submit: vec!["Ctrl+Alt+KeyQ".into(), "Ctrl+NumpadDecimal".into()],
+            switch_tabs: vec!["Ctrl+Shift+Equal".into()],
         };
         assert_eq!(parse_and_validate(&custom).unwrap().1.len(), 2);
+        assert_eq!(
+            parse_and_validate(&ShortcutSettings::default())
+                .unwrap()
+                .2
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -148,6 +164,24 @@ mod tests {
         assert!(parse_and_validate(&value).is_err());
         value.submit.clear();
         assert!(parse_and_validate(&value).is_err());
+        let mut value = ShortcutSettings::default();
+        value.switch_tabs.push("Ctrl+Digit0".into());
+        assert!(parse_and_validate(&value).is_err());
+        value.switch_tabs.clear();
+        assert!(parse_and_validate(&value).is_err());
+    }
+
+    #[test]
+    fn legacy_file_preserves_custom_bindings() {
+        let dir = std::env::temp_dir().join(format!("gpt-shortcuts-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("shortcut-settings.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, r#"{"ptt":["Ctrl+KeyT"],"submit":["Alt+KeyM"]}"#).unwrap();
+        let restored = ShortcutSettingsState::load(path).get().unwrap();
+        assert_eq!(restored.ptt, ["Ctrl+KeyT"]);
+        assert_eq!(restored.submit, ["Alt+KeyM"]);
+        assert_eq!(restored.switch_tabs, default_switch_tabs_bindings());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -158,6 +192,7 @@ mod tests {
         let custom = ShortcutSettings {
             ptt: vec!["Ctrl+Shift+KeyK".into()],
             submit: vec!["Alt+KeyM".into()],
+            switch_tabs: vec!["Ctrl+NumpadAdd".into()],
         };
         state.save(custom.clone()).unwrap();
         assert_eq!(ShortcutSettingsState::load(path).get().unwrap(), custom);

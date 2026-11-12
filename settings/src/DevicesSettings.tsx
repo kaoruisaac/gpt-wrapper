@@ -255,7 +255,7 @@ export default function DevicesSettings() {
             <Show when={wizard()?.stage === "securing"}><div class="devices-holdbox"><div class="devices-hold-symbol">◎</div><p>正在建立加密 BLE 連線，請保持裝置通電。</p></div></Show>
             <Show when={wizard()?.stage === "identify"}>
               <p class="devices-sub">確認選定 ESP32 的 LED 正在閃爍。先放開兩鍵，再於 30 秒內在實體裝置短按並放開 PTT。</p>
-              <div class="devices-holdbox"><div class="devices-hold-symbol">◎</div><h3>等待實體確認</h3><p class="devices-sub">這次 PTT 不會開始 ChatGPT 聽寫或收音；確認結果會自動更新。</p><button class="devices-btn" disabled={busy()} onClick={() => void act("identify")}>重新讓 LED 閃爍</button></div>
+              <div class="devices-holdbox"><div class="devices-hold-symbol">◎</div><h3>等待實體確認</h3><p class="devices-sub">這次 PTT 不會開始 ChatGPT / Claude 聽寫或收音；確認結果會自動更新。</p><button class="devices-btn" disabled={busy()} onClick={() => void act("identify")}>重新讓 LED 閃爍</button></div>
             </Show>
             <Show when={wizard()?.stage === "wifi"}>
               <p class="devices-sub">Windows 可連接 5 GHz 或 Ethernet；請為 ESP32 選擇能與 Windows 互通的 2.4 GHz 網路。</p>
