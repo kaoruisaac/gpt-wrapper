@@ -1,9 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod background_project_switcher;
+// Debug-build-only local verification harness (never compiled into release).
+#[cfg(debug_assertions)]
+mod dev_control;
+// ESP32 devices are a Windows-only backend (BLE / WLAN / DPAPI / audio bridge).
+// macOS v1 compiles the same API surface reporting `unsupported_platform`.
+#[cfg(windows)]
+mod devices;
+#[cfg(not(windows))]
+#[path = "devices_unsupported.rs"]
 mod devices;
 mod general_settings;
 mod microphone_inventory;
+mod platform;
 mod project_settings;
 mod provider;
 mod shortcut_settings;
@@ -36,30 +46,6 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use uuid::Uuid;
-use webview2_com::{
-    CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, ContextMenuRequestedEventHandler,
-    CustomItemSelectedEventHandler, ExecuteScriptCompletedHandler,
-    Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2, ICoreWebView2Environment9, ICoreWebView2_11, ICoreWebView2_2,
-        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-    },
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler, WebMessageReceivedEventHandler,
-};
-use windows::{
-    core::{Interface, HSTRING, PCWSTR, PWSTR},
-    Win32::UI::{
-        Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
-        Shell::ShellExecuteW,
-        WindowsAndMessaging::{
-            AppendMenuW, CreatePopupMenu, DestroyMenu, GetWindowPlacement, IsIconic,
-            SetForegroundWindow, ShowWindow, TrackPopupMenuEx, MF_CHECKED, MF_STRING, SW_RESTORE,
-            SW_SHOWMAXIMIZED, SW_SHOWNORMAL, TPM_LEFTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD,
-            TPM_RIGHTALIGN, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
-        },
-    },
-};
-
 const ADAPTER_SCRIPT: &str = include_str!("chatgpt_adapter.js");
 const CLAUDE_ADAPTER_SCRIPT: &str = include_str!("claude_adapter.js");
 // Placeholder replaced with the tab's provider ID in shared page scripts.
@@ -981,6 +967,7 @@ impl PttTracker {
             .unwrap_or(DeviceSubmitTarget::None)
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn capture_independent_device_submit(&self, active: Option<usize>) -> DeviceSubmitTarget {
         let Ok(owner) = self.owner.lock() else {
             return DeviceSubmitTarget::Busy;
@@ -1317,31 +1304,26 @@ fn inject_prefix_attempt(
     if !prefix_flow_current(&app, tab_id, flow) {
         return;
     }
-    let script = HSTRING::from(format!(
+    let script = format!(
         "window.__GPT_WRAPPER__?.applyMessagePrefix?.({}) ?? 'not-ready'",
         serde_json::to_string(&prefix).expect("prefix is serializable")
-    ));
-    let app_for_callback = app.clone();
+    );
+    let app_for_result = app.clone();
+    let app_for_unavailable = app.clone();
     let webview_for_callback = webview.clone();
-    let result = webview.with_webview(move |platform_webview| {
-        let core = match unsafe { platform_webview.controller().CoreWebView2() } {
-            Ok(core) => core,
-            Err(error) => {
-                eprintln!("[gpt-wrapper] prefix injection WebView2 unavailable on tab {tab_id}: {error:?}");
-                finish_prefix_flow(&app_for_callback, tab_id, flow, false);
+    platform::eval_json(
+        &webview,
+        script,
+        move |result, _| {
+            if !prefix_flow_current(&app_for_result, tab_id, flow) {
                 return;
             }
-        };
-        let app_for_result = app_for_callback.clone();
-        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
-            if !prefix_flow_current(&app_for_result, tab_id, flow) {
-                return Ok(());
-            }
-            let status = if let Err(error) = result {
-                eprintln!("[gpt-wrapper] prefix injection script failed on tab {tab_id}: {error:?}");
-                "failure".to_string()
-            } else {
-                serde_json::from_str::<String>(&raw).unwrap_or_else(|_| "failure".to_string())
+            let status = match result {
+                Err(error) => {
+                    eprintln!("[gpt-wrapper] prefix injection script failed on tab {tab_id}: {error}");
+                    "failure".to_string()
+                }
+                Ok(raw) => serde_json::from_str::<String>(&raw).unwrap_or_else(|_| "failure".to_string()),
             };
             match status.as_str() {
                 "success" => finish_prefix_flow(&app_for_result, tab_id, flow, true),
@@ -1359,17 +1341,12 @@ fn inject_prefix_attempt(
                     finish_prefix_flow(&app_for_result, tab_id, flow, false);
                 }
             }
-            Ok(())
-        }));
-        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
-            eprintln!("[gpt-wrapper] prefix injection ExecuteScript failed on tab {tab_id}: {error:?}");
-            finish_prefix_flow(&app_for_callback, tab_id, flow, false);
-        }
-    });
-    if let Err(error) = result {
-        eprintln!("[gpt-wrapper] prefix injection with_webview failed on tab {tab_id}: {error:?}");
-        finish_prefix_flow(&app, tab_id, flow, false);
-    }
+        },
+        move |error| {
+            eprintln!("[gpt-wrapper] prefix injection unavailable on tab {tab_id}: {error}");
+            finish_prefix_flow(&app_for_unavailable, tab_id, flow, false);
+        },
+    );
 }
 
 fn begin_prefix_flow(app: &AppHandle, webview: Webview, tab_id: usize, flow: PrefixFlow) {
@@ -1451,6 +1428,71 @@ fn reset_tab_status(app_handle: &AppHandle, tab_id: usize) {
     }
 }
 
+// Shared decision for every page -> host message, whatever the native bridge
+// (WebView2 postMessage or WKScriptMessageHandler). `source` is the native,
+// page-independent origin/URL of the top-level document.
+struct TabMessageLog {
+    rejected_source: AtomicBool,
+    rejected_payload: AtomicBool,
+}
+
+fn handle_tab_message(
+    app_handle: &AppHandle,
+    tab_id: usize,
+    provider: Provider,
+    source: &str,
+    raw: &str,
+    log: &TabMessageLog,
+) {
+    // Audio routing and inventory messages are trusted only from the
+    // tab's own provider origin (checked inside the handlers).
+    if microphone_inventory::handle_route_message(app_handle, tab_id, source, raw)
+        || microphone_inventory::handle_message(app_handle, tab_id, source, raw)
+    {
+        return;
+    }
+    // Developer-only capture-path evidence. Reject other origins and
+    // never expose these logs in a production build.
+    if provider == Provider::Chatgpt
+        && microphone_poc_enabled()
+        && serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|value| {
+                value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned)
+            })
+            .as_deref() == Some("gpt-wrapper-microphone-probe")
+    {
+        if trusted_chatgpt_source(source) {
+            println!("[gpt-wrapper] microphone POC tab {tab_id}: {}", raw.chars().take(2048).collect::<String>());
+        }
+        return;
+    }
+    let page_ready = app_handle.state::<TabState>().lock().ok()
+        .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c|
+            c.navigation.as_ref().is_none_or(|n| n.ready())))
+        .unwrap_or(false);
+    if !page_ready { return; }
+    match decode_tab_status(provider, source, raw) {
+        Ok(status) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[gpt-wrapper] status tab {tab_id}: accepted {status:?}");
+            set_tab_status(app_handle, tab_id, status);
+        }
+        Err("source rejected") => {
+            if !log.rejected_source.swap(true, Ordering::Relaxed) {
+                #[cfg(debug_assertions)]
+                eprintln!("[gpt-wrapper] status tab {tab_id}: source rejected");
+            }
+        }
+        Err(_) => {
+            if !log.rejected_payload.swap(true, Ordering::Relaxed) {
+                #[cfg(debug_assertions)]
+                eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected");
+            }
+        }
+    }
+}
+
 fn install_tab_status_listener(
     app_handle: &AppHandle,
     webview: &Webview,
@@ -1458,179 +1500,67 @@ fn install_tab_status_listener(
     provider: Provider,
 ) -> Result<(), String> {
     let app_handle = app_handle.clone();
-    let setup_error = Arc::new(Mutex::new(None));
-    let setup_error_for_callback = Arc::clone(&setup_error);
-    webview
-        .with_webview(move |platform_webview| {
-            let Ok(core) = (unsafe { platform_webview.controller().CoreWebView2() }) else {
-                *setup_error_for_callback.lock().unwrap() =
-                    Some(format!("WebView2 missing on tab {tab_id}"));
-                return;
-            };
-            let rejected_source = AtomicBool::new(false);
-            let rejected_payload = AtomicBool::new(false);
-            let handler = WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
-                let Some(args) = args else {
-                    if !rejected_payload.swap(true, Ordering::Relaxed) {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected (missing event args)");
-                    }
-                    return Ok(());
-                };
-                let mut source = PWSTR(std::ptr::null_mut());
-                if unsafe { args.Source(&mut source) }.is_err() {
-                    if !rejected_source.swap(true, Ordering::Relaxed) {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[gpt-wrapper] status tab {tab_id}: source rejected (read failed)");
-                    }
-                    return Ok(());
-                }
-                let source = CoTaskMemPWSTR::from(source).to_string();
-                let mut raw = PWSTR(std::ptr::null_mut());
-                if unsafe { args.TryGetWebMessageAsString(&mut raw) }.is_err() {
-                    if !rejected_payload.swap(true, Ordering::Relaxed) {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected (not a string)");
-                    }
-                    return Ok(());
-                }
-                let raw = CoTaskMemPWSTR::from(raw).to_string();
-                // Audio routing and inventory messages are trusted only from the
-                // tab's own provider origin (checked inside the handlers).
-                if microphone_inventory::handle_route_message(&app_handle, tab_id, &source, &raw)
-                    || microphone_inventory::handle_message(&app_handle, tab_id, &source, &raw)
-                {
-                    return Ok(());
-                }
-                // Developer-only capture-path evidence. Reject other origins and
-                // never expose these logs in a production build.
-                if provider == Provider::Chatgpt
-                    && microphone_poc_enabled()
-                    && serde_json::from_str::<serde_json::Value>(&raw)
-                        .ok()
-                        .and_then(|value| {
-                            value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned)
-                        })
-                        .as_deref() == Some("gpt-wrapper-microphone-probe")
-                {
-                    if trusted_chatgpt_source(&source) {
-                        println!("[gpt-wrapper] microphone POC tab {tab_id}: {}", raw.chars().take(2048).collect::<String>());
-                    }
-                    return Ok(());
-                }
-                let page_ready = app_handle.state::<TabState>().lock().ok()
-                    .and_then(|tabs| tabs.contexts.get(&tab_id).map(|c|
-                        c.navigation.as_ref().is_none_or(|n| n.ready())))
-                    .unwrap_or(false);
-                if !page_ready { return Ok(()); }
-                match decode_tab_status(provider, &source, &raw) {
-                    Ok(status) => {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[gpt-wrapper] status tab {tab_id}: accepted {status:?}");
-                        set_tab_status(&app_handle, tab_id, status);
-                    }
-                    Err("source rejected") => {
-                        if !rejected_source.swap(true, Ordering::Relaxed) {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[gpt-wrapper] status tab {tab_id}: source rejected");
-                        }
-                    }
-                    Err(_) => {
-                        if !rejected_payload.swap(true, Ordering::Relaxed) {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[gpt-wrapper] status tab {tab_id}: payload rejected");
-                        }
-                    }
-                }
-                Ok(())
-            }));
-            let mut token = 0;
-            if let Err(error) = unsafe { core.add_WebMessageReceived(&handler, &mut token) } {
-                *setup_error_for_callback.lock().unwrap() = Some(format!(
-                    "failed to install status observer on tab {tab_id}: {error:?}"
-                ));
-            } else {
-                #[cfg(debug_assertions)]
-                eprintln!("[gpt-wrapper] status listener installed on tab {tab_id}");
-            }
-        })
-        .map_err(|error| format!("failed to access WebView2 for tab {tab_id}: {error}"))?;
-    let result = setup_error.lock().unwrap().take();
-    result.map_or(Ok(()), Err)
+    let log = TabMessageLog {
+        rejected_source: AtomicBool::new(false),
+        rejected_payload: AtomicBool::new(false),
+    };
+    platform::install_message_listener(webview, tab_id, move |source, raw| {
+        handle_tab_message(&app_handle, tab_id, provider, source, raw, &log);
+    })
 }
 
-// WebView2 navigation IDs distinguish even A -> B -> A and duplicate completions.
-// Tauri's URL-only PageLoad callback cannot provide that guarantee.
+// Native navigation identities (WebView2 NavigationId / WKNavigation) distinguish
+// even A -> B -> A and duplicate completions. Tauri's URL-only PageLoad callback
+// cannot provide that guarantee.
+fn on_navigation_started(app: &AppHandle, tab_id: usize, id: u64, url: &url::Url) {
+    let accepted = {
+        let state = app.state::<TabState>();
+        let Ok(mut tabs) = state.lock() else { return; };
+        let accepted = tabs.contexts.get_mut(&tab_id)
+            .and_then(|c| c.navigation.as_mut())
+            .is_some_and(|n| n.started(id, url));
+        let ready = tabs.contexts.get(&tab_id).and_then(|c| c.navigation.as_ref())
+            .is_some_and(|n| n.ready());
+        if !ready && tabs.standby_ptt_tab_id == Some(tab_id) {
+            tabs.standby_ptt_ready = false;
+        }
+        accepted
+    };
+    if accepted {
+        if let Some(webview) = get_tab_webview(app, tab_id) {
+            handle_tab_page_load(&webview, tab_id, PageLoadEvent::Started, url);
+        }
+    }
+}
+
+fn on_navigation_finished(app: &AppHandle, tab_id: usize, id: u64, url: &url::Url, success: bool) {
+    let accepted = app.state::<TabState>().lock().ok()
+        .and_then(|mut tabs| tabs.contexts.get_mut(&tab_id)
+            .and_then(|c| c.navigation.as_mut()).map(|n| n.finished(id, url, success)))
+        .unwrap_or(false);
+    if accepted {
+        eprintln!("[gpt-wrapper] standby navigation finished: tab={tab_id}, navigation={id}");
+        if let Some(webview) = get_tab_webview(app, tab_id) {
+            handle_tab_page_load(&webview, tab_id, PageLoadEvent::Finished, url);
+        }
+    } else if !success {
+        eprintln!("[gpt-wrapper] navigation failed/obsolete: tab={tab_id}, navigation={id}");
+    }
+}
+
 fn install_navigation_listener(
     app: &AppHandle,
     webview: &Webview,
     tab_id: usize,
 ) -> Result<(), String> {
-    let app = app.clone();
-    let setup_error = Arc::new(Mutex::new(None));
-    let callback_error = Arc::clone(&setup_error);
-    webview.with_webview(move |platform| {
-        let result = (|| -> windows::core::Result<()> {
-            let core = unsafe { platform.controller().CoreWebView2()? };
-            let starting_app = app.clone();
-            let starting = NavigationStartingEventHandler::create(Box::new(move |_, args| {
-                let Some(args) = args else { return Ok(()); };
-                let mut id = 0;
-                let mut uri = PWSTR::null();
-                unsafe { args.NavigationId(&mut id)?; args.Uri(&mut uri)?; }
-                let Ok(url) = url::Url::parse(&CoTaskMemPWSTR::from(uri).to_string()) else { return Ok(()); };
-                let accepted = {
-                    let state = starting_app.state::<TabState>();
-                    let Ok(mut tabs) = state.lock() else { return Ok(()); };
-                    let accepted = tabs.contexts.get_mut(&tab_id)
-                        .and_then(|c| c.navigation.as_mut())
-                        .is_some_and(|n| n.started(id, &url));
-                    let ready = tabs.contexts.get(&tab_id).and_then(|c| c.navigation.as_ref())
-                        .is_some_and(|n| n.ready());
-                    if !ready && tabs.standby_ptt_tab_id == Some(tab_id) {
-                        tabs.standby_ptt_ready = false;
-                    }
-                    accepted
-                };
-                if accepted {
-                    if let Some(webview) = get_tab_webview(&starting_app, tab_id) {
-                        handle_tab_page_load(&webview, tab_id, PageLoadEvent::Started, &url);
-                    }
-                }
-                Ok(())
-            }));
-            let completed = NavigationCompletedEventHandler::create(Box::new(move |sender, args| {
-                let (Some(sender), Some(args)) = (sender, args) else { return Ok(()); };
-                let mut id = 0;
-                let mut success = windows::core::BOOL::default();
-                let mut source = PWSTR::null();
-                unsafe { args.NavigationId(&mut id)?; args.IsSuccess(&mut success)?; sender.Source(&mut source)?; }
-                let Ok(url) = url::Url::parse(&CoTaskMemPWSTR::from(source).to_string()) else { return Ok(()); };
-                let accepted = app.state::<TabState>().lock().ok()
-                    .and_then(|mut tabs| tabs.contexts.get_mut(&tab_id)
-                        .and_then(|c| c.navigation.as_mut()).map(|n| n.finished(id, &url, success.as_bool())))
-                    .unwrap_or(false);
-                if accepted {
-                    eprintln!("[gpt-wrapper] standby navigation finished: tab={tab_id}, navigation={id}");
-                    if let Some(webview) = get_tab_webview(&app, tab_id) {
-                        handle_tab_page_load(&webview, tab_id, PageLoadEvent::Finished, &url);
-                    }
-                } else if !success.as_bool() {
-                    eprintln!("[gpt-wrapper] navigation failed/obsolete: tab={tab_id}, navigation={id}");
-                }
-                Ok(())
-            }));
-            let mut token = 0;
-            unsafe {
-                core.add_NavigationStarting(&starting, &mut token)?;
-                core.add_NavigationCompleted(&completed, &mut token)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result { *callback_error.lock().unwrap() = Some(error.to_string()); }
-    }).map_err(|error| error.to_string())?;
-    let error = setup_error.lock().unwrap().take();
-    error.map_or(Ok(()), Err)
+    let starting_app = app.clone();
+    let finished_app = app.clone();
+    platform::install_navigation_listener(
+        webview,
+        tab_id,
+        move |id, url| on_navigation_started(&starting_app, tab_id, id, &url),
+        move |id, url, success| on_navigation_finished(&finished_app, tab_id, id, &url, success),
+    )
 }
 
 fn handle_tab_page_load(
@@ -1787,31 +1717,6 @@ fn external_link_url(link_uri: &str) -> Result<url::Url, String> {
     project_settings::valid_url(link_uri)
 }
 
-// ShellExecuteW uses the user's Windows default browser. Run it off the WebView
-// event thread so link activation cannot stall WebView2 or Tauri's UI loop.
-fn open_in_system_browser(url: url::Url, tab_id: usize) {
-    tauri::async_runtime::spawn_blocking(move || {
-        let wide_url: Vec<u16> = url
-            .as_str()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let result = unsafe {
-            ShellExecuteW(
-                None,
-                windows::core::w!("open"),
-                PCWSTR(wide_url.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        if (result.0 as usize) <= 32 {
-            eprintln!("[gpt-wrapper] failed to open external link from tab {tab_id}: {url} (ShellExecuteW code {})", result.0 as usize);
-        }
-    });
-}
-
 #[cfg(test)]
 mod external_link_tests {
     use super::*;
@@ -1876,176 +1781,6 @@ mod external_link_tests {
     }
 }
 
-fn install_link_context_menu(
-    app: &AppHandle,
-    webview: &Webview,
-    tab_id: usize,
-    provider: Provider,
-) -> Result<(), String> {
-    let app = app.clone();
-    let setup_error = Arc::new(Mutex::new(None));
-    let setup_error_for_callback = Arc::clone(&setup_error);
-    webview
-        .with_webview(move |platform| {
-            let setup = (|| -> windows::core::Result<()> {
-                let core = unsafe { platform.controller().CoreWebView2()? };
-                let core11: ICoreWebView2_11 = core.cast()?;
-                let core2: ICoreWebView2_2 = core.cast()?;
-                let environment: ICoreWebView2Environment9 =
-                    unsafe { core2.Environment()? }.cast()?;
-
-                let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
-                    // Leave the native menu unchanged unless a valid web link was clicked.
-                    let Some(args) = args else {
-                        return Ok(());
-                    };
-                    let result = (|| -> windows::core::Result<()> {
-                        let target = unsafe { args.ContextMenuTarget()? };
-                        let mut has_link = windows::core::BOOL::default();
-                        unsafe { target.HasLinkUri(&mut has_link)? };
-                        if !has_link.as_bool() {
-                            return Ok(());
-                        }
-
-                        let mut raw_link = PWSTR::null();
-                        unsafe { target.LinkUri(&mut raw_link)? };
-                        let link_uri = CoTaskMemPWSTR::from(raw_link).to_string();
-                        let Ok(spec) = link_tab_spec(provider, &link_uri) else {
-                            return Ok(());
-                        };
-                        let url = spec.url.clone();
-                        let items = unsafe { args.MenuItems()? };
-
-                        // Remove the native "open in new window" action. WebView2 uses
-                        // this unlocalized Name regardless of the UI language.
-                        // A native new-tab action would also hit NewWindowRequested,
-                        // so replace it with our in-app tab action if it exists.
-                        let mut count = 0;
-                        unsafe { items.Count(&mut count)? };
-                        for index in (0..count).rev() {
-                            let existing = unsafe { items.GetValueAtIndex(index)? };
-                            let mut raw_name = PWSTR::null();
-                            unsafe { existing.Name(&mut raw_name)? };
-                            let name = CoTaskMemPWSTR::from(raw_name).to_string();
-                            if matches!(name.as_str(), "openLinkInNewWindow" | "openLinkInNewTab") {
-                                unsafe { items.RemoveValueAtIndex(index)? };
-                            }
-                        }
-
-                        let tab_label: Vec<u16> = "在新分頁中開啟連結\0".encode_utf16().collect();
-                        let tab_item = unsafe {
-                            environment.CreateContextMenuItem(
-                                PCWSTR(tab_label.as_ptr()),
-                                None,
-                                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-                            )?
-                        };
-                        let tab_app = app.clone();
-                        let tab_selected =
-                            CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
-                                // add_child waits on the UI loop. Never create tabs inside
-                                // the WebView2 context-menu callback itself.
-                                let worker_app = tab_app.clone();
-                                let worker_spec = spec.clone();
-                                tauri::async_runtime::spawn_blocking(move || {
-                                    // The link stays with the source tab's provider.
-                                    match create_tab_with_spec(&worker_app, provider, worker_spec, false) {
-                                        Ok(_) => refresh_tab_host(&worker_app),
-                                        Err(error) => eprintln!(
-                                            "[gpt-wrapper] failed to open link in new tab: {error}"
-                                        ),
-                                    }
-                                });
-                                Ok(())
-                            }));
-                        let mut tab_selected_token = 0;
-                        unsafe {
-                            tab_item
-                                .add_CustomItemSelected(&tab_selected, &mut tab_selected_token)?
-                        };
-                        unsafe { items.InsertValueAtIndex(0, &tab_item)? };
-
-                        let label: Vec<u16> = "在預設瀏覽器開啟連結\0".encode_utf16().collect();
-                        let item = unsafe {
-                            environment.CreateContextMenuItem(
-                                PCWSTR(label.as_ptr()),
-                                None,
-                                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-                            )?
-                        };
-
-                        let selected =
-                            CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
-                                open_in_system_browser(url.clone(), tab_id);
-                                Ok(())
-                            }));
-                        let mut selected_token = 0;
-                        unsafe { item.add_CustomItemSelected(&selected, &mut selected_token)? };
-
-                        unsafe { items.InsertValueAtIndex(1, &item)? };
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        eprintln!(
-                            "[gpt-wrapper] failed to extend context menu on tab {tab_id}: {error:?}"
-                        );
-                    }
-                    Ok(())
-                }));
-                let mut token = 0;
-                unsafe { core11.add_ContextMenuRequested(&handler, &mut token)? };
-                Ok(())
-            })();
-            if let Err(error) = setup {
-                *setup_error_for_callback.lock().unwrap() = Some(format!(
-                    "failed to install link context menu on tab {tab_id}: {error:?}"
-                ));
-            }
-        })
-        .map_err(|error| format!("failed to access WebView2 on tab {tab_id}: {error}"))?;
-    let result = setup_error.lock().unwrap().take();
-    result.map_or(Ok(()), Err)
-}
-
-fn install_external_new_window_handler(webview: &Webview, tab_id: usize) -> Result<(), String> {
-    let setup_error = Arc::new(Mutex::new(None));
-    let callback_error = Arc::clone(&setup_error);
-    webview
-        .with_webview(move |platform| {
-            let setup = (|| -> windows::core::Result<()> {
-                let core = unsafe { platform.controller().CoreWebView2()? };
-                let handler = NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
-                    let Some(args) = args else {
-                        return Ok(());
-                    };
-                    // Suppress WebView2's default popup even for unsupported schemes.
-                    unsafe { args.SetHandled(true)? };
-                    let mut raw_uri = PWSTR::null();
-                    unsafe { args.Uri(&mut raw_uri)? };
-                    let uri = CoTaskMemPWSTR::from(raw_uri).to_string();
-                    match external_link_url(&uri) {
-                        Ok(url) => open_in_system_browser(url, tab_id),
-                        Err(_) => eprintln!(
-                            "[gpt-wrapper] ignored non-web popup URL on tab {tab_id}: {uri}"
-                        ),
-                    }
-                    Ok(())
-                }));
-                let mut token = 0;
-                unsafe { core.add_NewWindowRequested(&handler, &mut token)? };
-                Ok(())
-            })();
-            if let Err(error) = setup {
-                *callback_error.lock().unwrap() = Some(format!(
-                    "failed to intercept new windows on tab {tab_id}: {error:?}"
-                ));
-            }
-        })
-        .map_err(|error| format!("failed to access WebView2 on tab {tab_id}: {error}"))?;
-    let result = setup_error.lock().unwrap().take();
-    result.map_or(Ok(()), Err)
-}
-
 // Shared page scripts are pinned to the tab's provider, so a tab that
 // navigates to the other provider's site never routes audio or reports
 // inventory there.
@@ -2094,6 +1829,7 @@ fn create_provider_webview(
     for script in provider_initialization_scripts(provider) {
         builder = builder.initialization_script(script);
     }
+    let builder = platform::configure_tab_builder(builder, app_handle, tab_id, provider);
     let builder = builder
     .background_color(LOADING_BACKGROUND)
     .focused(false)
@@ -2138,13 +1874,13 @@ fn create_provider_webview(
         return Err(error);
     }
 
-    if let Err(error) = install_external_new_window_handler(&webview, tab_id) {
+    if let Err(error) = platform::install_external_new_window_handler(&webview, tab_id) {
         let _ = webview.close();
         return Err(error);
     }
 
-    // Keep the main browser usable even if an old WebView2 runtime lacks this API.
-    if let Err(error) = install_link_context_menu(app_handle, &webview, tab_id, provider) {
+    // Keep the main browser usable even if the native WebView lacks this API.
+    if let Err(error) = platform::install_link_context_menu(app_handle, &webview, tab_id, provider) {
         eprintln!("[gpt-wrapper] link context menu unavailable on tab {tab_id}: {error}");
     }
 
@@ -2347,22 +2083,7 @@ fn apply_standby_target(app: &AppHandle) -> Result<usize, String> {
             .forget_tab(id);
         // Cancel the old document/request before issuing another URL, including
         // an old request whose NavigationStarting has not arrived yet.
-        let stop_error = Arc::new(Mutex::new(None));
-        let callback_error = Arc::clone(&stop_error);
-        webview
-            .with_webview(move |platform| {
-                let result = unsafe {
-                    platform
-                        .controller()
-                        .CoreWebView2()
-                        .and_then(|core| core.Stop())
-                };
-                if let Err(error) = result {
-                    *callback_error.lock().unwrap() = Some(error.to_string());
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        if let Some(error) = stop_error.lock().unwrap().take() {
+        if let Err(error) = platform::stop_loading(&webview) {
             if let Ok(mut tabs) = app.state::<TabState>().lock() {
                 if let Some(n) = tabs
                     .contexts
@@ -2886,80 +2607,9 @@ async fn create_project_tab(
 }
 
 #[derive(Debug, Deserialize)]
-struct MenuAnchor {
-    right: f64,
-    bottom: f64,
-}
-
-struct PopupMenu(windows::Win32::UI::WindowsAndMessaging::HMENU);
-
-impl Drop for PopupMenu {
-    fn drop(&mut self) {
-        if let Err(error) = unsafe { DestroyMenu(self.0) } {
-            eprintln!("[gpt-wrapper] failed to destroy bookmark menu: {error}");
-        }
-    }
-}
-
-fn track_project_bookmark_menu(
-    app: &AppHandle,
-    provider: Provider,
-    settings: ProjectList,
-    anchor: MenuAnchor,
-) -> Result<Option<Uuid>, String> {
-    // IPC can reach the UI thread after the mouse has already been released.
-    if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
-        return Ok(None);
-    }
-    let window = app
-        .get_window(MAIN_WINDOW_LABEL)
-        .ok_or("main window is missing")?;
-    let scale = window.scale_factor().map_err(|error| error.to_string())?;
-    let origin = window.inner_position().map_err(|error| error.to_string())?;
-    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
-    let menu = PopupMenu(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
-
-    let builtin_label: Vec<u16> = format!("{}\0", background_project_switcher::builtin_label(provider))
-        .encode_utf16()
-        .collect();
-    let builtin_flags = if settings.default_project_id.is_none() {
-        MF_STRING | MF_CHECKED
-    } else {
-        MF_STRING
-    };
-    unsafe { AppendMenuW(menu.0, builtin_flags, 1, PCWSTR(builtin_label.as_ptr())) }
-        .map_err(|error| error.to_string())?;
-    {
-        for (index, project) in settings.projects.iter().enumerate() {
-            let label: Vec<u16> =
-                format!("{}\0", project.name.replace('&', "&&").replace('\0', ""))
-                    .encode_utf16()
-                    .collect();
-            let mut flags = MF_STRING;
-            if settings.default_project_id == Some(project.id) {
-                flags |= MF_CHECKED;
-            }
-            unsafe { AppendMenuW(menu.0, flags, index + 2, PCWSTR(label.as_ptr())) }
-                .map_err(|error| error.to_string())?;
-        }
-    }
-
-    // WebView2 may still own capture from pointerdown; the menu loop needs it.
-    let _ = unsafe { ReleaseCapture() };
-    if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
-        return Ok(None);
-    }
-    let x = origin.x + (anchor.right * scale).round() as i32;
-    let y = origin.y + (anchor.bottom * scale).round() as i32;
-    let flags = TPM_LEFTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN;
-    let command = unsafe { TrackPopupMenuEx(menu.0, flags.0, x, y, hwnd, None) }.0 as usize;
-    Ok(if command == 1 {
-        Some(Uuid::nil())
-    } else {
-        command
-            .checked_sub(2)
-            .and_then(|index| settings.projects.get(index).map(|p| p.id))
-    })
+pub(crate) struct MenuAnchor {
+    pub(crate) right: f64,
+    pub(crate) bottom: f64,
 }
 
 #[tauri::command]
@@ -2983,7 +2633,7 @@ async fn show_project_bookmark_menu(
         let (sender, receiver) = std::sync::mpsc::channel();
         let app_for_ui = app.clone();
         app.run_on_main_thread(move || {
-            let _ = sender.send(track_project_bookmark_menu(&app_for_ui, provider, settings, anchor));
+            let _ = sender.send(platform::track_project_bookmark_menu(&app_for_ui, provider, settings, anchor));
         })
         .map_err(|error| error.to_string())?;
         receiver.recv().map_err(|error| error.to_string())?
@@ -3180,95 +2830,6 @@ fn set_autostart_enabled(app: AppHandle, webview: Webview, enabled: bool) -> Res
     })
 }
 
-fn devtools_mouse_event(
-    webview: &ICoreWebView2,
-    event_type: &str,
-    x: f64,
-    y: f64,
-    button: &str,
-    buttons: u32,
-) {
-    let method = HSTRING::from("Input.dispatchMouseEvent");
-    let params = HSTRING::from(
-        serde_json::json!({
-            "type": event_type,
-            "x": x,
-            "y": y,
-            "button": button,
-            "buttons": buttons,
-            "clickCount": 1
-        })
-        .to_string(),
-    );
-
-    unsafe {
-        let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-            move |result, _response| {
-                if let Err(error) = result {
-                    eprintln!("[gpt-wrapper] DevTools mouse event failed: {error:?}");
-                }
-                Ok(())
-            },
-        ));
-
-        if let Err(error) = webview.CallDevToolsProtocolMethod(&method, &params, &handler) {
-            eprintln!("[gpt-wrapper] CallDevToolsProtocolMethod failed: {error:?}");
-        }
-    }
-}
-
-fn dispatch_trusted_click(webview: &ICoreWebView2, rect: Rect) {
-    devtools_mouse_event(webview, "mouseMoved", rect.x, rect.y, "none", 0);
-    devtools_mouse_event(webview, "mousePressed", rect.x, rect.y, "left", 1);
-    devtools_mouse_event(webview, "mouseReleased", rect.x, rect.y, "left", 0);
-}
-
-// SW_RESTORE must only run for minimized windows: it unmaximizes visible
-// maximized windows. Windows also records whether a minimized window should
-// return to maximized state in WINDOWPLACEMENT.
-fn minimized_restore_command(
-    restore_maximized: bool,
-) -> windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD {
-    if restore_maximized {
-        SW_SHOWMAXIMIZED
-    } else {
-        SW_RESTORE
-    }
-}
-
-fn restore_to_foreground(window: &Window) {
-    match window.hwnd() {
-        Ok(hwnd) => unsafe {
-            let was_minimized = IsIconic(hwnd).as_bool();
-            let restore_maximized = if was_minimized {
-                let mut placement = WINDOWPLACEMENT {
-                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                    ..Default::default()
-                };
-                GetWindowPlacement(hwnd, &mut placement).is_ok()
-                    && placement.flags.contains(WPF_RESTORETOMAXIMIZED)
-            } else {
-                false
-            };
-
-            let _ = window.show();
-            if was_minimized {
-                let _ = ShowWindow(hwnd, minimized_restore_command(restore_maximized));
-            }
-            let _ = SetForegroundWindow(hwnd);
-        },
-        Err(error) => {
-            eprintln!("[gpt-wrapper] hwnd unavailable: {error:?}");
-            let _ = window.show();
-            if window.is_minimized().unwrap_or(false) {
-                let _ = window.unminimize();
-            }
-        }
-    }
-
-    let _ = window.set_focus();
-}
-
 fn active_tab_id(app_handle: &AppHandle) -> Option<usize> {
     app_handle
         .state::<TabState>()
@@ -3316,7 +2877,7 @@ fn restore_main_window_from_tray(app_handle: &AppHandle) {
 
     match app_handle.get_window(MAIN_WINDOW_LABEL) {
         Some(window) => {
-            restore_to_foreground(&window);
+            platform::restore_to_foreground(&window);
             focus_active_tab(app_handle);
         }
         None => eprintln!("[gpt-wrapper] main window missing"),
@@ -3337,7 +2898,7 @@ fn activate_existing_main_window(app_handle: &AppHandle) {
     {
         restore_main_window_from_tray(app_handle);
     } else if let Some(window) = app_handle.get_window(MAIN_WINDOW_LABEL) {
-        restore_to_foreground(&window);
+        platform::restore_to_foreground(&window);
         focus_active_tab(app_handle);
     } else {
         eprintln!("[gpt-wrapper] second launch: main window unavailable");
@@ -3406,13 +2967,16 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
         .items(&[&open_item, &settings_item, &quit_item])
         .build()?;
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico"))?;
+    // Windows: left click restores, right click opens the menu. macOS Menu Bar
+    // convention: clicking the status item always opens its menu.
+    let menu_on_left_click = cfg!(target_os = "macos");
 
     let quitting_for_menu = Arc::clone(&quitting);
     TrayIconBuilder::new()
         .icon(icon)
         .tooltip("GPT Wrapper")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(menu_on_left_click)
         .on_menu_event(move |app_handle, event| match event.id().as_ref() {
             TRAY_OPEN_ID => restore_main_window_from_tray(app_handle),
             TRAY_SETTINGS_ID => open_settings_window(app_handle),
@@ -3425,7 +2989,10 @@ fn setup_tray(app: &tauri::App, quitting: Arc<AtomicBool>) -> tauri::Result<()> 
             }
             _ => {}
         })
-        .on_tray_icon_event(|tray, event| {
+        .on_tray_icon_event(move |tray, event| {
+            if menu_on_left_click {
+                return;
+            }
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -3455,28 +3022,17 @@ fn provider_rect_script(provider: Option<Provider>, target: DictationTarget) -> 
 }
 
 fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Option<ClickGuard>) {
-    let script = HSTRING::from(provider_rect_script(webview_tab_provider(webview), target));
+    let script = provider_rect_script(webview_tab_provider(webview), target);
 
-    let result = webview.with_webview(move |platform_webview| {
-        let controller = platform_webview.controller();
-
-        let webview = match unsafe { controller.CoreWebView2() } {
-            Ok(webview) => webview,
-            Err(error) => {
-                eprintln!("[gpt-wrapper] CoreWebView2 unavailable: {error:?}");
-                return;
-            }
-        };
-
-        let webview_for_callback = webview.clone();
-
-        unsafe {
-            let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
-                let mut clicked = false;
-                let mut native_sent = false;
-                if let Err(error) = result {
-                    eprintln!("[gpt-wrapper] button lookup script failed: {error:?}");
-                } else { match serde_json::from_str::<Option<Rect>>(&raw) {
+    platform::eval_json(
+        webview,
+        script,
+        move |result, click_target| {
+            let mut clicked = false;
+            let mut native_sent = false;
+            match result {
+                Err(error) => eprintln!("[gpt-wrapper] button lookup script failed: {error}"),
+                Ok(raw) => match serde_json::from_str::<Option<Rect>>(&raw) {
                     Ok(Some(rect)) if !rect.enabled => {
                         eprintln!(
                             "[gpt-wrapper] {:?} dictation control is visible but disabled",
@@ -3487,36 +3043,36 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                         match &guard {
                             Some(ClickGuard::Start(tracker, app, tab_id, generation)) => {
                                 if !tracker.is_current(*tab_id, *generation) {
-                                    return Ok(());
+                                    return;
                                 }
                                 // Settings can change in the 180 ms between
                                 // scheduling Start and dispatching the click.
                                 if let Err(reason) = microphone_inventory::ptt_start_guard(app, *tab_id) {
                                     tracker.clear_tab(*tab_id);
                                     microphone_inventory::show_ptt_error(app, Some(*tab_id), &reason);
-                                    return Ok(());
+                                    return;
                                 }
                                 if !tracker.mark_start_clicked(*tab_id, *generation) {
-                                    return Ok(());
+                                    return;
                                 }
                             }
                             Some(ClickGuard::Finish(tracker, _, _, generation, _, _))
                                 if tracker.finish_in_flight.load(Ordering::SeqCst) != *generation =>
                             {
-                                return Ok(())
+                                return
                             }
                             Some(ClickGuard::Cancel(tracker, cancelled_generation))
                                 if tracker.is_held()
                                     || tracker.generation.load(Ordering::SeqCst) != *cancelled_generation
                                     || tracker.finish_in_flight.load(Ordering::SeqCst) != 0 =>
                             {
-                                return Ok(())
+                                return
                             }
                             _ => {}
                         }
                         if rect.native_send {
                             if let Some(ClickGuard::Finish(tracker,app,tab,generation,_,_))=&guard {
-                                if tracker.device_finish_generation.load(Ordering::SeqCst)==*generation && !devices::runtime::send_allowed(app,*tab,*generation) {return Ok(());}
+                                if tracker.device_finish_generation.load(Ordering::SeqCst)==*generation && !devices::runtime::send_allowed(app,*tab,*generation) {return;}
                             }
                         }
                         println!(
@@ -3524,7 +3080,7 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                             target, rect.x, rect.y
                         );
                         native_sent = rect.native_send;
-                        dispatch_trusted_click(&webview_for_callback, rect);
+                        platform::trusted_click(&click_target, rect.x, rect.y);
                         clicked = true;
                     }
                     Ok(None) => {
@@ -3536,34 +3092,25 @@ fn trusted_click_guarded(webview: &Webview, target: DictationTarget, guard: Opti
                     Err(error) => {
                         eprintln!("[gpt-wrapper] could not parse button rect {raw:?}: {error}");
                     }
-                }}
-
-                match guard {
-                    Some(ClickGuard::Finish(tracker, app, tab_id, generation, auto_submit, submit_pending)) => {
-                        if clicked {
-                            verify_finish_stopped(app, tracker, tab_id, generation, auto_submit, submit_pending, native_sent, 0);
-                        } else {
-                            complete_finish(app, tracker, tab_id, generation, auto_submit, submit_pending, false, false);
-                        }
-                    }
-                    Some(ClickGuard::Start(tracker, app, tab_id, generation)) if clicked => {
-                        verify_start_visible(app, tracker, tab_id, generation, 0);
-                    }
-                    _ => {}
-                }
-
-                Ok(())
-            }));
-
-            if let Err(error) = webview.ExecuteScript(&script, &handler) {
-                eprintln!("[gpt-wrapper] ExecuteScript failed: {error:?}");
+                },
             }
-        }
-    });
 
-    if let Err(error) = result {
-        eprintln!("[gpt-wrapper] with_webview failed: {error:?}");
-    }
+            match guard {
+                Some(ClickGuard::Finish(tracker, app, tab_id, generation, auto_submit, submit_pending)) => {
+                    if clicked {
+                        verify_finish_stopped(app, tracker, tab_id, generation, auto_submit, submit_pending, native_sent, 0);
+                    } else {
+                        complete_finish(app, tracker, tab_id, generation, auto_submit, submit_pending, false, false);
+                    }
+                }
+                Some(ClickGuard::Start(tracker, app, tab_id, generation)) if clicked => {
+                    verify_start_visible(app, tracker, tab_id, generation, 0);
+                }
+                _ => {}
+            }
+        },
+        |error| eprintln!("[gpt-wrapper] button lookup unavailable: {error}"),
+    );
 }
 
 // PTT ends recording first. Only the setting or an independent, explicit
@@ -3685,18 +3232,17 @@ fn verify_start_visible(
         fail_start(app, tracker, tab_id, generation);
         return;
     };
-    let script = HSTRING::from(provider_rect_script(
+    let script = provider_rect_script(
         tab_provider(&app, tab_id),
         DictationTarget::Finish {
             allow_native_send: true,
         },
-    ));
-    let result = tab.with_webview(move |platform| {
-        let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
-            return;
-        };
-        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
-            if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(Some(_))) {
+    );
+    platform::eval_json(
+        &tab,
+        script,
+        move |result, _| {
+            if matches!(result.as_deref().map(serde_json::from_str::<Option<Rect>>), Ok(Ok(Some(_)))) {
                 if let Some(events) = tracker.start_completed(generation) {
                     devices::runtime::started(&app, tab_id, generation);
                     for event in events {
@@ -3713,15 +3259,9 @@ fn verify_start_visible(
                     }
                 });
             }
-            Ok(())
-        }));
-        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
-            eprintln!("[gpt-wrapper] Start verification query failed: {error:?}");
-        }
-    });
-    if let Err(error) = result {
-        eprintln!("[gpt-wrapper] Start verification WebView unavailable: {error:?}");
-    }
+        },
+        |error| eprintln!("[gpt-wrapper] Start verification query failed: {error}"),
+    );
 }
 
 fn watch_start_callback(
@@ -3780,18 +3320,17 @@ fn verify_finish_stopped(
     };
     // Check every known recording completion control, not just the selected
     // action, so a remaining Send/Insert choice isn't mistaken for completion.
-    let script = HSTRING::from(provider_rect_script(
+    let script = provider_rect_script(
         tab_provider(&app, tab_id),
         DictationTarget::Finish {
             allow_native_send: true,
         },
-    ));
-    let result = tab.with_webview(move |platform| {
-        let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
-            return;
-        };
-        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
-            if result.is_ok() && matches!(serde_json::from_str::<Option<Rect>>(&raw), Ok(None)) {
+    );
+    platform::eval_json(
+        &tab,
+        script,
+        move |result, _| {
+            if matches!(result.as_deref().map(serde_json::from_str::<Option<Rect>>), Ok(Ok(None))) {
                 complete_finish(
                     app.clone(),
                     Arc::clone(&tracker),
@@ -3821,15 +3360,9 @@ fn verify_finish_stopped(
                     }
                 });
             }
-            Ok(())
-        }));
-        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
-            eprintln!("[gpt-wrapper] Finish verification query failed: {error:?}");
-        }
-    });
-    if let Err(error) = result {
-        eprintln!("[gpt-wrapper] Finish verification WebView unavailable: {error:?}");
-    }
+        },
+        |error| eprintln!("[gpt-wrapper] Finish verification query failed: {error}"),
+    );
 }
 
 fn watch_finish_callback(
@@ -4001,26 +3534,19 @@ fn probe_ptt_recovery(
         abort_ptt_recovery(&app, &tracker, tab_id, generation, "分頁已關閉，請再試一次。");
         return;
     };
-    let script = HSTRING::from(recovery_probe_script(provider));
-    let result = tab.with_webview(move |platform| {
-        let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
-            abort_ptt_recovery(&app, &tracker, tab_id, generation, "無法讀取聽寫狀態，請再試一次。");
-            return;
-        };
-        let click_core = core.clone();
-        let app_for_callback = app.clone();
-        let tracker_for_callback = Arc::clone(&tracker);
-        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, raw| {
-            let app = app_for_callback.clone();
-            let tracker = Arc::clone(&tracker_for_callback);
+    let script = recovery_probe_script(provider);
+    let app_for_unavailable = app.clone();
+    let tracker_for_unavailable = Arc::clone(&tracker);
+    platform::eval_json(
+        &tab,
+        script,
+        move |result, click_target| {
             if !tracker.is_recovering(tab_id, generation) {
-                return Ok(());
+                return;
             }
-            let value = if result.is_ok() {
-                serde_json::from_str::<serde_json::Value>(&raw).ok()
-            } else {
-                None
-            };
+            let value = result
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
             let kind = value.as_ref().and_then(|v| v.get("kind")).and_then(|v| v.as_str());
             match kind {
                 Some("idle") => {
@@ -4042,12 +3568,11 @@ fn probe_ptt_recovery(
                     if let (Some(x), Some(y)) = (x, y) {
                         if tracker.is_recovering(tab_id, generation) {
                             // Trusted click only on a known transcription-only Finish.
-                            let rect = Rect { x, y, native_send: false, enabled: true };
-                            dispatch_trusted_click(&click_core, rect);
+                            platform::trusted_click(&click_target, x, y);
                         }
                     } else {
                         abort_ptt_recovery(&app, &tracker, tab_id, generation, "無法定位停止聽寫按鈕，請再試一次。");
-                        return Ok(());
+                        return;
                     }
                     let app = app.clone();
                     let tracker = Arc::clone(&tracker);
@@ -4069,16 +3594,12 @@ fn probe_ptt_recovery(
                     });
                 }
             }
-            Ok(())
-        }));
-        if let Err(error) = unsafe { core.ExecuteScript(&script, &handler) } {
-            eprintln!("[gpt-wrapper] recovery probe ExecuteScript failed: {error:?}");
-            abort_ptt_recovery(&app, &tracker, tab_id, generation, "讀取聽寫狀態失敗，請再試一次。");
-        }
-    });
-    if let Err(error) = result {
-        eprintln!("[gpt-wrapper] recovery WebView unavailable: {error:?}");
-    }
+        },
+        move |error| {
+            eprintln!("[gpt-wrapper] recovery probe failed: {error}");
+            abort_ptt_recovery(&app_for_unavailable, &tracker_for_unavailable, tab_id, generation, "讀取聽寫狀態失敗，請再試一次。");
+        },
+    );
 }
 
 // Both the device Submit signal and the Ctrl+. shortcut invoke this same WebView action.
@@ -4171,7 +3692,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                                 "[gpt-wrapper] failed to create fallback PTT tab: {create_error}"
                             );
                             if let Some(window) = app_handle.get_window(MAIN_WINDOW_LABEL) {
-                                restore_to_foreground(&window);
+                                platform::restore_to_foreground(&window);
                                 focus_active_tab(app_handle);
                             }
                             return;
@@ -4186,7 +3707,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
                 };
 
                 if let Some(window) = app_handle.get_window(MAIN_WINDOW_LABEL) {
-                    restore_to_foreground(&window);
+                    platform::restore_to_foreground(&window);
                 } else {
                     eprintln!("[gpt-wrapper] main window missing");
                     return;
@@ -4290,7 +3811,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
             };
 
             if let Some(window) = app_handle.get_window(MAIN_WINDOW_LABEL) {
-                restore_to_foreground(&window);
+                platform::restore_to_foreground(&window);
             }
             let _ = webview.set_focus();
 
@@ -4464,6 +3985,7 @@ fn handle_ptt_event(app_handle: &AppHandle, event: PttEvent, tracker: &Arc<PttTr
 
 struct KeyboardShortcutState {
     update_lock: Mutex<()>,
+    registration_error: Mutex<Option<String>>,
     ptt_keys_down: Arc<Mutex<HashSet<u32>>>,
     submit_keys_down: Arc<Mutex<HashSet<u32>>>,
     switch_tabs_keys_down: Arc<Mutex<HashSet<u32>>>,
@@ -4473,6 +3995,7 @@ impl KeyboardShortcutState {
     fn new() -> Self {
         Self {
             update_lock: Mutex::new(()),
+            registration_error: Mutex::new(None),
             ptt_keys_down: Arc::new(Mutex::new(HashSet::new())),
             submit_keys_down: Arc::new(Mutex::new(HashSet::new())),
             switch_tabs_keys_down: Arc::new(Mutex::new(HashSet::new())),
@@ -4622,6 +4145,92 @@ fn register_keyboard_shortcuts(
     Ok(())
 }
 
+// Windows keeps its original contract: a startup registration failure is fatal.
+#[cfg(not(target_os = "macos"))]
+fn register_startup_shortcuts(
+    app: &AppHandle,
+    settings: &ShortcutSettings,
+    tracker: &Arc<PttTracker>,
+    keyboard: &KeyboardShortcutState,
+) -> Result<(), String> {
+    register_keyboard_shortcuts(app, settings, tracker, keyboard)?;
+    println!("[gpt-wrapper] registered configured keyboard shortcuts.");
+    Ok(())
+}
+
+// macOS: a combination already taken by the system or another app must not
+// stop the app from launching. Fall back to the macOS defaults without
+// overwriting the user's saved choice, and surface the problem in Settings.
+#[cfg(target_os = "macos")]
+fn register_startup_shortcuts(
+    app: &AppHandle,
+    settings: &ShortcutSettings,
+    tracker: &Arc<PttTracker>,
+    keyboard: &KeyboardShortcutState,
+) -> Result<(), String> {
+    let Err(error) = register_keyboard_shortcuts(app, settings, tracker, keyboard) else {
+        println!("[gpt-wrapper] registered configured keyboard shortcuts.");
+        return Ok(());
+    };
+    eprintln!("[gpt-wrapper] configured shortcuts unavailable: {error}");
+    let _ = app.global_shortcut().unregister_all();
+    keyboard.reset();
+    let defaults = ShortcutSettings::default();
+    let message = if *settings != defaults
+        && register_keyboard_shortcuts(app, &defaults, tracker, keyboard).is_ok()
+    {
+        format!("{error}；已暫時改用 macOS 預設快捷鍵，請到 Settings → Shortcuts 重新設定。")
+    } else {
+        let _ = app.global_shortcut().unregister_all();
+        keyboard.reset();
+        format!("{error}；目前沒有可用的全域快捷鍵，請到 Settings → Shortcuts 重新設定。")
+    };
+    eprintln!("[gpt-wrapper] {message}");
+    if let Ok(mut slot) = keyboard.registration_error.lock() {
+        *slot = Some(message);
+    }
+    Ok(())
+}
+
+/// Startup registration problem to show in Settings (macOS only; Windows
+/// fails fast at startup instead).
+#[tauri::command]
+fn get_shortcut_registration_error(app: AppHandle, webview: Webview) -> Result<Option<String>, String> {
+    ensure_settings_webview(&webview)?;
+    Ok(app
+        .state::<KeyboardShortcutState>()
+        .registration_error
+        .lock()
+        .map_err(|_| "shortcut state lock poisoned")?
+        .clone())
+}
+
+/// Default bindings of this OS, so Settings "恢復預設" matches the backend.
+#[tauri::command]
+fn get_shortcut_defaults(webview: Webview) -> Result<ShortcutSettings, String> {
+    ensure_settings_webview(&webview)?;
+    Ok(ShortcutSettings::default())
+}
+
+/// Platform facts the Settings UI needs to render honest capabilities.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformInfo {
+    os: &'static str,
+    devices_supported: bool,
+    primary_modifier: &'static str,
+}
+
+#[tauri::command]
+fn get_platform_info(webview: Webview) -> Result<PlatformInfo, String> {
+    ensure_settings_webview(&webview)?;
+    Ok(PlatformInfo {
+        os: if cfg!(target_os = "macos") { "macos" } else { "windows" },
+        devices_supported: cfg!(windows),
+        primary_modifier: if cfg!(target_os = "macos") { "Command" } else { "Ctrl" },
+    })
+}
+
 #[tauri::command]
 fn get_shortcut_settings(app: AppHandle, webview: Webview) -> Result<ShortcutSettings, String> {
     ensure_settings_webview(&webview)?;
@@ -4673,6 +4282,9 @@ fn set_shortcut_settings(
             return Err(format!("{error}；恢復原有快捷鍵失敗：{rollback}"));
         }
         return Err(error);
+    }
+    if let Ok(mut registration_error) = keyboard.registration_error.lock() {
+        *registration_error = None;
     }
     Ok(settings)
 }
@@ -4726,6 +4338,9 @@ fn main() {
             set_notification_sound_enabled,
             get_shortcut_settings,
             set_shortcut_settings,
+            get_shortcut_defaults,
+            get_shortcut_registration_error,
+            get_platform_info,
             microphone_inventory::get_preferred_microphone,
             microphone_inventory::set_preferred_microphone,
             microphone_inventory::list_microphone_inputs,
@@ -4755,10 +4370,14 @@ fn main() {
             app.manage(background_project_switcher::BackgroundProjectSwitcherState::new());
             app.manage(tab_completion_notifications::NotificationState::new());
             app.manage(SettingsWindowState::new());
+            #[cfg(windows)]
             app.manage(devices::Devices::start(
                 app.path().app_config_dir()?.join("esp32-pairs.dpapi"),
                 app.handle().clone(),
             )?);
+            // No device workers and no .dpapi file outside Windows.
+            #[cfg(not(windows))]
+            app.manage(devices::Devices::unsupported());
             let project_settings_path: PathBuf =
                 app.path().app_config_dir()?.join("project-settings.json");
             app.manage(ProjectSettingsState::load(project_settings_path));
@@ -4785,6 +4404,10 @@ fn main() {
                 .visible(!launched_by_autostart)
                 .focused(!launched_by_autostart)
                 .build()?;
+            // The tab bar is a child WebView at y = 0 of the content view; on
+            // macOS that must start below the title bar (see platform docs).
+            #[cfg(target_os = "macos")]
+            platform::keep_content_below_title_bar(&window);
 
             let (width, _) = content_size(&window).map_err(tauri::Error::AssetNotFound)?;
             let host_builder = WebviewBuilder::new(
@@ -4833,6 +4456,9 @@ fn main() {
                     tab_completion_notifications::clear_all(&app_handle_for_events);
                 }
                 WindowEvent::Resized(_) => {
+                    // Leaving fullscreen can restore NSFullSizeContentView.
+                    #[cfg(target_os = "macos")]
+                    platform::keep_content_below_title_bar(&window_for_events);
                     if let Err(error) = layout_webviews(&window_for_events) {
                         eprintln!("[gpt-wrapper] failed to lay out webviews: {error}");
                     }
@@ -4849,7 +4475,7 @@ fn main() {
                 if let Err(error) = ensure_standby_ptt_tab(app.handle()) {
                     eprintln!("[gpt-wrapper] failed to prepare autostart standby PTT tab: {error}");
                 }
-                println!("[gpt-wrapper] launched by Windows autostart in tray-only mode.");
+                println!("[gpt-wrapper] launched by login autostart in tray-only mode.");
             }
 
             println!("[gpt-wrapper] main window and initial {saved_provider:?} tab created.");
@@ -4859,14 +4485,16 @@ fn main() {
                 .get()
                 .map_err(tauri::Error::AssetNotFound)?;
             let keyboard = app.state::<KeyboardShortcutState>();
-            register_keyboard_shortcuts(app.handle(), &settings, &ptt_tracker, &keyboard)
+            register_startup_shortcuts(app.handle(), &settings, &ptt_tracker, &keyboard)
                 .map_err(tauri::Error::AssetNotFound)?;
-            println!("[gpt-wrapper] registered configured keyboard shortcuts.");
 
             if !launched_by_autostart {
                 window.set_focus()?;
                 focus_active_tab(app.handle());
             }
+
+            #[cfg(debug_assertions)]
+            dev_control::start(app.handle());
 
             // Handle an ordinary second launch that arrived before setup finished.
             if pending_for_setup.swap(false, Ordering::SeqCst) {
@@ -4878,6 +4506,15 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building GPT Wrapper")
         .run(|app, event| {
+            // macOS Dock icon click (or Finder re-open) brings back the hidden
+            // main window and its existing tabs instead of creating new ones.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if app.get_window(MAIN_WINDOW_LABEL).is_some() {
+                    activate_existing_main_window(app);
+                }
+                return;
+            }
             if matches!(
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
@@ -4959,12 +4596,6 @@ mod ptt_tests {
             "--other-flag".into(),
             "--autostart".into(),
         ]));
-    }
-
-    #[test]
-    fn minimized_window_restores_its_previous_maximized_state() {
-        assert_eq!(minimized_restore_command(false), SW_RESTORE);
-        assert_eq!(minimized_restore_command(true), SW_SHOWMAXIMIZED);
     }
 
     #[test]

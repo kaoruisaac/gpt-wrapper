@@ -1,0 +1,162 @@
+name: Build macOS ARM64 (unsigned / ad-hoc)
+
+# Apple Silicon (aarch64-apple-darwin) .app + .dmg.
+#
+# - Tag pushes (vX.Y.Z) and manual runs build unsigned, ad-hoc-signed CI
+#   artifacts. No Apple Developer ID, notarization or signing secrets are used;
+#   the artifacts show Gatekeeper warnings and are NOT for public distribution.
+# - GitHub Release coexistence with release-windows.yml (unchanged):
+#   release-windows.yml is the only workflow that creates the Release for a tag.
+#   This workflow never creates a Release. Only when the repository variable
+#   MACOS_RELEASE_UPLOAD is 'true' does it wait for that Release to exist and
+#   upload its own, uniquely named macOS assets (no --clobber), so the two
+#   workflows can never race on `release create` or overwrite each other.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
+    outputs:
+      artifact: ${{ steps.meta.outputs.artifact }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Check out commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate tag and prepare bundle config
+        id: meta
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/tauri-macos-ci.json"
+          if [ "$REF_TYPE" = "tag" ]; then
+            if ! printf '%s' "$REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+              echo "Expected a release tag in vX.Y.Z format, got: $REF_NAME" >&2
+              exit 1
+            fi
+            version="${REF_NAME#v}"
+            label="$REF_NAME"
+          else
+            version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+            label="ci-${GITHUB_SHA::12}"
+          fi
+          printf '{"version":"%s","bundle":{"active":true,"targets":["app","dmg"]}}\n' "$version" > "$config"
+          echo "RELEASE_CONFIG=$config" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact=gpt-wrapper-${label}-macos-arm64-unsigned" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Unit tests (Node + Rust)
+        run: |
+          npm run frontend:build
+          node --test src-tauri/tests/*.test.cjs tests/*.test.cjs
+          cargo test --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --locked
+
+      - name: Build Apple Silicon .app and .dmg (ad-hoc signature)
+        run: npm run tauri -- build --ci --target aarch64-apple-darwin --bundles app,dmg --config "$RELEASE_CONFIG" -- --locked
+
+      - name: Verify bundle (arch, signature, permissions text, resources)
+        run: |
+          set -euo pipefail
+          bundle=src-tauri/target/aarch64-apple-darwin/release/bundle
+          app="$bundle/macos/GPT Wrapper.app"
+          test "$(lipo -archs "$app/Contents/MacOS/gpt-wrapper")" = "arm64"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -d --entitlements :- "$app" | grep -q 'com.apple.security.device.audio-input'
+          /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist"
+          test -f "$app/Contents/Resources/resources/ui-success-chime.wav"
+          test -f "$app/Contents/Resources/icon.icns"
+          ls "$bundle"/dmg/*.dmg
+          ditto -c -k --keepParent "$app" "$bundle/GPT-Wrapper_${{ steps.meta.outputs.version }}_aarch64_unsigned.app.zip"
+
+      - name: Keep macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/*_unsigned.app.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # Opt-in only (repository variable MACOS_RELEASE_UPLOAD = 'true'). Publishing
+  # unsigned macOS builds next to the Windows installer is a human decision.
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' && vars.MACOS_RELEASE_UPLOAD == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: macos-assets
+
+      - name: Wait for the Release created by release-windows.yml
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if gh release view "$RELEASE_TAG" --json tagName >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "Release $RELEASE_TAG not created yet (attempt $attempt/60); waiting."
+            sleep 30
+          done
+          echo "Release $RELEASE_TAG was not created by release-windows.yml within 30 minutes." >&2
+          exit 1
+
+      - name: Upload macOS assets without touching Windows assets
+        run: |
+          set -euo pipefail
+          existing="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          find macos-assets -type f \( -name '*.dmg' -o -name '*_unsigned.app.zip' \) -print0 |
+            while IFS= read -r -d '' asset; do
+              name="$(basename "$asset")"
+              case "$name" in
+                *aarch64*) ;;
+                *) echo "Refusing to upload a non-macOS asset name: $name" >&2; exit 1 ;;
+              esac
+              if printf '%s\n' "$existing" | grep -Fxq "$name"; then
+                echo "Asset $name already present; leaving it unchanged."
+              else
+                gh release upload "$RELEASE_TAG" "$asset"
+              fi
+            done

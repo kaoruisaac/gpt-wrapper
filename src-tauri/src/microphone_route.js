@@ -35,7 +35,7 @@
   let policy = null, epoch = -1, intent = null, lastTicket = null, sequence = 0;
   let deviceLease = null;
   const devicePost = (event, lease, attempt = "") => {
-    try { window.chrome?.webview?.postMessage(JSON.stringify({
+    try { (window.chrome?.webview ?? window.webkit?.messageHandlers?.gptWrapper)?.postMessage(JSON.stringify({
       kind: "gpt-wrapper-device-route", event, lease: lease.id, attempt,
     })); } catch { /* Host watchdog remains closed without evidence. */ }
   };
@@ -52,7 +52,7 @@
 
   const notify = (event, reason = "", ticket = null) => {
     try {
-      window.chrome?.webview?.postMessage(JSON.stringify({
+      (window.chrome?.webview ?? window.webkit?.messageHandlers?.gptWrapper)?.postMessage(JSON.stringify({
         kind: "gpt-wrapper-microphone-route", event, epoch, reason,
         attempt: ticket?.id || "", purpose: ticket?.purpose || "",
       }));

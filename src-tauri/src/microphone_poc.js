@@ -11,7 +11,7 @@
   const topFrame = window.top === window;
   const sendToHost = (detail) => {
     try {
-      window.chrome?.webview?.postMessage(JSON.stringify({
+      (window.chrome?.webview ?? window.webkit?.messageHandlers?.gptWrapper)?.postMessage(JSON.stringify({
         kind: "gpt-wrapper-microphone-probe", ...detail,
       }));
     } catch { /* diagnostics must never disrupt ChatGPT */ }

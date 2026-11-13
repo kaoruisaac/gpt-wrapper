@@ -1,7 +1,8 @@
 //! Non-activating completion cards for ChatGPT tabs. Separate from the tray project switcher.
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::{
     collections::HashMap,
-    os::windows::ffi::OsStrExt,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
@@ -11,6 +12,7 @@ use tauri::{
     webview::{PageLoadEvent, WebviewWindowBuilder},
     AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewUrl,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsWindow, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -18,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
+#[cfg(windows)]
 use windows::{
     core::PCWSTR,
     Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT},
@@ -297,6 +300,8 @@ pub fn clear_all(app: &AppHandle) {
 
 // Slot zero is reserved: actual Tab IDs start at one. Device notices remain
 // visible in the foreground, but share the existing non-activating card HWND.
+// Only the Windows ESP32 backend raises device notices.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn device_notice(app: &AppHandle, interrupted: bool) {
     if let Ok(mut store) = app.state::<NotificationState>().0.lock() {
         let generation = store.prepare(0);
@@ -330,11 +335,13 @@ fn update_script(cards: &[Card]) -> String {
     format!("window.__GPT_TAB_COMPLETIONS__?.render({encoded});")
 }
 
+#[cfg(windows)]
 fn native_visible(window: &tauri::WebviewWindow) -> Result<bool, String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     Ok(unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() })
 }
 
+#[cfg(windows)]
 fn hide_native(window: &tauri::WebviewWindow) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     unsafe {
@@ -382,6 +389,7 @@ fn schedule_hide_retry(app: AppHandle, remaining: u8) {
     });
 }
 
+#[cfg(windows)]
 fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     unsafe {
@@ -419,6 +427,18 @@ fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> 
     Ok(())
 }
 
+// macOS: the card window is re-classed to a non-activating panel so neither
+// showing it nor clicking its X activates GPT Wrapper or steals key focus.
+#[cfg(target_os = "macos")]
+fn hide_native(window: &tauri::WebviewWindow) -> Result<(), String> {
+    crate::platform::hide_overlay(window)
+}
+
+#[cfg(target_os = "macos")]
+fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
+    crate::platform::show_overlay_without_activation(window, true)
+}
+
 fn place(window: &tauri::WebviewWindow, count: usize) -> Result<(), String> {
     let monitor = window
         .app_handle()
@@ -443,7 +463,7 @@ fn place(window: &tauri::WebviewWindow, count: usize) -> Result<(), String> {
 }
 
 fn create_window(app: &AppHandle) -> Result<(), String> {
-    WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         WINDOW_LABEL,
         WebviewUrl::App("settings/tab-completion-notifications.html".into()),
@@ -456,8 +476,15 @@ fn create_window(app: &AppHandle) -> Result<(), String> {
     .focused(false)
     .visible(false)
     .skip_taskbar(true)
-    .always_on_top(true)
-    .transparent(true)
+    .always_on_top(true);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.transparent(true);
+    // macOS: transparency is applied natively after creation (no Tauri
+    // private-API feature), and the card never becomes key, so its X must
+    // accept the first click.
+    #[cfg(target_os = "macos")]
+    let builder = builder.accept_first_mouse(true);
+    let window = builder
     .on_page_load(|window, payload| {
         if payload.event() != PageLoadEvent::Finished {
             return;
@@ -469,6 +496,10 @@ fn create_window(app: &AppHandle) -> Result<(), String> {
     })
     .build()
     .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    crate::platform::make_overlay_transparent(&window)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
     Ok(())
 }
 
@@ -500,6 +531,16 @@ fn play_sound(app: &AppHandle) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("sound resource missing: {}", path.display()));
     }
+    play_sound_path(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn play_sound_path(path: &std::path::Path) -> Result<(), String> {
+    crate::platform::play_sound_file(path)
+}
+
+#[cfg(windows)]
+fn play_sound_path(path: &std::path::Path) -> Result<(), String> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // No SND_SYSTEM: use this process's audio session and application volume.
     if unsafe {

@@ -20,9 +20,6 @@
       "resources/ui-success-chime.LICENSE.txt"
     ],
     "active": true,
-    "targets": [
-      "nsis"
-    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser",

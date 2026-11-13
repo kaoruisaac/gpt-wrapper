@@ -9,6 +9,7 @@ use tauri::{
     AppHandle, Manager, PhysicalPosition, WebviewUrl,
 };
 use uuid::Uuid;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsWindow, IsWindowVisible, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE,
     SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -178,11 +179,13 @@ fn place_toast(window: &tauri::WebviewWindow) -> Result<(), String> {
 // All HWND visibility operations run on the Tauri UI thread. Checking the
 // actual HWND matters: the toast is shown via Win32, not Window::show(), so
 // Tao/Tauri's cached VISIBLE flag can disagree with the native window.
+#[cfg(windows)]
 fn native_visible(window: &tauri::WebviewWindow) -> Result<bool, String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     Ok(unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() })
 }
 
+#[cfg(windows)]
 fn hide_native_confirmed(window: &tauri::WebviewWindow) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     let before = native_visible(window)?;
@@ -208,6 +211,7 @@ fn hide_native_confirmed(window: &tauri::WebviewWindow) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
 fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
     unsafe {
@@ -227,6 +231,18 @@ fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> 
     } else {
         Ok(())
     }
+}
+
+// macOS: an always-on-top NSWindow ordered front without activating the app
+// or becoming key. The toast ignores the cursor, so it never needs a click.
+#[cfg(target_os = "macos")]
+fn hide_native_confirmed(window: &tauri::WebviewWindow) -> Result<(), String> {
+    crate::platform::hide_overlay(window)
+}
+
+#[cfg(target_os = "macos")]
+fn show_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
+    crate::platform::show_overlay_without_activation(window, false)
 }
 
 fn show_toast(app: &AppHandle, label: &str, generation: u64) -> Result<(), String> {

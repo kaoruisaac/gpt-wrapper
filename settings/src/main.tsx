@@ -5,6 +5,7 @@ import "./styles.css";
 import ProjectBookmarks from "./ProjectBookmarks";
 import MicrophoneSettings from "./MicrophoneSettings";
 import ShortcutsSettings from "./ShortcutsSettings";
+import { IS_MAC } from "./platform";
 import DevicesSettings from "./DevicesSettings";
 
 type SettingsTab = "general" | "devices" | "bookmarks" | "shortcuts";
@@ -186,7 +187,9 @@ function GeneralSettings() {
             開機時自動啟動 GPT Wrapper
           </label>
           <p class="setting-description">
-            Windows 登入後會在背景啟動並常駐 system tray，不會自動顯示主視窗。
+            {IS_MAC
+              ? "登入 macOS 後會在背景啟動並常駐選單列，不會自動顯示主視窗。"
+              : "Windows 登入後會在背景啟動並常駐 system tray，不會自動顯示主視窗。"}
           </p>
         </div>
       </div>

@@ -1,6 +1,7 @@
 import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { PROVIDER_CHOICES, type ProviderId, providerChoice } from "./providers";
+import { SYSTEM_DEFAULT_HINT, SYSTEM_DEFAULT_LABEL } from "./platform";
 
 type MicrophonePreference =
   | { mode: "default" }
@@ -108,7 +109,7 @@ export default function MicrophoneSettings() {
   };
 
   const chooseDefault = () =>
-    void save({ mode: "default" }, "已使用 Windows Default，維持各平台聽寫的原生音訊行為。");
+    void save({ mode: "default" }, `已使用 ${SYSTEM_DEFAULT_LABEL}，維持各平台聽寫的原生音訊行為。`);
 
   const selectProvider = (next: ProviderId) => {
     if (next === provider()) return;
@@ -141,7 +142,7 @@ export default function MicrophoneSettings() {
       <div class="microphone-heading">
         <div>
           <h2>聽寫麥克風</h2>
-          <p class="setting-description">ChatGPT 與 Claude 共用同一個麥克風選擇。裝置清單由所選平台的分頁列舉（各網站的裝置 ID 不同），不使用 Windows 裝置 ID 代替。</p>
+          <p class="setting-description">ChatGPT 與 Claude 共用同一個麥克風選擇。裝置清單由所選平台的分頁列舉（各網站的裝置 ID 不同），不使用作業系統的裝置 ID 代替。</p>
         </div>
         <button type="button" class="microphone-refresh" onClick={() => void refresh()} disabled={loading()}>
           {loading() ? "查詢中…" : "重新整理"}
@@ -169,14 +170,14 @@ export default function MicrophoneSettings() {
           aria-expanded={open()}
           onClick={() => setOpen(v => !v)}
         >
-          <span>{preference().mode === "default" ? "Windows Default" : (preference() as { label: string }).label}</span>
+          <span>{preference().mode === "default" ? SYSTEM_DEFAULT_LABEL : (preference() as { label: string }).label}</span>
           <span aria-hidden="true">⌄</span>
         </button>
         <Show when={open()}>
           <div class="microphone-menu" role="listbox" aria-label="麥克風來源">
             <button role="option" type="button" aria-selected={preference().mode === "default"}
               onClick={chooseDefault} disabled={saving()}>
-              <span>Windows Default <small>依 Windows 系統預設裝置</small></span>
+              <span>{SYSTEM_DEFAULT_LABEL} <small>{SYSTEM_DEFAULT_HINT}</small></span>
               <Show when={preference().mode === "default"}><span aria-hidden="true">✓</span></Show>
             </button>
             <Show when={devices().length > 0}>
@@ -205,7 +206,7 @@ export default function MicrophoneSettings() {
           classList={{ "is-warning": inventory()?.binding === "needsConfirmation" }}>{bindingText()}</p>
       </Show>
       <p class="microphone-warning" role="status">
-        指定裝置在受控的聽寫（與 ChatGPT Voice Mode）擷取時強制驗證 ID；失敗可直接重試，不會切回 Windows Default 或鎖定其他分頁。進行中的 Voice 如切換音源，請重新啟動 Voice。雙實體音源隔離仍待實機驗收。
+        指定裝置在受控的聽寫（與 ChatGPT Voice Mode）擷取時強制驗證 ID；失敗可直接重試，不會切回系統預設裝置或鎖定其他分頁。進行中的 Voice 如切換音源，請重新啟動 Voice。雙實體音源隔離仍待實機驗收。
       </p>
       <Show when={preference().mode === "device" && inventory()?.binding !== "needsConfirmation" &&
         devices().length > 0 && !devices().some(device => selectedHere(device))}>

@@ -1,6 +1,6 @@
 # GPT Wrapper
 
-Windows Tauri app that keeps ChatGPT Web available as a push-to-talk dictation window with multiple tabs in one native window.
+Tauri app for **Windows (x64, WebView2)** and **macOS (Apple Silicon, WKWebView)** that keeps ChatGPT and Claude Web available as a push-to-talk dictation window with multiple tabs in one native window. Both platforms share one Rust Core (tabs, providers, PTT state machine, settings); only native differences live in `src-tauri/src/platform/{windows,macos}.rs`. ESP32 devices are Windows-only for now.
 
 ## Run
 
@@ -39,6 +39,33 @@ The `.github/workflows/release-windows.yml` workflow runs when a `vX.X.X` tag is
 The installer and app version come from the tag through a temporary Tauri config override, so you do not need to edit `package.json`, `Cargo.toml`, or `tauri.conf.json` for each release. The workflow explicitly enables NSIS bundling and uses the committed npm and Cargo lockfiles. Tauri builds both frontend UIs automatically.
 
 GitHub Actions must be enabled for the repository. The workflow uses its built-in `GITHUB_TOKEN` with `contents: write`; no extra release token is required. Installers are currently unsigned. Successful builds also retain the installer as an Actions artifact for 14 days, including when release publishing fails. To retry a failed run, use **Actions → Release Windows NSIS → Re-run failed jobs**; an existing release receives replacement assets with the same filenames, while its title and notes are preserved.
+
+## macOS (Apple Silicon) development and builds
+
+Scope of the first macOS version: Apple Silicon (`aarch64-apple-darwin`) only — no Intel, Universal or Mac App Store build. Minimum macOS is **12.0** (WKWebView per-site media-capture permission API); it was built and tested on **macOS 26.2 (Mac mini, M1)** only, so 12–25 are declared but not tested.
+
+```bash
+cd '/Users/isaaclin/workspace/docs assistant/gpt-wrapper'
+npm ci
+npm run frontend:build
+cargo test --manifest-path src-tauri/Cargo.toml
+node --test src-tauri/tests/*.test.cjs tests/*.test.cjs
+npm run tauri -- build --target aarch64-apple-darwin
+```
+
+Outputs: `src-tauri/target/aarch64-apple-darwin/release/bundle/macos/GPT Wrapper.app` and `src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/GPT Wrapper_<version>_aarch64.dmg`. `tauri.macos.conf.json` selects the `app`/`dmg` bundles and `tauri.windows.conf.json` keeps Windows on `nsis`, so `npm run tauri build` picks the right bundle on each OS; explicit `--bundles` / `--config` overrides still apply on top.
+
+**Signing:** builds are ad-hoc signed (`signingIdentity: "-"`, Hardened Runtime, entitlement `com.apple.security.device.audio-input` only). There is no Developer ID signature and no notarization, so Gatekeeper rejects the app when it is downloaded: for internal testing open it with right-click → **Open** (or remove the quarantine attribute yourself). Do not distribute these builds as release-quality macOS software; Developer ID signing + notarization is a later, human decision. Because the ad-hoc signature changes with every build, macOS may ask for microphone permission again after each rebuild.
+
+**macOS behavior differences**
+- Default shortcuts use Control + Command (global hotkeys on macOS are system-wide, so plain Command+key would break other apps): PTT `⌃⌘0` / `⌃⌘Num0`, Explicit Submit `⌃⌘.` / `⌃⌘Num.`, Switch Tabs `⌃⌘=` / `⌃⌘Num+`. Settings → Shortcuts additionally accepts Command with exactly one of Control / Option / Shift and rejects known macOS system shortcuts (input sources, Spaces, screenshots, lock screen, force quit, Dock, zoom, Finder hidden files) with an explicit message. A settings file that still holds the Windows default list is migrated to the macOS defaults once; custom bindings are kept. If a saved shortcut cannot be registered at launch, the app still starts, falls back to the macOS defaults and shows the problem in Settings → Shortcuts. Hotkeys use Carbon `RegisterEventHotKey`, so no Accessibility or Input Monitoring permission is requested.
+- Microphone: the first dictation triggers the macOS microphone prompt for GPT Wrapper (the usage text is in `Info.plist`). Inside the app only the tab's own provider page (https chatgpt.com / chat.openai.com or claude.ai, top frame) may capture audio; camera, other sites and iframes are denied. If permission was denied, enable it in **System Settings → Privacy & Security → Microphone**, then retry PTT. "System default" means the macOS **Sound → Input** device.
+- Closing the window hides GPT Wrapper to the **Menu Bar** (click the status item for Open / Settings / Quit); clicking the Dock icon also brings the window back. Quit (menu, ⌘Q) exits completely. Login autostart uses a per-user LaunchAgent with `--autostart` (starts hidden in the Menu Bar).
+- Completion cards and the Default Project toast are non-activating panels: they never take focus from the app you are using, including when you click a card's ×. The completion chime plays through AppKit.
+- Right-clicking a link offers **在新分頁中開啟連結** and **在預設瀏覽器開啟連結**; `target=_blank` / `window.open` always go to the default browser and never open uncontrolled WebKit windows.
+- **Devices (ESP32) are not supported on macOS yet.** The Devices page shows `unsupported_platform`; no Bluetooth scan, Wi-Fi provisioning, UDP receiver, audio bridge or pairing file is used.
+
+**macOS CI:** `.github/workflows/release-macos.yml` builds the unsigned/ad-hoc `.app` (zipped) and `.dmg` on `vX.Y.Z` tags (with the same tag guard as Windows) or manually, runs the unit tests, verifies architecture/signature/entitlement/Info.plist, and keeps them as Actions artifacts (`gpt-wrapper-<tag>-macos-arm64-unsigned`, 14 days). It never creates a GitHub Release; only if the repository variable `MACOS_RELEASE_UPLOAD` is `true` does it wait for the Release created by `release-windows.yml` and add its uniquely named `*_aarch64*` assets without overwriting anything. No signing secrets are used.
 
 ## Usage
 

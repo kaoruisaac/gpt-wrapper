@@ -3,10 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 
 type Action = "ptt" | "submit" | "switchTabs";
 type Settings = { ptt: string[]; submit: string[]; switchTabs: string[] };
-const DEFAULTS: Settings = {
+type PlatformInfo = { os: "windows" | "macos"; devicesSupported: boolean; primaryModifier: string };
+// Windows defaults; the host replaces them with its own OS defaults on load.
+const WINDOWS_DEFAULTS: Settings = {
   ptt: ["Ctrl+Digit0", "Ctrl+Numpad0"],
   submit: ["Ctrl+Period", "Ctrl+NumpadDecimal"],
   switchTabs: ["Ctrl+Shift+Equal", "Ctrl+NumpadAdd"],
+};
+const MAC_MODIFIER_LABELS: Record<string, string> = {
+  Ctrl: "⌃ Control", Alt: "⌥ Option", Shift: "⇧ Shift", Command: "⌘ Command",
 };
 const clone = (value: Settings): Settings => ({
   ptt: [...value.ptt], submit: [...value.submit], switchTabs: [...value.switchTabs],
@@ -25,9 +30,30 @@ function keyName(code: string): string {
   if (/^Numpad[0-9]$/.test(code)) return "Num " + code.slice(6);
   return labels[code] || code;
 }
+let isMac = false;
 function format(binding: string) {
-  if (binding === "Ctrl+Shift+Equal") return ["Ctrl", "+"];
-  return binding.split("+").map((part) => part === "Ctrl" || part === "Alt" || part === "Shift" ? part : keyName(part));
+  if (!isMac && binding === "Ctrl+Shift+Equal") return ["Ctrl", "+"];
+  return binding.split("+").map((part) => {
+    if (part === "Ctrl" || part === "Alt" || part === "Shift" || part === "Command") {
+      return isMac ? MAC_MODIFIER_LABELS[part] : part;
+    }
+    return keyName(part);
+  });
+}
+// Mirrors shortcut_settings.rs: the Windows set everywhere, plus Command with
+// exactly one other modifier on macOS (Command alone would hijack app keys).
+function modifiers(event: KeyboardEvent, mac: boolean): string {
+  const { ctrlKey: c, altKey: a, shiftKey: s, metaKey: m } = event;
+  if (!m) {
+    return c && a && !s ? "Ctrl+Alt"
+      : c && s && !a ? "Ctrl+Shift"
+      : c && !s && !a ? "Ctrl"
+      : a && !c && !s ? "Alt" : "";
+  }
+  if (!mac) return "";
+  return c && !a && !s ? "Ctrl+Command"
+    : a && !c && !s ? "Alt+Command"
+    : s && !c && !a ? "Shift+Command" : "";
 }
 function supported(code: string): boolean {
   return /^Key[A-Z]$/.test(code) || /^Digit[0-9]$/.test(code) ||
@@ -36,8 +62,11 @@ function supported(code: string): boolean {
 }
 
 export default function ShortcutsSettings() {
-  const [settings, setSettings] = createSignal<Settings>(clone(DEFAULTS));
-  const [saved, setSaved] = createSignal(JSON.stringify(DEFAULTS));
+  const [defaults, setDefaults] = createSignal<Settings>(clone(WINDOWS_DEFAULTS));
+  const [platform, setPlatform] = createSignal<PlatformInfo>({ os: "windows", devicesSupported: true, primaryModifier: "Ctrl" });
+  const [registrationError, setRegistrationError] = createSignal("");
+  const [settings, setSettings] = createSignal<Settings>(clone(WINDOWS_DEFAULTS));
+  const [saved, setSaved] = createSignal(JSON.stringify(WINDOWS_DEFAULTS));
   const [busy, setBusy] = createSignal(true);
   const [status, setStatus] = createSignal("");
   const [error, setError] = createSignal("");
@@ -47,6 +76,15 @@ export default function ShortcutsSettings() {
   const read = async () => {
     setBusy(true); setError("");
     try {
+      const [info, osDefaults, startupError] = await Promise.all([
+        invoke<PlatformInfo>("get_platform_info"),
+        invoke<Settings>("get_shortcut_defaults"),
+        invoke<string | null>("get_shortcut_registration_error"),
+      ]);
+      isMac = info.os === "macos";
+      setPlatform(info);
+      setDefaults(clone(osDefaults));
+      setRegistrationError(startupError ?? "");
       const value = await invoke<Settings>("get_shortcut_settings");
       setSettings(clone(value));
       setSaved(JSON.stringify(value));
@@ -55,7 +93,7 @@ export default function ShortcutsSettings() {
   };
   onMount(() => { void read(); });
   const changed = () => JSON.stringify(settings()) !== saved();
-  const reset = () => { setSettings(clone(DEFAULTS)); setStatus(""); setError(""); };
+  const reset = () => { setSettings(clone(defaults())); setStatus(""); setError(""); };
   const remove = (action: Action, index: number) => {
     if (settings()[action].length <= 1) return;
     setSettings(value => ({ ...value, [action]: value[action].filter((_, i) => i !== index) }));
@@ -69,14 +107,13 @@ export default function ShortcutsSettings() {
     const current = recording();
     if (!current) return;
     event.preventDefault(); event.stopImmediatePropagation();
-    if (event.code === "Escape" && !event.ctrlKey && !event.altKey) { cancel(); return; }
+    if (event.code === "Escape" && !event.ctrlKey && !event.altKey && !event.metaKey) { cancel(); return; }
     if (["Control", "Alt", "Shift", "Meta", "AltGraph"].includes(event.key)) return;
-    const mod = event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey ? "Ctrl+Alt"
-      : event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey ? "Ctrl+Shift"
-      : event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey ? "Ctrl"
-      : event.altKey && !event.ctrlKey && !event.shiftKey && !event.metaKey ? "Alt" : "";
+    const mod = modifiers(event, isMac);
     if (!mod) {
-      setCaptureError("請使用 Ctrl、Alt、Ctrl + Alt 或 Ctrl + Shift 搭配一個按鍵。");
+      setCaptureError(isMac
+        ? "請使用 ⌃、⌥、⌃⌥、⌃⇧，或 ⌘ 搭配 ⌃／⌥／⇧ 其中一個，再加一個按鍵。"
+        : "請使用 Ctrl、Alt、Ctrl + Alt 或 Ctrl + Shift 搭配一個按鍵。");
       return;
     }
     if (!supported(event.code)) { setCaptureError("此按鍵不支援全域快捷鍵註冊。"); return; }
@@ -114,7 +151,12 @@ export default function ShortcutsSettings() {
     <>
       <h1>Shortcuts</h1>
       <p class="shortcuts-intro">自訂全域快捷鍵。點擊「變更」後，直接按下想設定的組合。</p>
-      <div class="shortcut-modes"><span>Ctrl + Key</span><span>Alt + Key</span><span>Ctrl + Alt + Key</span><span>Ctrl + Shift + Key</span></div>
+      <Show when={registrationError()}><p class="shortcut-error" role="alert">{registrationError()}</p></Show>
+      <Show when={platform().os === "macos"} fallback={
+        <div class="shortcut-modes"><span>Ctrl + Key</span><span>Alt + Key</span><span>Ctrl + Alt + Key</span><span>Ctrl + Shift + Key</span></div>
+      }>
+        <div class="shortcut-modes"><span>⌃ Control + ⌘ Command + Key</span><span>⌥ Option + ⌘ Command + Key</span><span>⇧ Shift + ⌘ Command + Key</span><span>⌃ / ⌥ / ⌃⌥ / ⌃⇧ + Key</span></div>
+      </Show>
       <h2 class="shortcut-heading">全域快捷鍵</h2>
       <For each={[
         { id: "ptt" as Action, title: "PTT 聽寫", desc: "按住開始聽寫，放開結束；是否自動送出由 General 控制。" },
@@ -143,7 +185,7 @@ export default function ShortcutsSettings() {
           </section>
         )}
       </For>
-      <p class="shortcut-note">同一組快捷鍵不能重複指派。若 Windows 或其他程式已佔用組合，儲存時會顯示錯誤並還原先前的設定。</p>
+      <p class="shortcut-note">同一組快捷鍵不能重複指派。若{platform().os === "macos" ? " macOS 系統" : " Windows"}或其他程式已佔用組合，儲存時會顯示錯誤並還原先前的設定。</p>
       <div class="shortcut-footer">
         <button class="shortcut-reset" type="button" disabled={busy()} onClick={reset}>恢復預設</button>
         <div class="shortcut-footer-actions"><span>{changed() ? "尚未儲存" : "目前設定已同步"}</span><button class="shortcut-save" type="button" disabled={busy() || !changed()} onClick={() => void save()}>儲存變更</button></div>

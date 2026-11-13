@@ -84,7 +84,9 @@
         matchingAriaButton(CONTROL_LABELS.send) ? "send" :
         matchingAriaButton(CONTROL_LABELS.voice) ? "voice" : "fallback";
       if (status === lastStatus) return;
-      const webview = window.chrome?.webview;
+      // Shared host bridge: WebView2 (Windows) or WKScriptMessageHandler
+      // "gptWrapper" (macOS). Same JSON string payload on both.
+      const webview = window.chrome?.webview ?? window.webkit?.messageHandlers?.gptWrapper;
       if (!webview?.postMessage) return;
       try {
         webview.postMessage(JSON.stringify({ kind: "gpt-wrapper-tab-status", status }));

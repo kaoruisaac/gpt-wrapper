@@ -9,6 +9,8 @@ const LONG_PRESS: Duration = Duration::from_millis(400);
 const MAX_HOLD: Duration = Duration::from_secs(10);
 pub type Validator = Arc<dyn Fn() -> bool + Send + Sync>;
 #[derive(Clone, Debug, PartialEq, Eq)]
+// `Device` input only exists with the Windows ESP32 backend.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum Source {
     Keyboard(u32),
     Device {
@@ -99,6 +101,7 @@ impl Machine {
         active.long_fired = true;
         Some(Action::Create)
     }
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn cancel_device(&mut self) {
         if self
             .current
@@ -194,6 +197,7 @@ pub fn cancel_all(app: &AppHandle) {
         }
     }
 }
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn cancel_device(app: &AppHandle) {
     if let Some(state) = app.try_state::<State>() {
         if let Ok(mut m) = state.0.lock() {

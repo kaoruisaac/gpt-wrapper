@@ -12,7 +12,7 @@
 
   const post = (payload) => {
     try {
-      window.chrome?.webview?.postMessage(JSON.stringify({
+      (window.chrome?.webview ?? window.webkit?.messageHandlers?.gptWrapper)?.postMessage(JSON.stringify({
         kind: "gpt-wrapper-microphone-inventory", ...payload,
       }));
     } catch { /* No website behavior should depend on the inventory bridge. */ }

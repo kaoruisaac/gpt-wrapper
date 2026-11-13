@@ -65,7 +65,9 @@
   document.addEventListener("input", clearSubmittedDraftGuardIfChanged, true);
 
   const post = (status) => {
-    const webview = window.chrome?.webview;
+    // Shared host bridge: WebView2 (Windows) or WKScriptMessageHandler
+    // "gptWrapper" (macOS). Same JSON string payload on both.
+    const webview = window.chrome?.webview ?? window.webkit?.messageHandlers?.gptWrapper;
     if (!webview?.postMessage) return false;
     try {
       webview.postMessage(JSON.stringify({ kind: "gpt-wrapper-tab-status", status }));

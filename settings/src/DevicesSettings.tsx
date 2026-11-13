@@ -68,6 +68,9 @@ export default function DevicesSettings() {
   const isAudioReady = () => snapshot()?.audio === "Ready";
   const isReceiverReady = () => snapshot()?.receiver === "Ready";
   const isOpen = () => !!wizard() && wizard()?.stage !== "canceled";
+  // macOS v1 has no ESP32 backend: the host reports unsupported_platform and
+  // the page must not offer pairing, receiver retries or fake device states.
+  const unsupported = () => snapshot()?.receiver === "unsupported_platform";
   const refresh = async () => {
     if (polling || busy()) return;
     polling = true;
@@ -76,15 +79,19 @@ export default function DevicesSettings() {
     finally { polling = false; }
   };
   onMount(() => {
-    void refresh().then(() => act("recheck_audio"));
-    const timer = setInterval(() => void refresh(), 500);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    void refresh().then(() => {
+      if (unsupported()) return;
+      void act("recheck_audio");
+      if (mounted) timer = setInterval(() => void refresh(), 500);
+    });
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       if (confirm()) { setConfirm(null); event.stopPropagation(); }
       else if (isOpen() && !busy()) { void dismissWizard(); event.stopPropagation(); }
     };
     document.addEventListener("keydown", onKey);
-    onCleanup(() => { mounted = false; clearInterval(timer); document.removeEventListener("keydown", onKey); setPassword(""); });
+    onCleanup(() => { mounted = false; if (timer !== undefined) clearInterval(timer); document.removeEventListener("keydown", onKey); setPassword(""); });
   });
   const act = async (op: string, args: Record<string, unknown> = {}): Promise<Snapshot | undefined> => {
     if (busy() || !snapshot()) return;
@@ -147,7 +154,21 @@ export default function DevicesSettings() {
   const requestConfirm = (data: Confirm) => setConfirm(() => data);
   const deviceResetHint = "不能從 Settings 直接覆寫已配對裝置的 Wi-Fi。請在 ESP32 上同時按住 PTT 與 Submit 5 秒，清除裝置端 Wi-Fi 與 Host 設定，進入 BLE 配網後再使用 Add Device。";
 
-  return <div class="devices-page">
+  const unsupportedPanel = <div class="devices-page" data-devices-unsupported="">
+    <header class="devices-header">
+      <div>
+        <div class="devices-eyebrow">DEVICE MANAGEMENT</div>
+        <h1>Devices</h1>
+        <p class="devices-sub">ESP32 無線 PTT 裝置</p>
+      </div>
+    </header>
+    <div class="devices-callout warning" role="status">
+      <strong>此平台尚未支援 ESP32 裝置（unsupported_platform）。</strong>
+      macOS 版目前不會掃描藍牙、配置 Wi-Fi、接收裝置音訊或建立配對資料。請使用鍵盤快捷鍵進行 PTT 聽寫與送出；ESP32 支援將於後續版本提供。
+    </div>
+  </div>;
+
+  return <Show when={!unsupported()} fallback={unsupportedPanel}><div class="devices-page">
     <header class="devices-header">
       <div>
         <div class="devices-eyebrow">DEVICE MANAGEMENT</div>
@@ -306,5 +327,5 @@ export default function DevicesSettings() {
         <footer class="devices-modal-footer"><button class="devices-btn" onClick={() => setConfirm(null)}>返回</button><button class="devices-btn" classList={{ danger: confirm()?.danger, primary: !confirm()?.danger }} onClick={() => { const action = confirm()?.action; setConfirm(null); action?.(); }}>{confirm()!.confirmLabel}</button></footer>
       </section>
     </div></Show>
-  </div>;
+  </div></Show>;
 }

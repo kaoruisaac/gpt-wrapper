@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>GPT Wrapper 需要使用麥克風，讓您在 ChatGPT 與 Claude 網頁中以按住說話（PTT）進行語音聽寫。音訊只會傳給您正在使用的 ChatGPT 或 Claude 網站。</string>
+</dict>
+</plist>
